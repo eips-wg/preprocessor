@@ -1,0 +1,19 @@
+[package]
+name = "eips-zola"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+rust-version = "1.71.1"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+chrono = "0.4.31"
+eipw-preamble = "0.1.0"
+lazy_static = "1.4.0"
+regex = "1.10.2"
+serde = { version = "1.0.192", features = ["derive"] }
+snafu = "0.7.5"
+toml = "0.8.8"
+toml_datetime = { version = "0.6.5", features = ["serde"] }
+walkdir = "2.4.0"
