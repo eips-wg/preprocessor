@@ -10,6 +10,10 @@ use eipw_preamble::Preamble;
 
 use lazy_static::lazy_static;
 
+use pulldown_cmark::{CowStr, Event, Options, Parser, Tag};
+
+use pulldown_cmark_to_cmark::cmark;
+
 use regex::Regex;
 
 use serde::{Deserialize, Serialize};
@@ -222,7 +226,8 @@ fn extract_authors(value: &str) -> Result<Vec<Author>, Whatever> {
 
 fn main() -> Result<(), Whatever> {
     let root = args().nth(1).unwrap();
-    let dir = std::fs::read_dir(&root)
+    let root_path = PathBuf::from(root.clone());
+    let dir = std::fs::read_dir(&root_path)
         .with_whatever_context(|_| format!("could not read directory `{root}`"))?;
 
     for entry in dir {
@@ -238,17 +243,66 @@ fn main() -> Result<(), Whatever> {
 
         let path = entry.path();
         if file_type.is_dir() {
-            process_eip(&path.join("index.md"))?;
-            process_assets(&path)?;
+            process_eip(&root_path, &path.join("index.md"))?;
+            process_assets(&root_path, &path)?;
         } else if path.extension().and_then(OsStr::to_str) == Some("md") {
-            process_eip(&path)?;
+            process_eip(&root_path, &path)?;
         }
     }
 
     Ok(())
 }
 
-fn process_assets(path: &Path) -> Result<(), Whatever> {
+fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+
+    let parent = path.parent().unwrap();
+
+    let croot = std::fs::canonicalize(&root).with_whatever_context(|_| {
+        format!("could not canonicalize `{}`", root.to_string_lossy())
+    })?;
+
+    let events = Parser::new_ext(body, opts).map(|mut e| match &mut e {
+        Event::Start(Tag::Image(_, dest, _))
+        | Event::End(Tag::Image(_, dest, _))
+        | Event::Start(Tag::Link(_, dest, _))
+        | Event::End(Tag::Link(_, dest, _)) => {
+            if dest.starts_with("//") || dest.contains("://") || !dest.ends_with(".md") {
+                return e;
+            }
+
+            let child = if dest.starts_with("/") {
+                let mut path = Path::new(dest.as_ref());
+                path = path.strip_prefix("/").unwrap();
+                root.join(path)
+            } else {
+                parent.join(Path::new(dest.as_ref()))
+            };
+
+            let cchild = std::fs::canonicalize(&child).expect("could not canonicalize");
+            let relative = cchild.strip_prefix(&croot).expect("child not in root");
+            *dest = CowStr::from(format!("@/{}", relative.to_str().unwrap()));
+
+            e
+        }
+        _ => e,
+    });
+
+    let mut output = String::with_capacity(body.len() + (body.len() / 100));
+
+    cmark(events, &mut output).whatever_context("cannot write markdown")?;
+
+    println!("{}", output);
+
+    Ok(output)
+}
+
+fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
     let number_txt = path
         .file_name()
         .with_whatever_context(|| format!("no file name for `{}`", path.to_string_lossy()))?
@@ -280,6 +334,8 @@ fn process_assets(path: &Path) -> Result<(), Whatever> {
             format!("could not read file `{}`", path.to_string_lossy())
         })?;
 
+        let contents = fix_links(root, &path, &contents)?;
+
         let relative_path = path.strip_prefix(&assets_dir).unwrap();
         let relative_path = relative_path.with_file_name(relative_path.file_stem().unwrap());
 
@@ -292,13 +348,15 @@ fn process_assets(path: &Path) -> Result<(), Whatever> {
     Ok(())
 }
 
-fn process_eip(path: &Path) -> Result<(), Whatever> {
+fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
     let path_lossy = path.to_string_lossy();
     let contents = read_to_string(&path)
         .with_whatever_context(|_| format!("could not read file `{}`", path_lossy))?;
 
     let (preamble, body) = Preamble::split(&contents)
         .with_whatever_context(|_| format!("couldn't split preamble for `{}`", path_lossy))?;
+
+    let body = fix_links(root, path, body)?;
 
     let preamble = Preamble::parse(Some(&path_lossy), preamble)
         .ok()
@@ -383,7 +441,7 @@ fn process_eip(path: &Path) -> Result<(), Whatever> {
         }
     }
 
-    write_file(Path::new(&path), front_matter, body).whatever_context("couldn't write file")?;
+    write_file(Path::new(&path), front_matter, &body).whatever_context("couldn't write file")?;
 
     Ok(())
 }

@@ -11,6 +11,8 @@ rust-version = "1.71.1"
 chrono = "0.4.31"
 eipw-preamble = "0.1.0"
 lazy_static = "1.4.0"
+pulldown-cmark = "0.9.3"
+pulldown-cmark-to-cmark = "11.0.2"
 regex = "1.10.2"
 serde = { version = "1.0.192", features = ["derive"] }
 snafu = "0.7.5"
