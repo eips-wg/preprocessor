@@ -253,6 +253,43 @@ fn main() -> Result<(), Whatever> {
     Ok(())
 }
 
+fn canonicalize_md(path: &Path) -> Result<PathBuf, Whatever> {
+    let first_error = match std::fs::canonicalize(path) {
+        Ok(canon) => return Ok(canon),
+        Err(e) => e,
+    };
+
+    if path.extension() != Some(OsStr::new("md")) {
+        panic!("canonicalizing non-md file: {}", path.to_string_lossy());
+    }
+
+    let alt_path = match path.file_name().and_then(OsStr::to_str) {
+        Some("index.md") => {
+            let mut new_path = path.to_owned();
+            new_path.pop();
+            new_path.set_extension("md");
+            new_path
+        }
+        _ => {
+            let mut new_path = path.with_extension("");
+            new_path.push("index.md");
+            new_path
+        }
+    };
+
+    if let Ok(canon) = std::fs::canonicalize(&alt_path) {
+        return Ok(canon);
+    };
+
+    Err(first_error).with_whatever_context(|_| {
+        format!(
+            "could not canonicalize `{}` or `{}`",
+            path.to_string_lossy(),
+            alt_path.to_string_lossy()
+        )
+    })
+}
+
 fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -271,7 +308,18 @@ fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
         .map(|mut e| match &mut e {
             Event::Start(Tag::Image { dest_url, .. })
             | Event::Start(Tag::Link { dest_url, .. }) => {
-                if dest_url.starts_with("//") || dest_url.contains("://") || !dest_url.ends_with(".md") {
+                if dest_url.starts_with("//") {
+                    // Is a protocol-relative URL.
+                    return Ok(e);
+                }
+
+                if dest_url.contains("://") {
+                    // Is an absolute URL.
+                    return Ok(e);
+                }
+
+                if !dest_url.ends_with(".md") {
+                    // Only markdown files need the `@` syntax.
                     return Ok(e);
                 }
 
@@ -283,9 +331,7 @@ fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
                     parent.join(Path::new(dest_url.as_ref()))
                 };
 
-                let cchild = std::fs::canonicalize(&child).with_whatever_context(|_| {
-                    format!("could not canonicalize {}", child.to_string_lossy())
-                })?;
+                let cchild = canonicalize_md(&child)?;
                 let relative = cchild.strip_prefix(&croot).expect("child not in root");
                 *dest_url = CowStr::from(format!("@/{}", relative.to_str().unwrap()));
 
