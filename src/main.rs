@@ -269,27 +269,25 @@ fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
 
     let events = Parser::new_ext(body, opts)
         .map(|mut e| match &mut e {
-            Event::Start(Tag::Image(_, dest, _))
-            | Event::End(Tag::Image(_, dest, _))
-            | Event::Start(Tag::Link(_, dest, _))
-            | Event::End(Tag::Link(_, dest, _)) => {
-                if dest.starts_with("//") || dest.contains("://") || !dest.ends_with(".md") {
+            Event::Start(Tag::Image { dest_url, .. })
+            | Event::Start(Tag::Link { dest_url, .. }) => {
+                if dest_url.starts_with("//") || dest_url.contains("://") || !dest_url.ends_with(".md") {
                     return Ok(e);
                 }
 
-                let child = if dest.starts_with("/") {
-                    let mut path = Path::new(dest.as_ref());
+                let child = if dest_url.starts_with("/") {
+                    let mut path = Path::new(dest_url.as_ref());
                     path = path.strip_prefix("/").unwrap();
                     root.join(path)
                 } else {
-                    parent.join(Path::new(dest.as_ref()))
+                    parent.join(Path::new(dest_url.as_ref()))
                 };
 
                 let cchild = std::fs::canonicalize(&child).with_whatever_context(|_| {
                     format!("could not canonicalize {}", child.to_string_lossy())
                 })?;
                 let relative = cchild.strip_prefix(&croot).expect("child not in root");
-                *dest = CowStr::from(format!("@/{}", relative.to_str().unwrap()));
+                *dest_url = CowStr::from(format!("@/{}", relative.to_str().unwrap()));
 
                 Ok(e)
             }
