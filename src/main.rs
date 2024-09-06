@@ -169,7 +169,7 @@ fn write_file(path: &Path, front_matter: FrontMatter, body: &str) -> std::io::Re
     let mut output = std::fs::OpenOptions::new()
         .truncate(true)
         .write(true)
-        .open(&path)?;
+        .open(path)?;
     writeln!(output, "+++")?;
     writeln!(output, "{}", toml::to_string(&front_matter).unwrap())?;
     writeln!(output, "+++")?;
@@ -263,35 +263,40 @@ fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
 
     let parent = path.parent().unwrap();
 
-    let croot = std::fs::canonicalize(&root).with_whatever_context(|_| {
+    let croot = std::fs::canonicalize(root).with_whatever_context(|_| {
         format!("could not canonicalize `{}`", root.to_string_lossy())
     })?;
 
-    let events = Parser::new_ext(body, opts).map(|mut e| match &mut e {
-        Event::Start(Tag::Image(_, dest, _))
-        | Event::End(Tag::Image(_, dest, _))
-        | Event::Start(Tag::Link(_, dest, _))
-        | Event::End(Tag::Link(_, dest, _)) => {
-            if dest.starts_with("//") || dest.contains("://") || !dest.ends_with(".md") {
-                return e;
+    let events = Parser::new_ext(body, opts)
+        .map(|mut e| match &mut e {
+            Event::Start(Tag::Image(_, dest, _))
+            | Event::End(Tag::Image(_, dest, _))
+            | Event::Start(Tag::Link(_, dest, _))
+            | Event::End(Tag::Link(_, dest, _)) => {
+                if dest.starts_with("//") || dest.contains("://") || !dest.ends_with(".md") {
+                    return Ok(e);
+                }
+
+                let child = if dest.starts_with("/") {
+                    let mut path = Path::new(dest.as_ref());
+                    path = path.strip_prefix("/").unwrap();
+                    root.join(path)
+                } else {
+                    parent.join(Path::new(dest.as_ref()))
+                };
+
+                let cchild = std::fs::canonicalize(&child).with_whatever_context(|_| {
+                    format!("could not canonicalize {}", child.to_string_lossy())
+                })?;
+                let relative = cchild.strip_prefix(&croot).expect("child not in root");
+                *dest = CowStr::from(format!("@/{}", relative.to_str().unwrap()));
+
+                Ok(e)
             }
-
-            let child = if dest.starts_with("/") {
-                let mut path = Path::new(dest.as_ref());
-                path = path.strip_prefix("/").unwrap();
-                root.join(path)
-            } else {
-                parent.join(Path::new(dest.as_ref()))
-            };
-
-            let cchild = std::fs::canonicalize(&child).expect("could not canonicalize");
-            let relative = cchild.strip_prefix(&croot).expect("child not in root");
-            *dest = CowStr::from(format!("@/{}", relative.to_str().unwrap()));
-
-            e
-        }
-        _ => e,
-    });
+            _ => Ok(e),
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter();
 
     let mut output = String::with_capacity(body.len() + (body.len() / 100));
 
@@ -330,17 +335,19 @@ fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
         })?;
 
         let path = entry.path();
-        let contents = read_to_string(&path).with_whatever_context(|_| {
+        let contents = read_to_string(path).with_whatever_context(|_| {
             format!("could not read file `{}`", path.to_string_lossy())
         })?;
 
-        let contents = fix_links(root, &path, &contents)?;
+        let contents = fix_links(root, path, &contents)?;
 
         let relative_path = path.strip_prefix(&assets_dir).unwrap();
         let relative_path = relative_path.with_file_name(relative_path.file_stem().unwrap());
 
-        let mut front_matter = FrontMatter::default();
-        front_matter.path = format!("{number}/assets/{}", relative_path.to_str().unwrap());
+        let front_matter = FrontMatter {
+            path: format!("{number}/assets/{}", relative_path.to_str().unwrap()),
+            ..Default::default()
+        };
 
         write_file(path, front_matter, &contents).whatever_context("couldn't write file")?;
     }
@@ -350,7 +357,7 @@ fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
 
 fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
     let path_lossy = path.to_string_lossy();
-    let contents = read_to_string(&path)
+    let contents = read_to_string(path)
         .with_whatever_context(|_| format!("could not read file `{}`", path_lossy))?;
 
     let (preamble, body) = Preamble::split(&contents)
@@ -362,9 +369,10 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
         .ok()
         .with_whatever_context(|| format!("couldn't parse preamble in `{}`", path_lossy))?;
 
-    let mut front_matter = FrontMatter::default();
-
-    front_matter.updated = Some(last_modified(Path::new(&path))?);
+    let mut front_matter = FrontMatter {
+        updated: Some(last_modified(Path::new(&path))?),
+        ..Default::default()
+    };
 
     for field in preamble.fields() {
         let value = field.value().trim();
