@@ -346,8 +346,6 @@ fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
 
     cmark(events, &mut output).whatever_context("cannot write markdown")?;
 
-    println!("{}", output);
-
     Ok(output)
 }
 
