@@ -253,6 +253,24 @@ fn main() -> Result<(), Whatever> {
     Ok(())
 }
 
+fn path_to_at(root: &Path, parent: &Path, input: &str) -> Result<String, Whatever> {
+    let croot = std::fs::canonicalize(root).with_whatever_context(|_| {
+        format!("could not canonicalize `{}`", root.to_string_lossy())
+    })?;
+
+    let child = if input.starts_with("/") {
+        let mut path = Path::new(input);
+        path = path.strip_prefix("/").unwrap();
+        root.join(path)
+    } else {
+        parent.join(Path::new(input))
+    };
+
+    let cchild = canonicalize_md(&child)?;
+    let relative = cchild.strip_prefix(&croot).expect("child not in root");
+    Ok(format!("@/{}", relative.to_str().unwrap()))
+}
+
 fn canonicalize_md(path: &Path) -> Result<PathBuf, Whatever> {
     let first_error = match std::fs::canonicalize(path) {
         Ok(canon) => return Ok(canon),
@@ -300,10 +318,6 @@ fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
 
     let parent = path.parent().unwrap();
 
-    let croot = std::fs::canonicalize(root).with_whatever_context(|_| {
-        format!("could not canonicalize `{}`", root.to_string_lossy())
-    })?;
-
     let events = Parser::new_ext(body, opts)
         .map(|mut e| match &mut e {
             Event::Start(Tag::Image { dest_url, .. })
@@ -323,18 +337,7 @@ fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
                     return Ok(e);
                 }
 
-                let child = if dest_url.starts_with("/") {
-                    let mut path = Path::new(dest_url.as_ref());
-                    path = path.strip_prefix("/").unwrap();
-                    root.join(path)
-                } else {
-                    parent.join(Path::new(dest_url.as_ref()))
-                };
-
-                let cchild = canonicalize_md(&child)?;
-                let relative = cchild.strip_prefix(&croot).expect("child not in root");
-                *dest_url = CowStr::from(format!("@/{}", relative.to_str().unwrap()));
-
+                *dest_url = CowStr::from(path_to_at(root, parent, &dest_url)?);
                 Ok(e)
             }
             _ => Ok(e),
@@ -474,12 +477,18 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
                     .insert("author_details".into(), Value::from(authors));
             }
             "requires" => {
-                let items: Vec<u32> = value
+                let items: Vec<String> = value
                     .split(',')
                     .map(str::trim)
                     .map(str::parse)
-                    .collect::<Result<_, _>>()
-                    .whatever_context("could not parse requires")?;
+                    .collect::<Result<Vec<u32>, _>>()
+                    .whatever_context("could not parse requires")?
+                    .into_iter()
+                    .map(|eip| {
+                        let path = format!("/{eip:0>5}.md");
+                        path_to_at(root, root, &path)
+                    })
+                    .collect::<Result<_, _>>()?;
                 front_matter
                     .extra
                     .insert("requires".into(), Value::from(items));
