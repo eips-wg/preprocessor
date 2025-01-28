@@ -337,7 +337,7 @@ fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
                     return Ok(e);
                 }
 
-                *dest_url = CowStr::from(path_to_at(root, parent, &dest_url)?);
+                *dest_url = CowStr::from(path_to_at(root, parent, dest_url)?);
                 Ok(e)
             }
             _ => Ok(e),
