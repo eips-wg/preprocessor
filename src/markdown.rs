@@ -10,6 +10,7 @@ use eipw_preamble::Preamble;
 
 use lazy_static::lazy_static;
 
+use log::{debug, info, log_enabled};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag};
 
 use pulldown_cmark_to_cmark::cmark;
@@ -31,6 +32,8 @@ use toml::Value;
 use toml_datetime::Datetime;
 
 use walkdir::WalkDir;
+
+use crate::progress::ProgressIteratorExt;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Author {
@@ -224,17 +227,23 @@ fn extract_authors(value: &str) -> Result<Vec<Author>, Whatever> {
 }
 
 pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
+    info!("preprocessing markdown");
     let dir = std::fs::read_dir(&root_path).with_whatever_context(|_| {
         format!("could not read directory `{}`", root_path.to_string_lossy())
     })?;
+    let dirs: Vec<_> = dir.collect();
 
-    for entry in dir {
+    for entry in dirs.into_iter().progress_ext("Markdown") {
         let entry = entry.with_whatever_context(|_| {
             format!(
                 "could not read directory entry in `{}`",
                 root_path.to_string_lossy()
             )
         })?;
+
+        if log_enabled!(log::Level::Debug) {
+            debug!("preprocessing `{}`", entry.path().to_string_lossy());
+        }
 
         let file_type = entry.file_type().with_whatever_context(|_| {
             format!(
@@ -375,8 +384,9 @@ fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
             Ok(f) => f.path().extension().and_then(OsStr::to_str) == Some("md"),
             Err(_) => true,
         });
+    let dirs: Vec<_> = dir.collect();
 
-    for entry in dir {
+    for entry in dirs.into_iter().progress_ext("Assets") {
         let entry = entry.with_whatever_context(|_| {
             format!("couldn't read entry in `{}`", assets_dir.to_string_lossy())
         })?;
