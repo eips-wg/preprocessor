@@ -14,7 +14,7 @@ use enum_map::{enum_map, Enum, EnumMap};
 use git2::{
     build::{CheckoutBuilder, RepoBuilder, TreeUpdateBuilder},
     BranchType, Commit, FetchOptions, FileMode, ObjectType, Repository, StatusOptions, Tree,
-    TreeWalkResult,
+    TreeEntry, TreeWalkResult,
 };
 use log::{debug, info};
 use snafu::{ensure, Backtrace, OptionExt, Report, ResultExt, Snafu};
@@ -114,23 +114,33 @@ fn branch_to_commit<'a, 'b>(repo: &'a Repository, rev: &'b str) -> Result<Commit
         })
 }
 
-fn check_conflict(master_tree: &Tree, path: &Path) -> Result<(), Error> {
-    if path.ends_with(".gitignore") {
-        return Ok(());
-    }
-
-    let allowed = &[Path::new("content/LICENSE.md")];
-
-    if allowed.contains(&path) {
-        return Ok(());
-    }
+fn check_conflict(master_tree: &Tree, path: &Path, entry: &TreeEntry) -> Result<(), Error> {
+    let original = match master_tree.get_path(path) {
+        Err(_) => return Ok(()),
+        Ok(o) => o,
+    };
 
     ensure!(
-        master_tree.get_path(path).is_err(),
+        original.filemode() == entry.filemode(),
         UpdateTreeSnafu {
-            msg: format!("conflicting path `{}`", path.to_string_lossy()),
+            msg: format!("conflicting path `{}` (filemode)", path.to_string_lossy()),
         }
     );
+
+    ensure!(
+        original.kind() == entry.kind(),
+        UpdateTreeSnafu {
+            msg: format!("conflicting path `{}` (kind)", path.to_string_lossy()),
+        }
+    );
+
+    ensure!(
+        original.id() == entry.id(),
+        UpdateTreeSnafu {
+            msg: format!("conflicting path `{}` (id)", path.to_string_lossy()),
+        }
+    );
+
     Ok(())
 }
 
@@ -231,7 +241,7 @@ pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<(), Err
                 }
             }
 
-            if let Err(e) = check_conflict(&master_tree, Path::new(&path)) {
+            if let Err(e) = check_conflict(&master_tree, Path::new(&path), b) {
                 walk_error = Some(e);
                 return TreeWalkResult::Abort;
             }
