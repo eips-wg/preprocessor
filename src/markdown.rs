@@ -10,7 +10,7 @@ use eipw_preamble::Preamble;
 
 use lazy_static::lazy_static;
 
-use log::{debug, info, log_enabled};
+use log::{debug, info, log_enabled, Level};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag};
 
 use pulldown_cmark_to_cmark::cmark;
@@ -227,11 +227,12 @@ fn extract_authors(value: &str) -> Result<Vec<Author>, Whatever> {
 }
 
 pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
-    info!("preprocessing markdown");
     let dir = std::fs::read_dir(&root_path).with_whatever_context(|_| {
         format!("could not read directory `{}`", root_path.to_string_lossy())
     })?;
     let dirs: Vec<_> = dir.collect();
+
+    info!("preprocessing markdown");
 
     for entry in dirs.into_iter().progress_ext("Markdown") {
         let entry = entry.with_whatever_context(|_| {
@@ -240,10 +241,7 @@ pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
                 root_path.to_string_lossy()
             )
         })?;
-
-        if log_enabled!(log::Level::Debug) {
-            debug!("preprocessing `{}`", entry.path().to_string_lossy());
-        }
+        let entry_path = entry.path();
 
         let file_type = entry.file_type().with_whatever_context(|_| {
             format!(
@@ -252,12 +250,22 @@ pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
             )
         })?;
 
-        let path = entry.path();
+        if log_enabled!(Level::Debug) {
+            let relative = match entry_path.strip_prefix(root_path) {
+                Ok(r) => r,
+                Err(_) => &entry_path,
+            };
+            match relative.with_extension("").to_string_lossy().parse::<u64>() {
+                Ok(n) => debug!("preprocessing {}", n),
+                Err(_) => debug!("preprocessing `{}`", relative.to_string_lossy()),
+            }
+        }
+
         if file_type.is_dir() {
-            process_eip(&root_path, &path.join("index.md"))?;
-            process_assets(&root_path, &path)?;
-        } else if path.extension().and_then(OsStr::to_str) == Some("md") {
-            process_eip(&root_path, &path)?;
+            process_eip(&root_path, &entry_path.join("index.md"))?;
+            process_assets(&root_path, &entry_path)?;
+        } else if entry_path.extension().and_then(OsStr::to_str) == Some("md") {
+            process_eip(&root_path, &entry_path)?;
         }
     }
 

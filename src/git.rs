@@ -5,19 +5,23 @@
  */
 
 use std::{
+    ffi::OsStr,
     fmt,
     path::{Path, PathBuf},
 };
 
-use crate::progress::{Git, ProgressIteratorExt};
+use crate::{
+    cache::Cache,
+    progress::{Git, ProgressIteratorExt},
+};
 use enum_map::{enum_map, Enum, EnumMap};
 use git2::{
     build::{CheckoutBuilder, RepoBuilder, TreeUpdateBuilder},
-    BranchType, Commit, FetchOptions, FileMode, ObjectType, Repository, StatusOptions, Tree,
-    TreeEntry, TreeWalkResult,
+    BranchType, Commit, FetchOptions, FileMode, ObjectType, Repository, RepositoryOpenFlags,
+    StatusOptions, Tree, TreeEntry, TreeWalkResult,
 };
 use log::{debug, info};
-use snafu::{ensure, Backtrace, OptionExt, Report, ResultExt, Snafu};
+use snafu::{ensure, Backtrace, IntoError, OptionExt, Report, ResultExt, Snafu};
 use url::Url;
 
 #[derive(Debug, Snafu)]
@@ -36,6 +40,11 @@ pub enum Error {
     Dirty { backtrace: Backtrace },
     #[snafu(display("unable to update tree ({msg})"))]
     UpdateTree { msg: String, backtrace: Backtrace },
+    #[snafu(context(false))]
+    Cache {
+        #[snafu(backtrace)]
+        source: crate::cache::Error,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
@@ -147,12 +156,11 @@ fn check_conflict(master_tree: &Tree, path: &Path, entry: &TreeEntry) -> Result<
 pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<(), Error> {
     check_dirty(root_path)?;
 
-    let repo_path = build_path.join(super::COMBINED_DIR);
     let url = Url::from_directory_path(root_path)
         .ok()
         .context(PathUrlSnafu { path: root_path })?;
 
-    if let Err(e) = std::fs::remove_dir_all(&repo_path) {
+    if let Err(e) = std::fs::remove_dir_all(&build_path) {
         debug!(
             "got while removing combined repo: {}",
             Report::from_error(e)
@@ -167,7 +175,7 @@ pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<(), Err
         fetch_options.remote_callbacks(git_progress.remote_callbacks());
         let x = RepoBuilder::new()
             .fetch_options(fetch_options)
-            .clone(url.as_str(), &repo_path)
+            .clone(url.as_str(), &build_path)
             .context(GitSnafu {
                 what: "clone local repo",
             })?;
@@ -180,20 +188,7 @@ pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<(), Err
 
     for (other_kind, other_repo) in repo_use.other_repos().iter().progress_ext("Merge Repos") {
         info!("fetching {other_kind} repository");
-        debug!("{other_kind} repository at `{other_repo}`");
-        let mut remote = repo.remote_anonymous(&other_repo).context(GitSnafu {
-            what: "creating remote",
-        })?;
-        {
-            let git_progress = Git::new();
-            let mut fetch_options = FetchOptions::new();
-            fetch_options.remote_callbacks(git_progress.remote_callbacks());
-            remote
-                .fetch(&["master:master-other"], Some(&mut fetch_options), None)
-                .context(GitSnafu {
-                    what: "fetching remote repo",
-                })?;
-        }
+        fetch(&repo, &other_repo, "master:master-other")?;
         let master = branch_to_commit(&repo, "master")?;
         let master_tree = master.tree().context(GitSnafu {
             what: "getting master tree",
@@ -294,4 +289,71 @@ pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<(), Err
     }
 
     Ok(())
+}
+
+fn fetch(repo: &Repository, url: &str, refspec: &str) -> Result<(), Error> {
+    debug!("fetching repository at `{url}`");
+    let mut remote = repo.remote_anonymous(url).context(GitSnafu {
+        what: "creating remote",
+    })?;
+    {
+        let git_progress = Git::new();
+        let mut fetch_options = FetchOptions::new();
+        fetch_options.remote_callbacks(git_progress.remote_callbacks());
+        remote
+            .fetch(&[refspec], Some(&mut fetch_options), None)
+            .context(GitSnafu {
+                what: "fetching remote repo",
+            })?;
+    }
+    Ok(())
+}
+
+impl Cache {
+    pub fn repo(&self, url: &str, commit: &str) -> Result<PathBuf, Error> {
+        let key = format!("git\0{url}");
+        let dir = self.dir(&key)?;
+
+        let repo =
+            match Repository::open_ext(&dir, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr]) {
+                Ok(r) => r,
+                Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                    Repository::init(&dir).context(GitSnafu {
+                        what: "init cached repo",
+                    })?
+                }
+                Err(e) => {
+                    return Err(GitSnafu {
+                        what: "open cached repo",
+                    }
+                    .into_error(e))
+                }
+            };
+
+        let object = match repo.revparse_single(commit) {
+            Ok(c) => c,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                fetch(&repo, url, "master")?;
+                repo.revparse_single(commit).context(GitSnafu {
+                    what: "revparse cached commit",
+                })?
+            }
+            Err(e) => {
+                return Err(GitSnafu {
+                    what: "revparse cached commit",
+                }
+                .into_error(e))
+            }
+        };
+
+        repo.checkout_tree(&object, Some(CheckoutBuilder::new().force()))
+            .context(GitSnafu {
+                what: "checkout cached commit",
+            })?;
+        repo.set_head_detached(object.id()).context(GitSnafu {
+            what: "set detached head",
+        })?;
+
+        Ok(dir)
+    }
 }
