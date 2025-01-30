@@ -96,6 +96,16 @@ pub fn check() -> Result<(), Error> {
 }
 
 pub fn build(cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(), Error> {
+    zola("build", cache, project_path, output_path)
+}
+
+pub fn serve(cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(), Error> {
+    // TODO: Properly kill the child process when we receive ctrl-c.
+    warn!("live reloading is not implemented");
+    zola("serve", cache, project_path, output_path)
+}
+
+fn zola(mode: &str, cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(), Error> {
     check()?;
 
     info!("invoking zola");
@@ -109,7 +119,6 @@ pub fn build(cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(
         "8dcc8efa5a6330c12356194aeb3db827c21dfe63",
     )?;
 
-    //let new_config = patch_config(path, &theme_dir)?;
     let config_path: PathBuf = [&theme_dir, Path::new("config"), Path::new("zola.toml")]
         .iter()
         .collect();
@@ -132,7 +141,7 @@ pub fn build(cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(
         "zola",
         "-c",
         config_path,
-        "build",
+        mode,
         "--drafts",
         "-o",
         output_path

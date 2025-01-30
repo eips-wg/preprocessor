@@ -13,7 +13,7 @@ mod zola;
 
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use fslock::LockFile;
 use log::{debug, info};
 use snafu::{Report, ResultExt, Whatever};
@@ -30,6 +30,18 @@ struct Args {
     /// Use ROOT as the base directory (instead of finding it automatically)
     #[clap(short = 'C')]
     root: Option<PathBuf>,
+
+    #[clap(subcommand)]
+    operation: Operation,
+}
+
+#[derive(Debug, Subcommand)]
+enum Operation {
+    /// Build the project and output HTML
+    Build,
+
+    /// Build the project and launch a web server to preview it
+    Serve,
 }
 
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
@@ -88,7 +100,14 @@ fn run() -> Result<(), Whatever> {
 
     let cache = cache::Cache::open().whatever_context("unable to open cache")?;
 
-    zola::build(&cache, &repo_path, &output_path).whatever_context("zola build failed")?;
+    match args.operation {
+        Operation::Build => {
+            zola::build(&cache, &repo_path, &output_path).whatever_context("zola build failed")?
+        }
+        Operation::Serve => {
+            zola::serve(&cache, &repo_path, &output_path).whatever_context("zola serve failed")?
+        }
+    }
 
     lock_file
         .unlock()
