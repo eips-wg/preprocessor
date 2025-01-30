@@ -42,6 +42,9 @@ enum Operation {
 
     /// Build the project and launch a web server to preview it
     Serve,
+
+    /// Remove temporary and output files
+    Clean,
 }
 
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
@@ -80,32 +83,69 @@ fn make_build_dir(root: &Path) -> Result<PathBuf, Whatever> {
     Ok(build_path)
 }
 
+#[derive(Debug)]
+struct Prepared {
+    cache: cache::Cache,
+    repo_path: PathBuf,
+    output_path: PathBuf,
+}
+
+impl Prepared {
+    fn prepare(root_path: PathBuf, build_path: PathBuf) -> Result<Self, Whatever> {
+        zola::check().whatever_context("unable to find suitable zola binary")?;
+
+        let repo_path = build_path.join(REPO_DIR);
+        let content_path = repo_path.join(CONTENT_DIR);
+        let output_path = build_path.join(OUTPUT_DIR);
+
+        git::merge_repositories(&root_path, &repo_path)
+            .whatever_context("unable to merge EIP/ERC repositories")?;
+
+        markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
+
+        let cache = cache::Cache::open().whatever_context("unable to open cache")?;
+
+        Ok(Prepared {
+            cache,
+            repo_path,
+            output_path,
+        })
+    }
+
+    fn build(self) -> Result<(), Whatever> {
+        zola::build(&self.cache, &self.repo_path, &self.output_path)
+            .whatever_context("zola build failed")?;
+        Ok(())
+    }
+
+    fn serve(self) -> Result<(), Whatever> {
+        zola::serve(&self.cache, &self.repo_path, &self.output_path)
+            .whatever_context("zola serve failed")?;
+        Ok(())
+    }
+}
+
 fn run() -> Result<(), Whatever> {
     let args = Args::parse();
-
-    zola::check().whatever_context("unable to find suitable zola binary")?;
-
     let root_path = root(&args)?;
     let build_path = make_build_dir(&root_path)?;
-    let repo_path = build_path.join(REPO_DIR);
-    let content_path = repo_path.join(CONTENT_DIR);
-    let output_path = build_path.join(OUTPUT_DIR);
 
     let mut lock_file = lock(&build_path)?;
 
-    git::merge_repositories(&root_path, &repo_path)
-        .whatever_context("unable to merge EIP/ERC repositories")?;
-
-    markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
-
-    let cache = cache::Cache::open().whatever_context("unable to open cache")?;
-
     match args.operation {
+        Operation::Clean => {
+            lock_file
+                .unlock()
+                .whatever_context("unable to unlock build directory")?;
+            std::fs::remove_dir_all(build_path)
+                .whatever_context("unable to remove build directory")?;
+            return Ok(());
+        }
         Operation::Build => {
-            zola::build(&cache, &repo_path, &output_path).whatever_context("zola build failed")?
+            Prepared::prepare(root_path, build_path)?.build()?;
         }
         Operation::Serve => {
-            zola::serve(&cache, &repo_path, &output_path).whatever_context("zola serve failed")?
+            Prepared::prepare(root_path, build_path)?.serve()?;
         }
     }
 
