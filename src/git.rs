@@ -74,13 +74,17 @@ impl RepositoryUse {
     const EIP_COMMIT: &str = "0f44e2b94df4e504bb7b912f56ebd712db2ad396";
     const ERC_COMMIT: &str = "8dd085d159cb123f545c272c0d871a5339550e79";
 
-    fn identify(repo: &Repository) -> Result<Self, Error> {
-        let eip = repo.revparse_single(Self::EIP_COMMIT);
-        let erc = repo.revparse_single(Self::ERC_COMMIT);
+    fn identify(path: &Path) -> Result<Self, Error> {
+        let repo = Repository::open_ext(path, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr])
+            .context(GitSnafu {
+                what: "identify open",
+            })?;
+        let eip = repo.revparse_single(Self::EIP_COMMIT).is_ok();
+        let erc = repo.revparse_single(Self::ERC_COMMIT).is_ok();
 
         match (eip, erc) {
-            (Ok(_), Err(_)) => Ok(Self::Eips),
-            (Err(_), Ok(_)) => Ok(Self::Ercs),
+            (true, false) => Ok(Self::Eips),
+            (false, true) => Ok(Self::Ercs),
             (_, _) => IdentifySnafu.fail(),
         }
     }
@@ -156,44 +160,44 @@ fn check_conflict(master_tree: &Tree, path: &Path, entry: &TreeEntry) -> Result<
 pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<(), Error> {
     check_dirty(root_path)?;
 
+    let repo_use = RepositoryUse::identify(root_path)?;
+
     let url = Url::from_directory_path(root_path)
         .ok()
         .context(PathUrlSnafu { path: root_path })?;
 
-    if let Err(e) = std::fs::remove_dir_all(&build_path) {
-        debug!(
-            "got while removing combined repo: {}",
-            Report::from_error(e)
-        );
-    }
-
     info!("cloning local repository");
     debug!("local repository at `{url}`");
-    let repo = {
-        let git_progress = Git::new();
-        let mut fetch_options = FetchOptions::new();
-        fetch_options.remote_callbacks(git_progress.remote_callbacks());
-        let x = RepoBuilder::new()
-            .fetch_options(fetch_options)
-            .clone(url.as_str(), &build_path)
-            .context(GitSnafu {
-                what: "clone local repo",
-            })?;
-        x
-    };
+    let repo = open_or_init(build_path)?;
+    let master = fetch(&repo, url.as_str(), "HEAD")?;
+    repo.set_head_detached(master.id())
+        .context(GitSnafu { what: "detach" })?;
+    let branch = repo.branch("master", &master, true).context(GitSnafu {
+        what: "branch master",
+    })?;
+    repo.set_head("refs/heads/master")
+        .context(GitSnafu { what: "set head" })?;
+    assert!(branch.is_head());
+    repo.checkout_head(Some(
+        CheckoutBuilder::default()
+            .remove_ignored(true)
+            .remove_untracked(true)
+            .force(),
+    ))
+    .context(GitSnafu {
+        what: "checkout local",
+    })?;
+
     if !repo.submodules().unwrap().is_empty() {
         panic!("submodules not supported yet");
     }
-    let repo_use = RepositoryUse::identify(&repo)?;
 
     for (other_kind, other_repo) in repo_use.other_repos().iter().progress_ext("Merge Repos") {
         info!("fetching {other_kind} repository");
-        fetch(&repo, &other_repo, "master:master-other")?;
-        let master = branch_to_commit(&repo, "master")?;
+        let master_other = fetch(&repo, &other_repo, "master:master-other")?;
         let master_tree = master.tree().context(GitSnafu {
             what: "getting master tree",
         })?;
-        let master_other = branch_to_commit(&repo, "master-other")?;
         let other_tree = master_other.tree().context(GitSnafu {
             what: "getting other tree",
         })?;
@@ -291,7 +295,7 @@ pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<(), Err
     Ok(())
 }
 
-fn fetch(repo: &Repository, url: &str, refspec: &str) -> Result<(), Error> {
+fn fetch<'a>(repo: &'a Repository, url: &'_ str, refspec: &'_ str) -> Result<Commit<'a>, Error> {
     debug!("fetching repository at `{url}`");
     let mut remote = repo.remote_anonymous(url).context(GitSnafu {
         what: "creating remote",
@@ -303,10 +307,30 @@ fn fetch(repo: &Repository, url: &str, refspec: &str) -> Result<(), Error> {
         remote
             .fetch(&[refspec], Some(&mut fetch_options), None)
             .context(GitSnafu {
-                what: "fetching remote repo",
+                what: "fetching repo",
             })?;
     }
-    Ok(())
+    let commit = repo
+        .revparse_single("FETCH_HEAD")
+        .context(GitSnafu {
+            what: "revparse FETCH_HEAD",
+        })?
+        .peel_to_commit()
+        .context(GitSnafu {
+            what: "peel FETCH_HEAD",
+        })?;
+    Ok(commit)
+}
+
+fn open_or_init(dir: &Path) -> Result<Repository, Error> {
+    let repo = match Repository::open_ext(dir, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr]) {
+        Ok(r) => r,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {
+            Repository::init(&dir).context(GitSnafu { what: "init repo" })?
+        }
+        Err(e) => return Err(GitSnafu { what: "open repo" }.into_error(e)),
+    };
+    Ok(repo)
 }
 
 impl Cache {
@@ -314,22 +338,7 @@ impl Cache {
         let key = format!("git\0{url}");
         let dir = self.dir(&key)?;
 
-        let repo =
-            match Repository::open_ext(&dir, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr]) {
-                Ok(r) => r,
-                Err(e) if e.code() == git2::ErrorCode::NotFound => {
-                    Repository::init(&dir).context(GitSnafu {
-                        what: "init cached repo",
-                    })?
-                }
-                Err(e) => {
-                    return Err(GitSnafu {
-                        what: "open cached repo",
-                    }
-                    .into_error(e))
-                }
-            };
-
+        let repo = open_or_init(&dir)?;
         let object = match repo.revparse_single(commit) {
             Ok(c) => c,
             Err(e) if e.code() == git2::ErrorCode::NotFound => {
