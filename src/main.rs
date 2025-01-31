@@ -45,6 +45,9 @@ enum Operation {
 
     /// Remove temporary and output files
     Clean,
+
+    /// Analyze the repository and report errors, but don't build HTML files
+    Check,
 }
 
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
@@ -92,7 +95,7 @@ struct Prepared {
 
 impl Prepared {
     fn prepare(root_path: PathBuf, build_path: PathBuf) -> Result<Self, Whatever> {
-        zola::check().whatever_context("unable to find suitable zola binary")?;
+        zola::find_zola().whatever_context("unable to find suitable zola binary")?;
 
         let repo_path = build_path.join(REPO_DIR);
         let content_path = repo_path.join(CONTENT_DIR);
@@ -123,6 +126,11 @@ impl Prepared {
             .whatever_context("zola serve failed")?;
         Ok(())
     }
+
+    fn check(self) -> Result<(), Whatever> {
+        zola::check(&self.cache, &self.repo_path).whatever_context("zola check failed")?;
+        Ok(())
+    }
 }
 
 fn run() -> Result<(), Whatever> {
@@ -140,6 +148,9 @@ fn run() -> Result<(), Whatever> {
             std::fs::remove_dir_all(build_path)
                 .whatever_context("unable to remove build directory")?;
             return Ok(());
+        }
+        Operation::Check => {
+            Prepared::prepare(root_path, build_path)?.check()?;
         }
         Operation::Build => {
             Prepared::prepare(root_path, build_path)?.build()?;
