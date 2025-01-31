@@ -5,6 +5,7 @@
  */
 
 use std::{
+    ffi::OsString,
     io::{BufRead, BufReader, ErrorKind},
     path::{Path, PathBuf},
 };
@@ -77,7 +78,7 @@ pub enum Error {
     },
 }
 
-pub fn check() -> Result<(), Error> {
+pub fn find_zola() -> Result<(), Error> {
     let text = match duct::cmd!("zola", "--version").stdin_null().read() {
         Ok(t) => t,
         Err(e) if e.kind() == ErrorKind::NotFound => return Err(MissingSnafu.into_error(e)),
@@ -95,33 +96,63 @@ pub fn check() -> Result<(), Error> {
     Ok(())
 }
 
+pub fn check(cache: &Cache, project_path: &Path) -> Result<(), Error> {
+    let args = ["check", "--drafts", "--skip-external-links"];
+    spawn_log(cache, project_path, args)?;
+    Ok(())
+}
+
 pub fn build(cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(), Error> {
-    zola("build", cache, project_path, output_path)
+    remove_output(output_path);
+    let args = ["build", "--drafts", "-o"]
+        .map(OsString::from)
+        .into_iter()
+        .chain(std::iter::once(output_path.into()));
+    spawn_log(cache, project_path, args)?;
+    if let Ok(url) = Url::from_file_path(output_path) {
+        info!("HTML output to: {}", url);
+    }
+    Ok(())
 }
 
 pub fn serve(cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(), Error> {
     // TODO: Properly kill the child process when we receive ctrl-c.
     warn!("live reloading is not implemented");
-    zola("serve", cache, project_path, output_path)
+    remove_output(output_path);
+    let args = ["serve", "--drafts", "-o"]
+        .map(OsString::from)
+        .into_iter()
+        .chain(std::iter::once(output_path.into()));
+    spawn_log(cache, project_path, args)?;
+    Ok(())
 }
 
-fn zola(mode: &str, cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(), Error> {
-    check()?;
+fn remove_output(output_path: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(&output_path) {
+        debug!(
+            "got while removing output directory: {}",
+            Report::from_error(e)
+        );
+    }
+}
 
+fn spawn_log<U, I>(cache: &Cache, project_path: &Path, args: U) -> Result<(), Error>
+where
+    U: IntoIterator<Item = I>,
+    I: Into<OsString>,
+{
     info!("invoking zola");
     debug!(
         "zola project directory is `{}`",
         project_path.to_string_lossy()
     );
 
+    find_zola()?;
+
     let theme_dir = cache.repo(
         "https://github.com/eips-wg/theme.git",
-        "8dcc8efa5a6330c12356194aeb3db827c21dfe63",
+        "492c78e5e60acce22b71f33a92a32b3be7ee88a6",
     )?;
-
-    let config_path: PathBuf = [&theme_dir, Path::new("config"), Path::new("zola.toml")]
-        .iter()
-        .collect();
 
     let mut themes_dir = project_path.join("themes");
     if let Err(e) = std::fs::create_dir(&themes_dir) {
@@ -130,27 +161,18 @@ fn zola(mode: &str, cache: &Cache, project_path: &Path, output_path: &Path) -> R
     themes_dir.push("eips-theme");
     force_symlink_dir(&theme_dir, &themes_dir).context(FsSnafu { path: &themes_dir })?;
 
-    if let Err(e) = std::fs::remove_dir_all(&output_path) {
-        debug!(
-            "got while removing output directory: {}",
-            Report::from_error(e)
-        );
-    }
+    let config_path: PathBuf = [&theme_dir, Path::new("config"), Path::new("zola.toml")]
+        .iter()
+        .collect();
 
-    let reader = duct::cmd!(
-        "zola",
-        "-c",
-        config_path,
-        mode,
-        "--drafts",
-        "-o",
-        output_path
-    )
-    .dir(project_path)
-    .stdin_null()
-    .stderr_to_stdout()
-    .reader()
-    .context(IoSnafu)?;
+    let prefix = [OsString::from("-c"), config_path.into()].into_iter();
+    let args = prefix.chain(args.into_iter().map(Into::into));
+    let reader = duct::cmd("zola", args)
+        .dir(project_path)
+        .stdin_null()
+        .stderr_to_stdout()
+        .reader()
+        .context(IoSnafu)?;
 
     let mut buf = BufReader::new(reader);
     let mut line = String::new();
@@ -175,10 +197,6 @@ fn zola(mode: &str, cache: &Cache, project_path: &Path, output_path: &Path) -> R
         .try_wait()
         .context(IoSnafu)?
         .expect("zola should have exited");
-
-    if let Ok(url) = Url::from_file_path(output_path) {
-        info!("HTML output to: {}", url);
-    }
 
     Ok(())
 }
