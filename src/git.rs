@@ -16,12 +16,12 @@ use crate::{
 };
 use enum_map::{enum_map, Enum, EnumMap};
 use git2::{
-    build::{CheckoutBuilder, RepoBuilder, TreeUpdateBuilder},
+    build::{CheckoutBuilder, TreeUpdateBuilder},
     BranchType, Commit, FetchOptions, FileMode, ObjectType, Repository, RepositoryOpenFlags,
     StatusOptions, Tree, TreeEntry, TreeWalkResult,
 };
 use log::{debug, info};
-use snafu::{ensure, Backtrace, IntoError, OptionExt, Report, ResultExt, Snafu};
+use snafu::{ensure, Backtrace, IntoError, OptionExt, ResultExt, Snafu};
 use url::Url;
 
 #[derive(Debug, Snafu)]
@@ -113,18 +113,6 @@ pub fn check_dirty(root_path: &Path) -> Result<(), Error> {
     } else {
         Ok(())
     }
-}
-
-fn branch_to_commit<'a, 'b>(repo: &'a Repository, rev: &'b str) -> Result<Commit<'a>, Error> {
-    repo.find_branch(rev, BranchType::Local)
-        .context(GitSnafu {
-            what: "revparse to annotated",
-        })?
-        .into_reference()
-        .peel_to_commit()
-        .context(GitSnafu {
-            what: "peel to annotated",
-        })
 }
 
 fn check_conflict(master_tree: &Tree, path: &Path, entry: &TreeEntry) -> Result<(), Error> {
