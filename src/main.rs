@@ -7,6 +7,7 @@
 mod cache;
 mod find_root;
 mod git;
+mod lint;
 mod markdown;
 mod progress;
 mod zola;
@@ -37,17 +38,32 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Operation {
+    // TODO:
+    // Config {
+    //     - Print default eipw configuration.
+    //     - List available eipw lints.
+    //     - Print schema version.
+    // }
     /// Build the project and output HTML
-    Build,
+    Build {
+        #[command(flatten)]
+        eipw: lint::CmdArgs,
+    },
 
     /// Build the project and launch a web server to preview it
-    Serve,
+    Serve {
+        #[command(flatten)]
+        eipw: lint::CmdArgs,
+    },
 
     /// Remove temporary and output files
     Clean,
 
     /// Analyze the repository and report errors, but don't build HTML files
-    Check,
+    Check {
+        #[command(flatten)]
+        eipw: lint::CmdArgs,
+    },
 }
 
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
@@ -94,7 +110,11 @@ struct Prepared {
 }
 
 impl Prepared {
-    fn prepare(root_path: PathBuf, build_path: PathBuf) -> Result<Self, Whatever> {
+    fn prepare(
+        eipw: lint::CmdArgs,
+        root_path: PathBuf,
+        build_path: PathBuf,
+    ) -> Result<Self, Whatever> {
         zola::find_zola().whatever_context("unable to find suitable zola binary")?;
 
         let repo_path = build_path.join(REPO_DIR);
@@ -103,6 +123,9 @@ impl Prepared {
 
         git::merge_repositories(&root_path, &repo_path)
             .whatever_context("unable to merge EIP/ERC repositories")?;
+
+        lint::eipw(&root_path.join("eipw.toml"), &content_path, eipw)
+            .whatever_context("linting failed")?;
 
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
 
@@ -142,6 +165,8 @@ fn run() -> Result<(), Whatever> {
 
     match args.operation {
         Operation::Clean => {
+            // TODO: There's a race condition here. Maybe we move the lockfile to the repository
+            //       root?
             lock_file
                 .unlock()
                 .whatever_context("unable to unlock build directory")?;
@@ -149,14 +174,14 @@ fn run() -> Result<(), Whatever> {
                 .whatever_context("unable to remove build directory")?;
             return Ok(());
         }
-        Operation::Check => {
-            Prepared::prepare(root_path, build_path)?.check()?;
+        Operation::Check { eipw } => {
+            Prepared::prepare(eipw, root_path, build_path)?.check()?;
         }
-        Operation::Build => {
-            Prepared::prepare(root_path, build_path)?.build()?;
+        Operation::Build { eipw } => {
+            Prepared::prepare(eipw, root_path, build_path)?.build()?;
         }
-        Operation::Serve => {
-            Prepared::prepare(root_path, build_path)?.serve()?;
+        Operation::Serve { eipw } => {
+            Prepared::prepare(eipw, root_path, build_path)?.serve()?;
         }
     }
 
