@@ -224,7 +224,7 @@ pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<Vec<Pat
 
     for (other_kind, other_repo) in repo_use.other_repos().iter().progress_ext("Merge Repos") {
         info!("fetching {other_kind} repository");
-        let master_other = fetch(&repo, &other_repo, "master:master-other")?;
+        let master_other = fetch(&repo, other_repo, "master:master-other")?;
         let other_tree = master_other.tree().context(GitSnafu {
             what: "getting other tree",
         })?;
@@ -233,10 +233,8 @@ pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<Vec<Pat
         let prefix = format!("{}/", super::CONTENT_DIR);
         let mut walk_error: Option<Error> = None;
         let walk_result = other_tree.walk(git2::TreeWalkMode::PreOrder, |a, b| {
-            if !a.starts_with(&prefix) {
-                if !a.is_empty() || b.name() != Some(super::CONTENT_DIR) {
-                    return TreeWalkResult::Skip;
-                }
+            if !a.starts_with(&prefix) && (!a.is_empty() || b.name() != Some(super::CONTENT_DIR)) {
+                return TreeWalkResult::Skip;
             }
 
             let name = match b.name() {
@@ -353,7 +351,7 @@ fn open_or_init(dir: &Path) -> Result<Repository, Error> {
     let repo = match Repository::open_ext(dir, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr]) {
         Ok(r) => r,
         Err(e) if e.code() == git2::ErrorCode::NotFound => {
-            Repository::init(&dir).context(GitSnafu { what: "init repo" })?
+            Repository::init(dir).context(GitSnafu { what: "init repo" })?
         }
         Err(e) => return Err(GitSnafu { what: "open repo" }.into_error(e)),
     };

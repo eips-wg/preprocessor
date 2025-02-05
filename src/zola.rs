@@ -128,7 +128,7 @@ pub fn serve(cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(
 }
 
 fn remove_output(output_path: &Path) {
-    if let Err(e) = std::fs::remove_dir_all(&output_path) {
+    if let Err(e) = std::fs::remove_dir_all(output_path) {
         debug!(
             "got while removing output directory: {}",
             Report::from_error(e)

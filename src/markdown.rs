@@ -227,7 +227,7 @@ fn extract_authors(value: &str) -> Result<Vec<Author>, Whatever> {
 }
 
 pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
-    let dir = std::fs::read_dir(&root_path).with_whatever_context(|_| {
+    let dir = std::fs::read_dir(root_path).with_whatever_context(|_| {
         format!("could not read directory `{}`", root_path.to_string_lossy())
     })?;
     let dirs: Vec<_> = dir.collect();
@@ -262,10 +262,10 @@ pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
         }
 
         if file_type.is_dir() {
-            process_eip(&root_path, &entry_path.join("index.md"))?;
-            process_assets(&root_path, &entry_path)?;
+            process_eip(root_path, &entry_path.join("index.md"))?;
+            process_assets(root_path, &entry_path)?;
         } else if entry_path.extension().and_then(OsStr::to_str) == Some("md") {
-            process_eip(&root_path, &entry_path)?;
+            process_eip(root_path, &entry_path)?;
         }
     }
 

@@ -129,7 +129,7 @@ impl Git {
         ))
     }
 
-    pub fn remote_callbacks<'a>(&'a self) -> git2::RemoteCallbacks<'a> {
+    pub fn remote_callbacks(&self) -> git2::RemoteCallbacks<'_> {
         let mut cb = git2::RemoteCallbacks::new();
 
         cb.transfer_progress(move |stats| {
