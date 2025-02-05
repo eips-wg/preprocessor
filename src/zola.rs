@@ -149,10 +149,7 @@ where
 
     find_zola()?;
 
-    let theme_dir = cache.repo(
-        crate::THEME_REPO,
-        crate::THEME_REV,
-    )?;
+    let theme_dir = cache.repo(crate::THEME_REPO, crate::THEME_REV)?;
 
     let mut themes_dir = project_path.join("themes");
     if let Err(e) = std::fs::create_dir(&themes_dir) {

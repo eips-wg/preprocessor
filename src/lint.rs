@@ -9,6 +9,7 @@ use eipw_snippets::Message;
 
 use clap::ValueEnum;
 use log::debug;
+use semver::{Comparator, Op, VersionReq};
 
 use crate::cache::Cache;
 use crate::progress::ProgressIteratorExt;
@@ -53,10 +54,30 @@ pub enum Error {
         #[snafu(backtrace)]
         source: crate::git::Error,
     },
+    #[snafu(display(
+        "eipw configuration (`{}`) is incompatible with this application (`{}`)",
+        file_version,
+        application_version
+    ))]
+    SchemaVersion {
+        file_version: semver::Version,
+        application_version: semver::Version,
+        backtrace: Backtrace,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ConfigVersion {
+    schema_version: semver::Version,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 struct Config {
+    #[serde(flatten)]
+    config_version: ConfigVersion,
+
     command: CmdArgs,
 
     #[serde(flatten)]
@@ -121,25 +142,6 @@ impl Reporter for EitherReporter {
             Self::Json(j) => j.report(snippet),
         }
     }
-}
-
-fn defaults() {
-    let options = DefaultOptions::<String>::default();
-
-    let output = toml::to_string_pretty(&options).unwrap();
-
-    println!("{output}\n");
-}
-
-fn list_lints() {
-    let options = DefaultOptions::<String>::default();
-    println!("Available lints:");
-
-    for (slug, _) in options.lints {
-        println!("\t{}", slug);
-    }
-
-    println!();
 }
 
 async fn collect_sources(sources: Vec<PathBuf>) -> Result<Vec<PathBuf>, Error> {
@@ -211,6 +213,18 @@ async fn collect_sources(sources: Vec<PathBuf>) -> Result<Vec<PathBuf>, Error> {
     Ok(output)
 }
 
+fn version_to_req(version: &semver::Version) -> semver::VersionReq {
+    VersionReq {
+        comparators: vec![Comparator {
+            op: Op::Caret,
+            major: version.major,
+            minor: Some(version.minor),
+            patch: Some(version.patch),
+            pre: version.pre.clone(),
+        }],
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 pub async fn eipw(
     cache: &Cache,
@@ -225,17 +239,40 @@ pub async fn eipw(
 
     let mut stdout = std::io::stdout();
 
-    let mut config_path = cache.repo(
-        crate::THEME_REPO,
-        crate::THEME_REV,
-    )?;
+    let mut config_path = cache.repo(crate::THEME_REPO, crate::THEME_REV)?;
 
     config_path.push("config");
     config_path.push("eipw.toml");
 
+    let toml_file = Toml::file_exact(&config_path);
+
+    let file_version = Figment::new()
+        .merge(&toml_file)
+        .extract::<ConfigVersion>()
+        .context(ConfigSnafu)?
+        .schema_version;
+
+    let application_version = DefaultOptions::<String>::schema_version();
+
+    if file_version == application_version && file_version.build != application_version.build {
+        return SchemaVersionSnafu {
+            application_version,
+            file_version,
+        }
+        .fail();
+    }
+
+    ensure!(
+        version_to_req(&file_version).matches(&application_version),
+        SchemaVersionSnafu {
+            file_version,
+            application_version,
+        }
+    );
+
     let config: Config = Figment::new()
         .merge(DefaultOptions::<String>::figment())
-        .merge(Toml::file_exact(config_path))
+        .merge(toml_file)
         .merge(Serialized::global("command", opts))
         .extract()
         .context(ConfigSnafu)?;
