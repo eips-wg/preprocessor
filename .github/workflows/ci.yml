@@ -1,0 +1,44 @@
+name: ci
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - master
+jobs:
+  build:
+    strategy:
+      matrix:
+        rust-version: ["1.84.0"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            rust-version: stable
+    name: ${{ matrix.os }} - ${{ matrix.rust-version }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install (Rust)
+        run: |
+          rustup toolchain install ${{ matrix.rust-version }} --profile default --no-self-update
+          rustup default ${{ matrix.rust-version }}
+          cargo --version
+      - name: Cache (Rust)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Lint
+        if: matrix.rust-version != 'stable'
+        run: |
+          echo ::group::rustfmt
+          cargo fmt --check
+          echo ::endgroup::
+          echo ::group::clippy
+          cargo clippy --locked -- -Dwarnings
+          echo ::endgroup::
+      - name: Test
+        env:
+          RUSTFLAGS: "-Dwarnings"
+        run: |
+          cargo test --locked
