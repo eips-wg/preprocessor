@@ -150,8 +150,8 @@ where
     find_zola()?;
 
     let theme_dir = cache.repo(
-        "https://github.com/eips-wg/theme.git",
-        "492c78e5e60acce22b71f33a92a32b3be7ee88a6",
+        crate::THEME_REPO,
+        crate::THEME_REV,
     )?;
 
     let mut themes_dir = project_path.join("themes");

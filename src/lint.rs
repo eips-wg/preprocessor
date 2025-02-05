@@ -10,6 +10,7 @@ use eipw_snippets::Message;
 use clap::ValueEnum;
 use log::debug;
 
+use crate::cache::Cache;
 use crate::progress::ProgressIteratorExt;
 
 use eipw_lint::reporters::{AdditionalHelp, Count, Json, Reporter, Text};
@@ -46,6 +47,11 @@ pub enum Error {
         path: PathBuf,
         backtrace: Backtrace,
         source: std::io::Error,
+    },
+    #[snafu(transparent)]
+    Git {
+        #[snafu(backtrace)]
+        source: crate::git::Error,
     },
 }
 
@@ -207,9 +213,9 @@ async fn collect_sources(sources: Vec<PathBuf>) -> Result<Vec<PathBuf>, Error> {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn eipw(
+    cache: &Cache,
     root_dir: &Path,
     repo_dir: &Path,
-    config_path: &Path,
     changed_paths: Vec<PathBuf>,
     opts: CmdArgs,
 ) -> Result<(), Error> {
@@ -218,6 +224,14 @@ pub async fn eipw(
     }
 
     let mut stdout = std::io::stdout();
+
+    let mut config_path = cache.repo(
+        crate::THEME_REPO,
+        crate::THEME_REV,
+    )?;
+
+    config_path.push("config");
+    config_path.push("eipw.toml");
 
     let config: Config = Figment::new()
         .merge(DefaultOptions::<String>::figment())

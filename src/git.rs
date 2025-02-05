@@ -65,8 +65,8 @@ impl fmt::Display for RepositoryUse {
 
 lazy_static::lazy_static! {
     static ref REPO_URLS: EnumMap<RepositoryUse, &'static str> = enum_map! {
-        RepositoryUse::Eips => "https://github.com/ethereum/EIPs.git",
-        RepositoryUse::Ercs => "https://github.com/ethereum/ERCs.git",
+        RepositoryUse::Eips => "https://github.com/eips-wg/EIPs.git",
+        RepositoryUse::Ercs => "https://github.com/eips-wg/ERCs.git",
     };
 }
 
