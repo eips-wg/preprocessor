@@ -188,6 +188,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eeab4423108c5d7c744f4d234de88d18d636100093ae04caf4825134b9c3a32"
 
 [[package]]
+name = "build-eips"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "directories",
+ "duct",
+ "eipw-lint",
+ "eipw-preamble 0.2.0",
+ "eipw-snippets 0.2.0-dev",
+ "enum-map",
+ "env_logger",
+ "figment",
+ "fslock",
+ "git2",
+ "indicatif",
+ "indicatif-log-bridge",
+ "lazy_static",
+ "log",
+ "pulldown-cmark",
+ "pulldown-cmark-to-cmark",
+ "regex",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha3",
+ "snafu",
+ "tokio",
+ "toml",
+ "toml_datetime",
+ "url",
+ "walkdir",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -481,41 +516,6 @@ name = "ego-tree"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2972feb8dffe7bc8c5463b1dacda1b0dfbed3710e50f977d965429692d74cd8"
-
-[[package]]
-name = "eips-zola"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "directories",
- "duct",
- "eipw-lint",
- "eipw-preamble 0.2.0",
- "eipw-snippets 0.2.0-dev",
- "enum-map",
- "env_logger",
- "figment",
- "fslock",
- "git2",
- "indicatif",
- "indicatif-log-bridge",
- "lazy_static",
- "log",
- "pulldown-cmark",
- "pulldown-cmark-to-cmark",
- "regex",
- "semver",
- "serde",
- "serde_json",
- "sha3",
- "snafu",
- "tokio",
- "toml",
- "toml_datetime",
- "url",
- "walkdir",
-]
 
 [[package]]
 name = "eipw-lint"
