@@ -133,6 +133,7 @@ impl Default for FrontMatter {
 }
 
 fn last_modified(p: &Path) -> Result<Datetime, Whatever> {
+    // TODO: Replace this with `git2`
     let mut command = std::process::Command::new("git");
     command
         .current_dir(p.parent().unwrap())
