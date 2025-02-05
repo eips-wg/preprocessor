@@ -4,8 +4,19 @@ version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.84.0"
+readme = "README.md"
+repository = "https://github.com/ethereum/eips-build"
+description = "Lint and render Ethereum Improvement Proposals (EIPs / ERCs)"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata.deb]
+maintainer = "Sam Wilson <sam@binarycake.ca>"
+copyright = "2024-2025, Ethereum Foundation"
+license-file = ["LICENSE.md", "0"]
+section = "text"
+priority = "optional"
+depends = "$auto, libc6, libssl3, zlib1g, libgcc-s1, libgit2-1.5, git"
 
 [dependencies]
 chrono = "0.4.39"
