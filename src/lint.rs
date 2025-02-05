@@ -54,16 +54,23 @@ pub enum Error {
         #[snafu(backtrace)]
         source: crate::git::Error,
     },
-    #[snafu(display(
-        "eipw configuration (`{}`) is incompatible with this application (`{}`)",
-        file_version,
-        application_version
-    ))]
+    #[snafu(transparent)]
     SchemaVersion {
-        file_version: semver::Version,
-        application_version: semver::Version,
-        backtrace: Backtrace,
+        #[snafu(backtrace)]
+        source: SchemaVersionError,
     },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "eipw configuration (`{}`) is incompatible with this application (`{}`)",
+    file_version,
+    application_version
+))]
+pub struct SchemaVersionError {
+    pub file_version: Box<semver::Version>,
+    pub application_version: Box<semver::Version>,
+    pub backtrace: Backtrace,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -213,16 +220,37 @@ async fn collect_sources(sources: Vec<PathBuf>) -> Result<Vec<PathBuf>, Error> {
     Ok(output)
 }
 
-fn version_to_req(version: &semver::Version) -> semver::VersionReq {
-    VersionReq {
+fn version_cmp(
+    file_version: semver::Version,
+    application_version: semver::Version,
+) -> Result<(), SchemaVersionError> {
+    if file_version == application_version && file_version.build != application_version.build {
+        return SchemaVersionSnafu {
+            application_version,
+            file_version,
+        }
+        .fail();
+    }
+
+    let req = VersionReq {
         comparators: vec![Comparator {
             op: Op::Caret,
-            major: version.major,
-            minor: Some(version.minor),
-            patch: Some(version.patch),
-            pre: version.pre.clone(),
+            major: file_version.major,
+            minor: Some(file_version.minor),
+            patch: Some(file_version.patch),
+            pre: file_version.pre.clone(),
         }],
-    }
+    };
+
+    ensure!(
+        req.matches(&application_version),
+        SchemaVersionSnafu {
+            file_version,
+            application_version,
+        }
+    );
+
+    Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -254,21 +282,7 @@ pub async fn eipw(
 
     let application_version = DefaultOptions::<String>::schema_version();
 
-    if file_version == application_version && file_version.build != application_version.build {
-        return SchemaVersionSnafu {
-            application_version,
-            file_version,
-        }
-        .fail();
-    }
-
-    ensure!(
-        version_to_req(&file_version).matches(&application_version),
-        SchemaVersionSnafu {
-            file_version,
-            application_version,
-        }
-    );
+    version_cmp(file_version, application_version)?;
 
     let config: Config = Figment::new()
         .merge(DefaultOptions::<String>::figment())
