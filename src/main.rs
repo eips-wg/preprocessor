@@ -12,7 +12,10 @@ mod markdown;
 mod progress;
 mod zola;
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 use clap::{Parser, Subcommand};
 use fslock::LockFile;
@@ -110,6 +113,44 @@ struct Prepared {
 }
 
 impl Prepared {
+    fn is_proposal_path(p: PathBuf) -> bool {
+        // Only lint `content/00001.md` and `content/00001/index.md` files.
+        let mut p = p.to_path_buf();
+
+        // content/00000.md  |  content/00000/index.md
+        //         ^^^^^^^^  |                ^^^^^^^^
+        match p.file_name() {
+            Some(n) if n == "index.md" => {
+                p.pop();
+            }
+            Some(_) if p.extension().map(|x| x == "md").unwrap_or(false) => {
+                p.set_extension("");
+            }
+            None | Some(_) => return false,
+        }
+
+        // content/00000
+        //         ^^^^^
+        match p.file_name().and_then(OsStr::to_str) {
+            None => return false,
+            Some(f) if f.parse::<u64>().is_err() => return false,
+            Some(_) => {
+                p.pop();
+            }
+        }
+
+        // content
+        // ^^^^^^^
+        match p.file_name() {
+            Some(f) if f == "content" => {
+                p.pop();
+            }
+            _ => return false,
+        }
+
+        p == OsStr::new("")
+    }
+
     fn prepare(
         eipw: lint::CmdArgs,
         root_path: PathBuf,
@@ -121,11 +162,21 @@ impl Prepared {
         let content_path = repo_path.join(CONTENT_DIR);
         let output_path = build_path.join(OUTPUT_DIR);
 
-        git::merge_repositories(&root_path, &repo_path)
-            .whatever_context("unable to merge EIP/ERC repositories")?;
+        let changed_files: Vec<_> = git::merge_repositories(&root_path, &repo_path)
+            .whatever_context("unable to merge EIP/ERC repositories")?
+            .into_iter()
+            .filter(|p| Self::is_proposal_path(p.into()))
+            .map(|p| repo_path.join(p))
+            .collect();
 
-        lint::eipw(&root_path.join("eipw.toml"), &content_path, eipw)
-            .whatever_context("linting failed")?;
+        lint::eipw(
+            &root_path,
+            &repo_path,
+            &root_path.join("eipw.toml"),
+            changed_files,
+            eipw,
+        )
+        .whatever_context("linting failed")?;
 
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
 

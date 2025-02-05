@@ -514,7 +514,7 @@ dependencies = [
 [[package]]
 name = "eipw-lint"
 version = "0.10.0-dev"
-source = "git+https://github.com/ethereum/eipw.git?branch=schema-version#b6930911a0b91fd71fc16ca924c617f4bdec9b2d"
+source = "git+https://github.com/ethereum/eipw.git?branch=schema-version#d3e1263ec0833a11ce78e57aeaebb898edb3cbe7"
 dependencies = [
  "chrono",
  "comrak",
@@ -547,7 +547,7 @@ dependencies = [
 [[package]]
 name = "eipw-preamble"
 version = "0.3.0-dev"
-source = "git+https://github.com/ethereum/eipw.git?branch=schema-version#b6930911a0b91fd71fc16ca924c617f4bdec9b2d"
+source = "git+https://github.com/ethereum/eipw.git?branch=schema-version#d3e1263ec0833a11ce78e57aeaebb898edb3cbe7"
 dependencies = [
  "eipw-snippets 0.2.0-dev",
  "regex",
@@ -567,7 +567,7 @@ dependencies = [
 [[package]]
 name = "eipw-snippets"
 version = "0.2.0-dev"
-source = "git+https://github.com/ethereum/eipw.git?branch=schema-version#b6930911a0b91fd71fc16ca924c617f4bdec9b2d"
+source = "git+https://github.com/ethereum/eipw.git?branch=schema-version#d3e1263ec0833a11ce78e57aeaebb898edb3cbe7"
 dependencies = [
  "annotate-snippets",
  "serde",
