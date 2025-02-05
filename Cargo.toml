@@ -12,7 +12,7 @@ chrono = "0.4.39"
 clap = { version = "4.5.27", features = ["cargo", "derive"] }
 directories = "6.0.0"
 duct = "0.13.7"
-eipw-lint = { git = "https://github.com/ethereum/eipw.git", branch = "schema-version", version = "0.10.0-dev" }
+eipw-lint = { git = "https://github.com/ethereum/eipw.git", branch = "schema-version", version = "0.10.0-dev", features = [ "tokio" ] }
 eipw-snippets = { git = "https://github.com/ethereum/eipw.git", branch = "schema-version", version = "0.2.0-dev" }
 eipw-preamble = "0.2.0"
 enum-map = "2.7.3"
@@ -39,4 +39,4 @@ url = "2.5.4"
 walkdir = "2.5.0"
 
 [features]
-backtrace = [ "snafu/backtrace" ]
+backtrace = [ "snafu/backtrace", "eipw-lint/backtrace" ]

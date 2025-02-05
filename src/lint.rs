@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use eipw_lint::config::{DefaultOptions, Override};
+use eipw_lint::config::DefaultOptions;
 use eipw_snippets::Message;
 
 use clap::ValueEnum;
@@ -60,7 +60,11 @@ struct Config {
 #[derive(Debug, clap::Args, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CmdArgs {
-    /// Restrict linting to specific files and/or directories
+    /// Disable linting entirely
+    #[arg(long, exclusive(true))]
+    no_lint: bool,
+
+    /// Restrict linting to specific files and/or directories (relative to project root)
     #[clap(required(false))]
     sources: Vec<PathBuf>,
 
@@ -202,7 +206,17 @@ async fn collect_sources(sources: Vec<PathBuf>) -> Result<Vec<PathBuf>, Error> {
 }
 
 #[tokio::main(flavor = "current_thread")]
-pub async fn eipw(config_path: &Path, content_path: &Path, opts: CmdArgs) -> Result<(), Error> {
+pub async fn eipw(
+    root_dir: &Path,
+    repo_dir: &Path,
+    config_path: &Path,
+    changed_paths: Vec<PathBuf>,
+    opts: CmdArgs,
+) -> Result<(), Error> {
+    if opts.no_lint {
+        return Ok(());
+    }
+
     let mut stdout = std::io::stdout();
 
     let config: Config = Figment::new()
@@ -215,9 +229,36 @@ pub async fn eipw(config_path: &Path, content_path: &Path, opts: CmdArgs) -> Res
     let opts = config.command;
 
     let paths = if opts.sources.is_empty() {
-        vec![content_path.to_path_buf()]
+        changed_paths
     } else {
-        opts.sources
+        let root_dir = tokio::fs::canonicalize(root_dir)
+            .await
+            .context(FsSnafu { path: root_dir })?;
+        let repo_dir = tokio::fs::canonicalize(repo_dir)
+            .await
+            .context(FsSnafu { path: repo_dir })?;
+
+        let mut repo_relative_sources = Vec::with_capacity(opts.sources.len());
+        for source in &opts.sources {
+            let root_relative_source = root_dir.join(source);
+            let full_source = tokio::fs::canonicalize(&root_relative_source)
+                .await
+                .context(FsSnafu {
+                    path: root_relative_source,
+                })?;
+
+            let relative_source = match full_source.strip_prefix(&root_dir) {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = std::io::Error::new(std::io::ErrorKind::NotFound, e);
+                    return Err(FsSnafu { path: full_source }.into_error(err));
+                }
+            };
+
+            repo_relative_sources.push(repo_dir.join(relative_source));
+        }
+
+        repo_relative_sources
     };
 
     let sources = collect_sources(paths).await?;
@@ -249,10 +290,7 @@ pub async fn eipw(config_path: &Path, content_path: &Path, opts: CmdArgs) -> Res
             let (k, v) = lints
                 .remove_entry(warn.as_str())
                 .context(NoLintSnafu { name: warn })?;
-            match v {
-                Override::Enable(v) => linter = linter.warn(k, v),
-                _ => unreachable!(),
-            }
+            linter = linter.warn(k, v.into_lint().unwrap());
         }
     }
 
@@ -263,10 +301,7 @@ pub async fn eipw(config_path: &Path, content_path: &Path, opts: CmdArgs) -> Res
             let (k, v) = lints
                 .remove_entry(deny.as_str())
                 .context(NoLintSnafu { name: deny })?;
-            match v {
-                Override::Enable(v) => linter = linter.deny(k, v),
-                _ => unreachable!(),
-            }
+            linter = linter.deny(k, v.into_lint().unwrap());
         }
     }
 

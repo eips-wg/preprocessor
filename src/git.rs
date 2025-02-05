@@ -89,6 +89,10 @@ impl RepositoryUse {
         }
     }
 
+    fn url(self) -> &'static str {
+        REPO_URLS[self]
+    }
+
     fn other_repos(self) -> Vec<(Self, &'static str)> {
         REPO_URLS.into_iter().filter(|(k, _)| *k != self).collect()
     }
@@ -145,7 +149,7 @@ fn check_conflict(master_tree: &Tree, path: &Path, entry: &TreeEntry) -> Result<
     Ok(())
 }
 
-pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<(), Error> {
+pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<Vec<PathBuf>, Error> {
     check_dirty(root_path)?;
 
     let repo_use = RepositoryUse::identify(root_path)?;
@@ -180,12 +184,47 @@ pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<(), Err
         panic!("submodules not supported yet");
     }
 
+    info!("fetching latest {repo_use} repository");
+    let latest_master = fetch(&repo, repo_use.url(), "master")?;
+    let merge_base = repo
+        .merge_base(master.id(), latest_master.id())
+        .context(GitSnafu { what: "merge base" })?;
+    debug!(
+        "merge base of `{}` (local) and `{}` (latest) is `{}`",
+        master.id(),
+        latest_master.id(),
+        merge_base
+    );
+
+    let merge_base_tree = repo
+        .find_commit(merge_base)
+        .context(GitSnafu {
+            what: "getting merge base commit",
+        })?
+        .tree()
+        .context(GitSnafu {
+            what: "getting merge base tree",
+        })?;
+
+    let master_tree = master.tree().context(GitSnafu {
+        what: "getting master tree",
+    })?;
+
+    let diff = repo
+        .diff_tree_to_tree(Some(&merge_base_tree), Some(&master_tree), None)
+        .context(GitSnafu {
+            what: "comparing merge base to master",
+        })?;
+
+    let changed_files = diff
+        .deltas()
+        .filter_map(|d| d.new_file().path())
+        .map(Path::to_path_buf)
+        .collect();
+
     for (other_kind, other_repo) in repo_use.other_repos().iter().progress_ext("Merge Repos") {
         info!("fetching {other_kind} repository");
         let master_other = fetch(&repo, &other_repo, "master:master-other")?;
-        let master_tree = master.tree().context(GitSnafu {
-            what: "getting master tree",
-        })?;
         let other_tree = master_other.tree().context(GitSnafu {
             what: "getting other tree",
         })?;
@@ -280,7 +319,7 @@ pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<(), Err
             })?;
     }
 
-    Ok(())
+    Ok(changed_files)
 }
 
 fn fetch<'a>(repo: &'a Repository, url: &'_ str, refspec: &'_ str) -> Result<Commit<'a>, Error> {
