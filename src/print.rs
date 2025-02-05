@@ -1,0 +1,43 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+use eipw_lint::config::DefaultOptions;
+
+#[derive(Debug, clap::Args, Clone)]
+pub struct CmdArgs {
+    /// Thing to print
+    what: What,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum What {
+    SchemaVersion,
+    AvailableLints,
+    DefaultLints,
+}
+
+fn list_lints() {
+    let options = DefaultOptions::<String>::default();
+    for (slug, _) in options.lints {
+        println!("{}", slug);
+    }
+}
+
+fn defaults() {
+    let options = DefaultOptions::<String>::default();
+
+    let output = toml::to_string_pretty(&options).unwrap();
+
+    println!("{output}\n");
+}
+
+pub fn print(args: CmdArgs) {
+    match args.what {
+        What::SchemaVersion => println!("{}", DefaultOptions::<String>::schema_version()),
+        What::AvailableLints => list_lints(),
+        What::DefaultLints => defaults(),
+    }
+}

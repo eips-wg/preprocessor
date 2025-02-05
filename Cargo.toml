@@ -12,7 +12,7 @@ chrono = "0.4.39"
 clap = { version = "4.5.27", features = ["cargo", "derive"] }
 directories = "6.0.0"
 duct = "0.13.7"
-eipw-lint = { git = "https://github.com/ethereum/eipw.git", branch = "schema-version", version = "0.10.0-dev", features = [ "tokio" ] }
+eipw-lint = { git = "https://github.com/ethereum/eipw.git", branch = "schema-version", version = "0.10.0-dev", features = [ "tokio", "schema-version" ] }
 eipw-snippets = { git = "https://github.com/ethereum/eipw.git", branch = "schema-version", version = "0.2.0-dev" }
 eipw-preamble = "0.2.0"
 enum-map = "2.7.3"
@@ -27,7 +27,7 @@ log = { version = "0.4.25", features = ["std"] }
 pulldown-cmark = "0.12.2"
 pulldown-cmark-to-cmark = "20.0.0"
 regex = "1.11.1"
-semver = "1.0.25"
+semver = {version = "1.0.25", features = ["serde"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
 sha3 = "0.10.8"

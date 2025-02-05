@@ -9,6 +9,7 @@ mod find_root;
 mod git;
 mod lint;
 mod markdown;
+mod print;
 mod progress;
 mod zola;
 
@@ -28,7 +29,7 @@ const REPO_DIR: &str = "repo";
 const OUTPUT_DIR: &str = "output";
 
 const THEME_REPO: &str = "https://github.com/eips-wg/theme.git";
-const THEME_REV: &str = "99842b8c9f06c6b085f6efb28b166c9fbd5855c7";
+const THEME_REV: &str = "6161766e7429441ce784d5251ba25029702b0f26";
 
 /// Build script for Ethereum EIPs and ERCs.
 #[derive(Parser, Debug)]
@@ -44,12 +45,12 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Operation {
-    // TODO:
-    // Config {
-    //     - Print default eipw configuration.
-    //     - List available eipw lints.
-    //     - Print schema version.
-    // }
+    /// Print various useful things, like available lints
+    Print {
+        #[command(flatten)]
+        print: print::CmdArgs,
+    },
+
     /// Build the project and output HTML
     Build {
         #[command(flatten)]
@@ -174,14 +175,8 @@ impl Prepared {
 
         let cache = cache::Cache::open().whatever_context("unable to open cache")?;
 
-        lint::eipw(
-            &cache,
-            &root_path,
-            &repo_path,
-            changed_files,
-            eipw,
-        )
-        .whatever_context("linting failed")?;
+        lint::eipw(&cache, &root_path, &repo_path, changed_files, eipw)
+            .whatever_context("linting failed")?;
 
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
 
@@ -212,12 +207,18 @@ impl Prepared {
 
 fn run() -> Result<(), Whatever> {
     let args = Args::parse();
+    if let Operation::Print { print } = args.operation {
+        print::print(print);
+        return Ok(());
+    }
+
     let root_path = root(&args)?;
     let build_path = make_build_dir(&root_path)?;
 
     let mut lock_file = lock(&build_path)?;
 
     match args.operation {
+        Operation::Print { .. } => unreachable!(),
         Operation::Clean => {
             // TODO: There's a race condition here. Maybe we move the lockfile to the repository
             //       root?
