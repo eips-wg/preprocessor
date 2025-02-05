@@ -27,6 +27,9 @@ const BUILD_DIR: &str = "build";
 const REPO_DIR: &str = "repo";
 const OUTPUT_DIR: &str = "output";
 
+const THEME_REPO: &str = "https://github.com/eips-wg/theme.git";
+const THEME_REV: &str = "99842b8c9f06c6b085f6efb28b166c9fbd5855c7";
+
 /// Build script for Ethereum EIPs and ERCs.
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -169,18 +172,18 @@ impl Prepared {
             .map(|p| repo_path.join(p))
             .collect();
 
+        let cache = cache::Cache::open().whatever_context("unable to open cache")?;
+
         lint::eipw(
+            &cache,
             &root_path,
             &repo_path,
-            &root_path.join("eipw.toml"),
             changed_files,
             eipw,
         )
         .whatever_context("linting failed")?;
 
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
-
-        let cache = cache::Cache::open().whatever_context("unable to open cache")?;
 
         Ok(Prepared {
             cache,
