@@ -1,0 +1,54 @@
+name: release
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  RUSTFLAGS: "-Dwarnings"
+  CARGO_INCREMENTAL: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        rust-version: ["1.84.1"]
+        os: [ubuntu, windows, macos]
+    name: ${{ matrix.os }} - ${{ matrix.rust-version }}
+    runs-on: ${{ matrix.os }}-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install (Rust)
+        run: |
+          rustup toolchain install ${{ matrix.rust-version }} --profile default --no-self-update
+          rustup default ${{ matrix.rust-version }}
+          cargo --version
+      - name: Build
+        run: |
+          cargo build --locked --release
+      - name: Compress (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          EIPS_BUILD_ARCHIVE: build-eips-${{ github.ref_name }}-${{ matrix.os }}.zip
+        run: |
+          md dist
+          cd target/release
+          $targetPath = Join-Path -Path (Resolve-Path ..\..\dist) -ChildPath $Env:EIPS_BUILD_ARCHIVE
+          Compress-Archive -Path build-eips.exe -DestinationPath $targetPath
+      - name: Compress (Unix)
+        if: matrix.os != 'windows'
+        env:
+          EIPS_BUILD_ARCHIVE: dist/build-eips-${{ github.ref_name }}-${{ matrix.os }}.tar.xz
+        run: |
+          mkdir dist
+          tar cavf "$EIPS_BUILD_ARCHIVE" -C target/release build-eips
+      - name: Release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda
+        with:
+          files: |
+            dist/*
