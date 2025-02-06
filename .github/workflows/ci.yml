@@ -9,7 +9,7 @@ jobs:
   build:
     strategy:
       matrix:
-        rust-version: ["1.84.0"]
+        rust-version: ["1.84.1"]
         os: [ubuntu-latest, windows-latest, macos-latest]
         include:
           - os: ubuntu-latest
