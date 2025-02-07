@@ -20,6 +20,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use fslock::LockFile;
+use git::RepositoryUse;
 use log::{debug, info};
 use snafu::{Report, ResultExt, Whatever};
 
@@ -112,6 +113,7 @@ fn make_build_dir(root: &Path) -> Result<PathBuf, Whatever> {
 #[derive(Debug)]
 struct Prepared {
     cache: cache::Cache,
+    root_path: PathBuf,
     repo_path: PathBuf,
     output_path: PathBuf,
 }
@@ -181,6 +183,7 @@ impl Prepared {
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
 
         Ok(Prepared {
+            root_path,
             cache,
             repo_path,
             output_path,
@@ -188,8 +191,15 @@ impl Prepared {
     }
 
     fn build(self) -> Result<(), Whatever> {
-        zola::build(&self.cache, &self.repo_path, &self.output_path)
-            .whatever_context("zola build failed")?;
+        let repository_use = RepositoryUse::identify(&self.root_path)
+            .whatever_context("cannot identify repository use")?;
+        zola::build(
+            &self.cache,
+            &self.repo_path,
+            &self.output_path,
+            repository_use.base_url(),
+        )
+        .whatever_context("zola build failed")?;
         Ok(())
     }
 

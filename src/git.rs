@@ -48,7 +48,7 @@ pub enum Error {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
-enum RepositoryUse {
+pub enum RepositoryUse {
     Eips,
     Ercs,
 }
@@ -68,13 +68,18 @@ lazy_static::lazy_static! {
         RepositoryUse::Eips => "https://github.com/eips-wg/EIPs.git",
         RepositoryUse::Ercs => "https://github.com/eips-wg/ERCs.git",
     };
+
+    static ref BASE_URLS: EnumMap<RepositoryUse, &'static str> = enum_map! {
+        RepositoryUse::Eips => "https://eips.ethereum.org/",
+        RepositoryUse::Ercs => "https://ercs.ethereum.org/",
+    };
 }
 
 impl RepositoryUse {
     const EIP_COMMIT: &str = "0f44e2b94df4e504bb7b912f56ebd712db2ad396";
     const ERC_COMMIT: &str = "8dd085d159cb123f545c272c0d871a5339550e79";
 
-    fn identify(path: &Path) -> Result<Self, Error> {
+    pub fn identify(path: &Path) -> Result<Self, Error> {
         let repo = Repository::open_ext(path, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr])
             .context(GitSnafu {
                 what: "identify open",
@@ -95,6 +100,10 @@ impl RepositoryUse {
 
     fn other_repos(self) -> Vec<(Self, &'static str)> {
         REPO_URLS.into_iter().filter(|(k, _)| *k != self).collect()
+    }
+
+    pub fn base_url(self) -> &'static str {
+        BASE_URLS[self]
     }
 }
 

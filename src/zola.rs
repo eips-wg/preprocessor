@@ -102,9 +102,14 @@ pub fn check(cache: &Cache, project_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn build(cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(), Error> {
+pub fn build(
+    cache: &Cache,
+    project_path: &Path,
+    output_path: &Path,
+    base_url: &str,
+) -> Result<(), Error> {
     remove_output(output_path);
-    let args = ["build", "--drafts", "-o"]
+    let args = ["build", "--drafts", "-u", base_url, "-o"]
         .map(OsString::from)
         .into_iter()
         .chain(std::iter::once(output_path.into()));
