@@ -34,7 +34,7 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         env:
-          EIPS_BUILD_ARCHIVE: build-eips-${{ github.ref_name }}-${{ matrix.os }}.zip
+          EIPS_BUILD_ARCHIVE: build-eips-${{ matrix.os }}.zip
         run: |
           md dist
           cd target/release
@@ -43,7 +43,7 @@ jobs:
       - name: Compress (Unix)
         if: matrix.os != 'windows'
         env:
-          EIPS_BUILD_ARCHIVE: dist/build-eips-${{ github.ref_name }}-${{ matrix.os }}.tar.xz
+          EIPS_BUILD_ARCHIVE: dist/build-eips-${{ matrix.os }}.tar.xz
         run: |
           mkdir dist
           tar cavf "$EIPS_BUILD_ARCHIVE" -C target/release build-eips
