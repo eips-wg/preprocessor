@@ -72,6 +72,54 @@ enum Operation {
         #[command(flatten)]
         eipw: lint::CmdArgs,
     },
+
+    /// List files changed since the last commit common to both the local and upstream repositories
+    Changed {
+        /// List all changed files, not just proposals
+        #[arg(long, short)]
+        all: bool,
+        #[clap(long, value_enum, default_value_t)]
+        format: ChangedFormat,
+    },
+}
+
+#[derive(Debug, clap::ValueEnum, Clone, Default)]
+enum ChangedFormat {
+    #[default]
+    Newline,
+    Nul,
+    Json,
+}
+
+impl ChangedFormat {
+    fn print_sep(files: &[&Path], sep: &str) {
+        let files: Vec<_> = files
+            .iter()
+            .map(|f| f.to_str().expect("path not UTF-8"))
+            .collect();
+        println!("{}", files.join(sep));
+    }
+
+    fn print_json(files: &[&Path]) {
+        let stdout = std::io::stdout();
+        serde_json::to_writer_pretty(stdout, files).unwrap();
+    }
+
+    fn print(&self, files: &[PathBuf], repo_path: &Path) {
+        let files: Vec<_> = files
+            .iter()
+            .map(|f| match f.strip_prefix(repo_path) {
+                Ok(p) => p,
+                _ => f,
+            })
+            .collect();
+
+        match self {
+            Self::Newline => Self::print_sep(&files, "\n"),
+            Self::Nul => Self::print_sep(&files, "\0"),
+            Self::Json => Self::print_json(&files),
+        }
+    }
 }
 
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
@@ -168,12 +216,23 @@ impl Prepared {
         let content_path = repo_path.join(CONTENT_DIR);
         let output_path = build_path.join(OUTPUT_DIR);
 
-        let changed_files: Vec<_> = git::merge_repositories(&root_path, &repo_path)
-            .whatever_context("unable to merge EIP/ERC repositories")?
+        let both = git::Fresh::new(&root_path, &repo_path)
+            .whatever_context("initializing build repo")?
+            .clone_src()
+            .whatever_context("cloning source repo")?
+            .fetch_upstream()
+            .whatever_context("fetching upstream repo")?;
+
+        let changed_files: Vec<_> = both
+            .changed_files()
+            .whatever_context("unable to list changed files")?
             .into_iter()
             .filter(|p| Self::is_proposal_path(p.into()))
             .map(|p| repo_path.join(p))
             .collect();
+
+        both.merge()
+            .whatever_context("unable to merge ERC/EIP repositories")?;
 
         let cache = cache::Cache::open().whatever_context("unable to open cache")?;
 
@@ -247,6 +306,26 @@ fn run() -> Result<(), Whatever> {
         }
         Operation::Serve { eipw } => {
             Prepared::prepare(eipw, root_path, build_path)?.serve()?;
+        }
+        Operation::Changed { all, format } => {
+            let repo_path = build_path.join(REPO_DIR);
+
+            let both = git::Fresh::new(&root_path, &repo_path)
+                .whatever_context("initializing build repo")?
+                .clone_src()
+                .whatever_context("cloning source repo")?
+                .fetch_upstream()
+                .whatever_context("fetching upstream repo")?;
+
+            let changed_files: Vec<_> = both
+                .changed_files()
+                .whatever_context("unable to list changed files")?
+                .into_iter()
+                .filter(|p| all || Prepared::is_proposal_path(p.into()))
+                .map(|p| repo_path.join(p))
+                .collect();
+
+            format.print(&changed_files, &repo_path);
         }
     }
 

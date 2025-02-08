@@ -17,7 +17,7 @@ use crate::{
 use enum_map::{enum_map, Enum, EnumMap};
 use git2::{
     build::{CheckoutBuilder, TreeUpdateBuilder},
-    BranchType, Commit, FetchOptions, FileMode, ObjectType, Repository, RepositoryOpenFlags,
+    BranchType, Commit, FetchOptions, FileMode, ObjectType, Oid, Repository, RepositoryOpenFlags,
     StatusOptions, Tree, TreeEntry, TreeWalkResult,
 };
 use log::{debug, info};
@@ -158,175 +158,270 @@ fn check_conflict(master_tree: &Tree, path: &Path, entry: &TreeEntry) -> Result<
     Ok(())
 }
 
-pub fn merge_repositories(root_path: &Path, build_path: &Path) -> Result<Vec<PathBuf>, Error> {
-    check_dirty(root_path)?;
+pub struct Fresh {
+    src_repo_use: RepositoryUse,
+    src_repo_url: Url,
 
-    let repo_use = RepositoryUse::identify(root_path)?;
+    working_repo: Repository,
+}
 
-    let url = Url::from_directory_path(root_path)
-        .ok()
-        .context(PathUrlSnafu { path: root_path })?;
+impl Fresh {
+    pub fn new(root_path: &Path, build_path: &Path) -> Result<Self, Error> {
+        check_dirty(root_path)?;
+        let src_repo_use = RepositoryUse::identify(root_path)?;
+        let src_repo_url = Url::from_directory_path(root_path)
+            .ok()
+            .context(PathUrlSnafu { path: root_path })?;
 
-    info!("cloning local repository");
-    debug!("local repository at `{url}`");
-    let repo = open_or_init(build_path)?;
-    let master = fetch(&repo, url.as_str(), "HEAD")?;
-    repo.set_head_detached(master.id())
-        .context(GitSnafu { what: "detach" })?;
-    let branch = repo.branch("master", &master, true).context(GitSnafu {
-        what: "branch master",
-    })?;
-    repo.set_head("refs/heads/master")
-        .context(GitSnafu { what: "set head" })?;
-    assert!(branch.is_head());
-    repo.checkout_head(Some(
-        CheckoutBuilder::default()
-            .remove_ignored(true)
-            .remove_untracked(true)
-            .force(),
-    ))
-    .context(GitSnafu {
-        what: "checkout local",
-    })?;
+        debug!("source repository at `{src_repo_url}`");
 
-    if !repo.submodules().unwrap().is_empty() {
-        panic!("submodules not supported yet");
+        let working_repo = open_or_init(build_path)?;
+
+        Ok(Self {
+            working_repo,
+            src_repo_url,
+            src_repo_use,
+        })
     }
 
-    info!("fetching latest {repo_use} repository");
-    let latest_master = fetch(&repo, repo_use.url(), "master")?;
-    let merge_base = repo
-        .merge_base(master.id(), latest_master.id())
-        .context(GitSnafu { what: "merge base" })?;
-    debug!(
-        "merge base of `{}` (local) and `{}` (latest) is `{}`",
-        master.id(),
-        latest_master.id(),
-        merge_base
-    );
+    pub fn clone_src(self) -> Result<SourceOnly, Error> {
+        info!("cloning local repository");
+        let master = fetch(&self.working_repo, self.src_repo_url.as_str(), "HEAD")?;
+        self.working_repo
+            .set_head_detached(master.id())
+            .context(GitSnafu { what: "detach" })?;
+        let branch = self
+            .working_repo
+            .branch("master", &master, true)
+            .context(GitSnafu {
+                what: "branch master",
+            })?;
+        self.working_repo
+            .set_head("refs/heads/master")
+            .context(GitSnafu { what: "set head" })?;
+        assert!(branch.is_head());
+        self.working_repo
+            .checkout_head(Some(
+                CheckoutBuilder::default()
+                    .remove_ignored(true)
+                    .remove_untracked(true)
+                    .force(),
+            ))
+            .context(GitSnafu {
+                what: "checkout local",
+            })?;
 
-    let merge_base_tree = repo
-        .find_commit(merge_base)
-        .context(GitSnafu {
-            what: "getting merge base commit",
-        })?
-        .tree()
-        .context(GitSnafu {
-            what: "getting merge base tree",
-        })?;
-
-    let master_tree = master.tree().context(GitSnafu {
-        what: "getting master tree",
-    })?;
-
-    let diff = repo
-        .diff_tree_to_tree(Some(&merge_base_tree), Some(&master_tree), None)
-        .context(GitSnafu {
-            what: "comparing merge base to master",
-        })?;
-
-    let changed_files = diff
-        .deltas()
-        .filter_map(|d| d.new_file().path())
-        .map(Path::to_path_buf)
-        .collect();
-
-    for (other_kind, other_repo) in repo_use.other_repos().iter().progress_ext("Merge Repos") {
-        info!("fetching {other_kind} repository");
-        let master_other = fetch(&repo, other_repo, "master:master-other")?;
-        let other_tree = master_other.tree().context(GitSnafu {
-            what: "getting other tree",
-        })?;
-
-        let mut tree_builder = TreeUpdateBuilder::new();
-        let prefix = format!("{}/", super::CONTENT_DIR);
-        let mut walk_error: Option<Error> = None;
-        let walk_result = other_tree.walk(git2::TreeWalkMode::PreOrder, |a, b| {
-            if !a.starts_with(&prefix) && (!a.is_empty() || b.name() != Some(super::CONTENT_DIR)) {
-                return TreeWalkResult::Skip;
-            }
-
-            let name = match b.name() {
-                Some(n) => n,
-                None => {
-                    walk_error = Some(
-                        UpdateTreeSnafu {
-                            msg: format!("tree entry without name in `{a}`"),
-                        }
-                        .build(),
-                    );
-                    return TreeWalkResult::Abort;
-                }
-            };
-
-            let path = format!("{}{}", a, name);
-            match b.kind() {
-                Some(ObjectType::Blob) => (),
-                Some(ObjectType::Tree) => return TreeWalkResult::Ok,
-                kind => {
-                    walk_error = Some(
-                        UpdateTreeSnafu {
-                            msg: format!("unknown blob type `{kind:?}` for `{path}`"),
-                        }
-                        .build(),
-                    );
-                    return TreeWalkResult::Abort;
-                }
-            }
-
-            if let Err(e) = check_conflict(&master_tree, Path::new(&path), b) {
-                walk_error = Some(e);
-                return TreeWalkResult::Abort;
-            }
-
-            debug!("upsert `{path}`");
-            tree_builder.upsert(path, b.id(), FileMode::Blob);
-            TreeWalkResult::Ok
-        });
-
-        if let Some(error) = walk_error {
-            return Err(error);
+        if !self.working_repo.submodules().unwrap().is_empty() {
+            panic!("submodules not supported yet");
         }
 
-        walk_result.context(GitSnafu {
-            what: "traverse tree",
+        let local_head = master.id();
+        drop(master);
+        drop(branch);
+        Ok(SourceOnly {
+            local_head,
+            src_repo_use: self.src_repo_use,
+            working_repo: self.working_repo,
+        })
+    }
+}
+
+pub struct SourceOnly {
+    src_repo_use: RepositoryUse,
+
+    working_repo: Repository,
+    local_head: Oid,
+}
+
+impl SourceOnly {
+    pub fn fetch_upstream(self) -> Result<SourceWithUpstream, Error> {
+        info!("fetching latest {} repository", self.src_repo_use);
+        let latest_master = fetch(&self.working_repo, self.src_repo_use.url(), "master")?;
+        let upstream_head = latest_master.id();
+        drop(latest_master);
+        Ok(SourceWithUpstream {
+            upstream_head,
+            local_head: self.local_head,
+            src_repo_use: self.src_repo_use,
+            working_repo: self.working_repo,
+        })
+    }
+}
+
+pub struct SourceWithUpstream {
+    src_repo_use: RepositoryUse,
+
+    working_repo: Repository,
+    local_head: Oid,
+    upstream_head: Oid,
+}
+
+impl SourceWithUpstream {
+    fn local_head_tree(&self) -> Result<Tree, Error> {
+        let commit = self
+            .working_repo
+            .find_commit(self.local_head)
+            .context(GitSnafu {
+                what: "local commit from id",
+            })?;
+        let master_tree = commit.tree().context(GitSnafu {
+            what: "getting master tree",
         })?;
 
-        let merged_tree_oid = tree_builder
-            .create_updated(&repo, &master_tree)
-            .context(GitSnafu { what: "build tree" })?;
-        let merged_tree = repo.find_tree(merged_tree_oid).unwrap();
-
-        let sig = repo.signature().context(GitSnafu {
-            what: "commit signature",
-        })?;
-        let msg = format!("Merge {other_repo}");
-        repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            &msg,
-            &merged_tree,
-            &[&master, &master_other],
-        )
-        .context(GitSnafu { what: "committing" })?;
-
-        repo.checkout_head(Some(CheckoutBuilder::default().force()))
-            .context(GitSnafu {
-                what: "checkout merged",
-            })?;
-
-        repo.find_branch("master-other", BranchType::Local)
-            .context(GitSnafu {
-                what: "find master-other",
-            })?
-            .delete()
-            .context(GitSnafu {
-                what: "delete master-other",
-            })?;
+        Ok(master_tree)
     }
 
-    Ok(changed_files)
+    pub fn changed_files(&self) -> Result<Vec<PathBuf>, Error> {
+        let merge_base = self
+            .working_repo
+            .merge_base(self.local_head, self.upstream_head)
+            .context(GitSnafu { what: "merge base" })?;
+        debug!(
+            "merge base of `{}` (local) and `{}` (latest) is `{}`",
+            self.local_head, self.upstream_head, merge_base
+        );
+
+        let merge_base_tree = self
+            .working_repo
+            .find_commit(merge_base)
+            .context(GitSnafu {
+                what: "getting merge base commit",
+            })?
+            .tree()
+            .context(GitSnafu {
+                what: "getting merge base tree",
+            })?;
+
+        let master_tree = self.local_head_tree()?;
+        let diff = self
+            .working_repo
+            .diff_tree_to_tree(Some(&merge_base_tree), Some(&master_tree), None)
+            .context(GitSnafu {
+                what: "comparing merge base to master",
+            })?;
+
+        let changed_files = diff
+            .deltas()
+            .filter_map(|d| d.new_file().path())
+            .map(Path::to_path_buf)
+            .collect();
+
+        Ok(changed_files)
+    }
+
+    pub fn merge(&self) -> Result<(), Error> {
+        let repo_use = self.src_repo_use;
+        let master_tree = self.local_head_tree()?;
+        let mut local_head = self.local_head;
+        for (other_kind, other_repo) in repo_use.other_repos().iter().progress_ext("Merge Repos") {
+            info!("fetching {other_kind} repository");
+            let master_other = fetch(&self.working_repo, other_repo, "master:master-other")?;
+            let other_tree = master_other.tree().context(GitSnafu {
+                what: "getting other tree",
+            })?;
+
+            let mut tree_builder = TreeUpdateBuilder::new();
+            let prefix = format!("{}/", super::CONTENT_DIR);
+            let mut walk_error: Option<Error> = None;
+            let walk_result = other_tree.walk(git2::TreeWalkMode::PreOrder, |a, b| {
+                if !a.starts_with(&prefix)
+                    && (!a.is_empty() || b.name() != Some(super::CONTENT_DIR))
+                {
+                    return TreeWalkResult::Skip;
+                }
+
+                let name = match b.name() {
+                    Some(n) => n,
+                    None => {
+                        walk_error = Some(
+                            UpdateTreeSnafu {
+                                msg: format!("tree entry without name in `{a}`"),
+                            }
+                            .build(),
+                        );
+                        return TreeWalkResult::Abort;
+                    }
+                };
+
+                let path = format!("{}{}", a, name);
+                match b.kind() {
+                    Some(ObjectType::Blob) => (),
+                    Some(ObjectType::Tree) => return TreeWalkResult::Ok,
+                    kind => {
+                        walk_error = Some(
+                            UpdateTreeSnafu {
+                                msg: format!("unknown blob type `{kind:?}` for `{path}`"),
+                            }
+                            .build(),
+                        );
+                        return TreeWalkResult::Abort;
+                    }
+                }
+
+                if let Err(e) = check_conflict(&master_tree, Path::new(&path), b) {
+                    walk_error = Some(e);
+                    return TreeWalkResult::Abort;
+                }
+
+                debug!("upsert `{path}`");
+                tree_builder.upsert(path, b.id(), FileMode::Blob);
+                TreeWalkResult::Ok
+            });
+
+            if let Some(error) = walk_error {
+                return Err(error);
+            }
+
+            walk_result.context(GitSnafu {
+                what: "traverse tree",
+            })?;
+
+            let merged_tree_oid = tree_builder
+                .create_updated(&self.working_repo, &master_tree)
+                .context(GitSnafu { what: "build tree" })?;
+            let merged_tree = self.working_repo.find_tree(merged_tree_oid).unwrap();
+
+            let sig = self.working_repo.signature().context(GitSnafu {
+                what: "commit signature",
+            })?;
+            let msg = format!("Merge {other_repo}");
+            let master = self
+                .working_repo
+                .find_commit(local_head)
+                .context(GitSnafu {
+                    what: "find local head commit",
+                })?;
+            local_head = self
+                .working_repo
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    &msg,
+                    &merged_tree,
+                    &[&master, &master_other],
+                )
+                .context(GitSnafu { what: "committing" })?;
+
+            self.working_repo
+                .checkout_head(Some(CheckoutBuilder::default().force()))
+                .context(GitSnafu {
+                    what: "checkout merged",
+                })?;
+
+            self.working_repo
+                .find_branch("master-other", BranchType::Local)
+                .context(GitSnafu {
+                    what: "find master-other",
+                })?
+                .delete()
+                .context(GitSnafu {
+                    what: "delete master-other",
+                })?;
+        }
+
+        Ok(())
+    }
 }
 
 fn fetch<'a>(repo: &'a Repository, url: &'_ str, refspec: &'_ str) -> Result<Commit<'a>, Error> {
