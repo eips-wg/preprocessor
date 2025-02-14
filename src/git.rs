@@ -74,8 +74,8 @@ lazy_static::lazy_static! {
     };
 
     static ref BASE_URLS: EnumMap<RepositoryUse, &'static str> = enum_map! {
-        RepositoryUse::Eips => "https://eips.ethereum.org/",
-        RepositoryUse::Ercs => "https://ercs.ethereum.org/",
+        RepositoryUse::Eips => "https://eips-wg.github.io/EIPs/",
+        RepositoryUse::Ercs => "https://eips-wg.github.io/ERCs/",
     };
 }
 
