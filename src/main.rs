@@ -97,6 +97,9 @@ impl ChangedFormat {
             .iter()
             .map(|f| f.to_str().expect("path not UTF-8"))
             .collect();
+        if files.iter().any(|f| f.contains(sep)) {
+            panic!("changed file path contains separator");
+        }
         println!("{}", files.join(sep));
     }
 
