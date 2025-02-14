@@ -164,6 +164,7 @@ async fn collect_sources(sources: Vec<PathBuf>) -> Result<Vec<PathBuf>, Error> {
         if metadata.is_file() {
             debug!("collecting `{}` for linting", source.to_string_lossy());
             output.push(source.clone());
+            continue;
         }
 
         if !metadata.is_dir() {
