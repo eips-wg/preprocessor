@@ -18,7 +18,7 @@ use enum_map::{enum_map, Enum, EnumMap};
 use git2::{
     build::{CheckoutBuilder, TreeUpdateBuilder},
     BranchType, Commit, FetchOptions, FileMode, ObjectType, Oid, Repository, RepositoryOpenFlags,
-    StatusOptions, Tree, TreeEntry, TreeWalkResult,
+    Signature, StatusOptions, Tree, TreeEntry, TreeWalkResult,
 };
 use log::{debug, info};
 use snafu::{ensure, Backtrace, IntoError, OptionExt, ResultExt, Snafu};
@@ -385,9 +385,11 @@ impl SourceWithUpstream {
                 .context(GitSnafu { what: "build tree" })?;
             let merged_tree = self.working_repo.find_tree(merged_tree_oid).unwrap();
 
-            let sig = self.working_repo.signature().context(GitSnafu {
-                what: "commit signature",
-            })?;
+            let sig = Signature::now("eips-build", "eips-build@eips-build.invalid").context(
+                GitSnafu {
+                    what: "commit signature",
+                },
+            )?;
             let msg = format!("Merge {other_repo}");
             let master = self
                 .working_repo
