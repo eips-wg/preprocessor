@@ -34,8 +34,12 @@ pub enum Error {
         source: git2::Error,
         backtrace: Backtrace,
     },
-    #[snafu(display("unable to determine if repository is EIPs or ERCs"))]
-    Identify { backtrace: Backtrace },
+    #[snafu(display("unable to determine if repository is EIPs ({eips}) or ERCs ({ercs})"))]
+    Identify {
+        eips: bool,
+        ercs: bool,
+        backtrace: Backtrace,
+    },
     #[snafu(display("working tree or index has uncommitted modifications"))]
     Dirty { backtrace: Backtrace },
     #[snafu(display("unable to update tree ({msg})"))]
@@ -90,7 +94,7 @@ impl RepositoryUse {
         match (eip, erc) {
             (true, false) => Ok(Self::Eips),
             (false, true) => Ok(Self::Ercs),
-            (_, _) => IdentifySnafu.fail(),
+            (eips, ercs) => IdentifySnafu { eips, ercs }.fail(),
         }
     }
 
