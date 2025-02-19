@@ -128,6 +128,9 @@ pub struct CmdArgs {
 enum Format {
     Text,
     Json,
+    #[serde(rename = "github")]
+    #[clap(name = "github")]
+    GitHub,
 }
 
 impl Default for Format {
@@ -140,6 +143,7 @@ impl Default for Format {
 enum EitherReporter {
     Text(Text<String>),
     Json(Json),
+    GitHub(crate::github::Reporter),
 }
 
 impl Reporter for EitherReporter {
@@ -147,6 +151,7 @@ impl Reporter for EitherReporter {
         match self {
             Self::Text(s) => s.report(snippet),
             Self::Json(j) => j.report(snippet),
+            Self::GitHub(g) => g.report(snippet),
         }
     }
 }
@@ -294,16 +299,16 @@ pub async fn eipw(
 
     let opts = config.command;
 
+    let repo_dir = tokio::fs::canonicalize(repo_dir)
+        .await
+        .context(FsSnafu { path: repo_dir })?;
+
     let paths = if opts.sources.is_empty() {
         changed_paths
     } else {
         let root_dir = tokio::fs::canonicalize(root_dir)
             .await
             .context(FsSnafu { path: root_dir })?;
-        let repo_dir = tokio::fs::canonicalize(repo_dir)
-            .await
-            .context(FsSnafu { path: repo_dir })?;
-
         let mut repo_relative_sources = Vec::with_capacity(opts.sources.len());
         for source in &opts.sources {
             let root_relative_source = root_dir.join(source);
@@ -332,6 +337,9 @@ pub async fn eipw(
     let reporter = match opts.format {
         Format::Json => EitherReporter::Json(Json::default()),
         Format::Text => EitherReporter::Text(Text::default()),
+        Format::GitHub => EitherReporter::GitHub(crate::github::Reporter {
+            root: repo_dir.to_str().expect("repository dir not UTF-8").into(),
+        }),
     };
 
     let reporter = AdditionalHelp::new(reporter, |t: &str| {
@@ -382,6 +390,7 @@ pub async fn eipw(
     match reporter.into_inner().into_inner() {
         EitherReporter::Json(j) => serde_json::to_writer_pretty(&stdout, &j).unwrap(),
         EitherReporter::Text(t) => write!(stdout, "{}", t.into_inner()).unwrap(),
+        EitherReporter::GitHub(_) => (),
     }
 
     ensure!(n_errors == 0, FailedSnafu { n_errors });

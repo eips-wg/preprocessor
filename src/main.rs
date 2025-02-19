@@ -7,6 +7,7 @@
 mod cache;
 mod find_root;
 mod git;
+mod github;
 mod lint;
 mod markdown;
 mod print;
