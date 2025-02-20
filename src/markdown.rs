@@ -489,6 +489,13 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
                     };
                     front_matter.aliases.push(root.into());
                 }
+
+                front_matter
+                    .aliases
+                    .push(format!("ERCS/erc-{number}").into());
+                front_matter
+                    .aliases
+                    .push(format!("EIPS/eip-{number}").into());
             }
             "author" => {
                 let authors = extract_authors(value)?;
