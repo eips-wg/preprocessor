@@ -410,8 +410,27 @@ fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
         let relative_path = path.strip_prefix(&assets_dir).unwrap();
         let relative_path = relative_path.with_file_name(relative_path.file_stem().unwrap());
 
+        let alias_bases = [
+            PathBuf::from(format!("/assets/eip-{number}/")),
+            PathBuf::from(format!("/assets/erc-{number}/")),
+        ];
+
+        let mut aliases = Vec::with_capacity(alias_bases.len());
+
+        for alias_base in &alias_bases {
+            aliases.push(alias_base.join(&relative_path));
+        }
+
+        if relative_path.ends_with("README") || relative_path.ends_with("index") {
+            let index_path = relative_path.parent().unwrap();
+            for alias_base in &alias_bases {
+                aliases.push(alias_base.join(index_path));
+            }
+        }
+
         let front_matter = FrontMatter {
             path: format!("{number}/assets/{}", relative_path.to_str().unwrap()),
+            aliases,
             ..Default::default()
         };
 
