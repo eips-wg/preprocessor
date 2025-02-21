@@ -6,12 +6,15 @@
 
 use chrono::DateTime;
 
+use citationberg::Style;
 use eipw_preamble::Preamble;
 
+use hayagriva::archive::ArchivedStyle;
+use hayagriva::{BibliographyDriver, BibliographyRequest, CitationItem, CitationRequest};
 use lazy_static::lazy_static;
 
 use log::{debug, info, log_enabled, Level};
-use pulldown_cmark::{CowStr, Event, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
 
 use pulldown_cmark_to_cmark::cmark;
 
@@ -357,6 +360,69 @@ fn fix_links<'a, 'b>(
     }
 }
 
+struct RenderCsl {
+    contents: Option<String>,
+}
+
+impl RenderCsl {
+    fn render_csl<'a>(&mut self, event: Event<'a>) -> Option<Event<'a>> {
+        let text = match (&mut self.contents, event) {
+            (contents @ None, Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(ref lang))))
+                if lang.as_ref() == "csl-json" =>
+            {
+                *contents = Some(String::new());
+                return None;
+            }
+            (Some(_), Event::End(TagEnd::CodeBlock)) => self.contents.take().unwrap(),
+            (Some(contents), Event::Text(text)) => {
+                contents.push_str(&text);
+                return None;
+            }
+            (Some(_), event) => {
+                panic!("unknown event inside csl-json block: {event:#?}");
+            }
+            (None, e) => return Some(e),
+        };
+
+        let mut value: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
+
+        // TODO: Once typst/citationberg#17 is merged, we can remove this line.
+        value
+            .as_object_mut()
+            .expect("not an object")
+            .remove("custom");
+
+        let item: citationberg::json::Item =
+            serde_json::from_value(value).expect("invalid CSL-JSON");
+
+        let locales = hayagriva::archive::locales();
+        let style = match ArchivedStyle::AmericanPsychologicalAssociation.get() {
+            Style::Independent(i) => i,
+            _ => unreachable!(),
+        };
+        let mut driver = BibliographyDriver::new();
+
+        let items = vec![CitationItem::with_entry(&item)];
+        driver.citation(CitationRequest::from_items(items, &style, &locales));
+
+        let result = driver.finish(BibliographyRequest {
+            style: &style,
+            locale: None,
+            locale_files: &locales,
+        });
+
+        let bib = result.bibliography.unwrap();
+        let mut text = String::new();
+        for item in bib.items {
+            item.content
+                .write_buf(&mut text, hayagriva::BufWriteFormat::Html)
+                .unwrap();
+        }
+
+        Some(Event::InlineHtml(text.into()))
+    }
+}
+
 fn transform_markdown(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -366,9 +432,14 @@ fn transform_markdown(root: &Path, path: &Path, body: &str) -> Result<String, Wh
     opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
 
     let parent = path.parent().unwrap();
+    let mut csl = RenderCsl { contents: None };
 
     let events = Parser::new_ext(body, opts)
         .map(|e| fix_links(root, parent, e))
+        .filter_map(|r| match r {
+            Ok(e) => csl.render_csl(e).map(Ok),
+            err => Some(err),
+        })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
 

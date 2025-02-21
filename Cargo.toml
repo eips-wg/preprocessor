@@ -48,6 +48,8 @@ toml = "0.8.19"
 toml_datetime = { version = "0.6.8", features = ["serde"] }
 url = "2.5.4"
 walkdir = "2.5.0"
+citationberg = { version = "0.5.0", features = ["json"] }
+hayagriva = { version = "0.8.1", features = ["archive", "csl-json"], default-features = false }
 
 [features]
 backtrace = [ "snafu/backtrace", "eipw-lint/backtrace" ]
