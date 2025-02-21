@@ -328,7 +328,36 @@ fn canonicalize_md(path: &Path) -> Result<PathBuf, Whatever> {
     })
 }
 
-fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
+fn fix_links<'a, 'b>(
+    root: &'a Path,
+    parent: &'a Path,
+    mut e: Event<'b>,
+) -> Result<Event<'b>, Whatever> {
+    match &mut e {
+        Event::Start(Tag::Image { dest_url, .. }) | Event::Start(Tag::Link { dest_url, .. }) => {
+            if dest_url.starts_with("//") {
+                // Is a protocol-relative URL.
+                return Ok(e);
+            }
+
+            if dest_url.contains("://") {
+                // Is an absolute URL.
+                return Ok(e);
+            }
+
+            if !dest_url.ends_with(".md") {
+                // Only markdown files need the `@` syntax.
+                return Ok(e);
+            }
+
+            *dest_url = CowStr::from(path_to_at(root, parent, dest_url)?);
+            Ok(e)
+        }
+        _ => Ok(e),
+    }
+}
+
+fn transform_markdown(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_FOOTNOTES);
@@ -339,29 +368,7 @@ fn fix_links(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
     let parent = path.parent().unwrap();
 
     let events = Parser::new_ext(body, opts)
-        .map(|mut e| match &mut e {
-            Event::Start(Tag::Image { dest_url, .. })
-            | Event::Start(Tag::Link { dest_url, .. }) => {
-                if dest_url.starts_with("//") {
-                    // Is a protocol-relative URL.
-                    return Ok(e);
-                }
-
-                if dest_url.contains("://") {
-                    // Is an absolute URL.
-                    return Ok(e);
-                }
-
-                if !dest_url.ends_with(".md") {
-                    // Only markdown files need the `@` syntax.
-                    return Ok(e);
-                }
-
-                *dest_url = CowStr::from(path_to_at(root, parent, dest_url)?);
-                Ok(e)
-            }
-            _ => Ok(e),
-        })
+        .map(|e| fix_links(root, parent, e))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
 
@@ -405,7 +412,7 @@ fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
             format!("could not read file `{}`", path.to_string_lossy())
         })?;
 
-        let contents = fix_links(root, path, &contents)?;
+        let contents = transform_markdown(root, path, &contents)?;
 
         let relative_path = path.strip_prefix(&assets_dir).unwrap();
         let relative_path = relative_path.with_file_name(relative_path.file_stem().unwrap());
@@ -448,7 +455,7 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
     let (preamble, body) = Preamble::split(&contents)
         .with_whatever_context(|_| format!("couldn't split preamble for `{}`", path_lossy))?;
 
-    let body = fix_links(root, path, body)?;
+    let body = transform_markdown(root, path, body)?;
 
     let preamble = Preamble::parse(Some(&path_lossy), preamble)
         .ok()
