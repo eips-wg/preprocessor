@@ -313,6 +313,54 @@ impl SourceWithUpstream {
         Ok(changed_files)
     }
 
+    fn check_ignored(&self, tree: &Tree) -> Result<(), Error> {
+        let mut walk_error = None;
+        let walk_result = tree.walk(git2::TreeWalkMode::PreOrder, |a, b| {
+            if b.kind() != Some(ObjectType::Blob) {
+                return TreeWalkResult::Ok;
+            }
+
+            let path = match b.name() {
+                None => a.to_owned(),
+                Some(p) => format!("{a}{p}"),
+            };
+
+            debug!("checking if `{path}` is ignored");
+
+            match self.working_repo.is_path_ignored(&path) {
+                Ok(false) => TreeWalkResult::Ok,
+                Ok(true) => {
+                    walk_error = Some(
+                        UpdateTreeSnafu {
+                            msg: format!("contains ignored path `{path}`"),
+                        }
+                        .build(),
+                    );
+                    TreeWalkResult::Abort
+                }
+                Err(e) => {
+                    walk_error = Some(
+                        GitSnafu {
+                            what: "check ignored",
+                        }
+                        .into_error(e),
+                    );
+                    TreeWalkResult::Abort
+                }
+            }
+        });
+
+        if let Some(error) = walk_error {
+            return Err(error);
+        }
+
+        walk_result.context(GitSnafu {
+            what: "traverse tree",
+        })?;
+
+        Ok(())
+    }
+
     pub fn merge(&self) -> Result<(), Error> {
         let repo_use = self.src_repo_use;
         let master_tree = self.local_head_tree()?;
@@ -384,6 +432,8 @@ impl SourceWithUpstream {
                 .create_updated(&self.working_repo, &master_tree)
                 .context(GitSnafu { what: "build tree" })?;
             let merged_tree = self.working_repo.find_tree(merged_tree_oid).unwrap();
+
+            self.check_ignored(&merged_tree)?;
 
             let sig = Signature::now("eips-build", "eips-build@eips-build.invalid").context(
                 GitSnafu {
