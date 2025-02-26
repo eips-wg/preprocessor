@@ -532,8 +532,13 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
         .ok()
         .with_whatever_context(|| format!("couldn't parse preamble in `{}`", path_lossy))?;
 
+    let updated = match path.file_name() {
+        Some(x) if x == "_index.md" => None,
+        _ => Some(last_modified(path)?),
+    };
+
     let mut front_matter = FrontMatter {
-        updated: Some(last_modified(Path::new(&path))?),
+        updated,
         ..Default::default()
     };
 
