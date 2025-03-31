@@ -31,7 +31,7 @@ const REPO_DIR: &str = "repo";
 const OUTPUT_DIR: &str = "output";
 
 const THEME_REPO: &str = "https://github.com/eips-wg/theme.git";
-const THEME_REV: &str = "1349a0612b8e0c779dc9c24509a8b27563bd3a04";
+const THEME_REV: &str = "3a5947eae18fa337e142c48e537a5acc463c4ca2";
 
 /// Build script for Ethereum EIPs and ERCs.
 #[derive(Parser, Debug)]
