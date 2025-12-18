@@ -31,7 +31,8 @@ use std::path::{Path, PathBuf};
 pub enum Error {
     #[snafu(display("unable to construct eipw configuration"))]
     Config {
-        source: figment::Error,
+        #[snafu(source(from(figment::Error, Box::new)))]
+        source: Box<figment::Error>,
         backtrace: Backtrace,
     },
     #[snafu(display("no lint `{name}` is enabled"))]
@@ -123,20 +124,15 @@ pub struct CmdArgs {
     allow: Vec<String>,
 }
 
-#[derive(ValueEnum, Clone, Debug, Serialize, Deserialize)]
+#[derive(Default, ValueEnum, Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum Format {
+    #[default]
     Text,
     Json,
     #[serde(rename = "github")]
     #[clap(name = "github")]
     GitHub,
-}
-
-impl Default for Format {
-    fn default() -> Self {
-        Self::Text
-    }
 }
 
 #[derive(Debug)]
