@@ -483,7 +483,12 @@ fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
             format!("could not read file `{}`", path.to_string_lossy())
         })?;
 
-        let contents = transform_markdown(root, path, &contents)?;
+        let contents = transform_markdown(root, path, &contents).with_whatever_context(|_| {
+            format!(
+                "unable to transform markdown for `{}`",
+                path.to_string_lossy()
+            )
+        })?;
 
         let relative_path = path.strip_prefix(&assets_dir).unwrap();
         let relative_path = relative_path.with_file_name(relative_path.file_stem().unwrap());
@@ -526,7 +531,8 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
     let (preamble, body) = Preamble::split(&contents)
         .with_whatever_context(|_| format!("couldn't split preamble for `{}`", path_lossy))?;
 
-    let body = transform_markdown(root, path, body)?;
+    let body = transform_markdown(root, path, body)
+        .with_whatever_context(|_| format!("unable to transform markdown for `{path_lossy}`"))?;
 
     let preamble = Preamble::parse(Some(&path_lossy), preamble)
         .ok()

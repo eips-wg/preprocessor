@@ -261,7 +261,7 @@ pub struct SourceWithUpstream {
 }
 
 impl SourceWithUpstream {
-    fn local_head_tree(&self) -> Result<Tree, Error> {
+    fn local_head_tree(&self) -> Result<Tree<'_>, Error> {
         let commit = self
             .working_repo
             .find_commit(self.local_head)
