@@ -50,6 +50,7 @@ url = "2.5.7"
 walkdir = "2.5.0"
 citationberg = { version = "0.6.1", features = ["json"] }
 hayagriva = { version = "0.9.1", features = ["archive", "csl-json"], default-features = false }
+iref = "3.2.2"
 
 [features]
 backtrace = [ "snafu/backtrace", "eipw-lint/backtrace" ]

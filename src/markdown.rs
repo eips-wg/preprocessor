@@ -36,6 +36,8 @@ use toml_datetime::Datetime;
 
 use walkdir::WalkDir;
 
+use iref::IriRef;
+
 use crate::progress::ProgressIteratorExt;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -338,17 +340,16 @@ fn fix_links<'a, 'b>(
 ) -> Result<Event<'b>, Whatever> {
     match &mut e {
         Event::Start(Tag::Image { dest_url, .. }) | Event::Start(Tag::Link { dest_url, .. }) => {
-            if dest_url.starts_with("//") {
-                // Is a protocol-relative URL.
+            let iri_ref = IriRef::new(dest_url)
+                .map_err(|e| e.to_string())
+                .whatever_context("invalid URL in image/link")?;
+
+            if iri_ref.authority().is_some() {
+                // Is a protocol-relative or absolute URL.
                 return Ok(e);
             }
 
-            if dest_url.contains("://") {
-                // Is an absolute URL.
-                return Ok(e);
-            }
-
-            if !dest_url.ends_with(".md") {
+            if !iri_ref.path().ends_with(".md") {
                 // Only markdown files need the `@` syntax.
                 return Ok(e);
             }
