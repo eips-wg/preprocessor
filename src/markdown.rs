@@ -36,7 +36,7 @@ use toml_datetime::Datetime;
 
 use walkdir::WalkDir;
 
-use iref::IriRef;
+use iref::IriRefBuf;
 
 use crate::progress::ProgressIteratorExt;
 
@@ -340,7 +340,7 @@ fn fix_links<'a, 'b>(
 ) -> Result<Event<'b>, Whatever> {
     match &mut e {
         Event::Start(Tag::Image { dest_url, .. }) | Event::Start(Tag::Link { dest_url, .. }) => {
-            let iri_ref = IriRef::new(dest_url)
+            let mut iri_ref = IriRefBuf::new(dest_url.clone().into_string())
                 .map_err(|e| e.to_string())
                 .whatever_context("invalid URL in image/link")?;
 
@@ -354,7 +354,11 @@ fn fix_links<'a, 'b>(
                 return Ok(e);
             }
 
-            *dest_url = CowStr::from(path_to_at(root, parent, dest_url)?);
+            let canonicalized = path_to_at(root, parent, iri_ref.path())?;
+            let path = iref::iri::Path::new(&canonicalized).expect("path is valid IRI");
+            iri_ref.set_path(path);
+
+            *dest_url = CowStr::from(iri_ref.into_string());
             Ok(e)
         }
         _ => Ok(e),
