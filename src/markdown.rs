@@ -370,35 +370,36 @@ struct RenderCsl {
 }
 
 impl RenderCsl {
-    fn render_csl<'a>(&mut self, event: Event<'a>) -> Option<Event<'a>> {
+    fn render_csl<'a>(&mut self, event: Event<'a>) -> Result<Option<Event<'a>>, Whatever> {
         let text = match (&mut self.contents, event) {
             (contents @ None, Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(ref lang))))
                 if lang.as_ref() == "csl-json" =>
             {
                 *contents = Some(String::new());
-                return None;
+                return Ok(None);
             }
             (Some(_), Event::End(TagEnd::CodeBlock)) => self.contents.take().unwrap(),
             (Some(contents), Event::Text(text)) => {
                 contents.push_str(&text);
-                return None;
+                return Ok(None);
             }
             (Some(_), event) => {
                 panic!("unknown event inside csl-json block: {event:#?}");
             }
-            (None, e) => return Some(e),
+            (None, e) => return Ok(Some(e)),
         };
 
-        let mut value: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&text).whatever_context("invalid JSON in citation")?;
 
         // TODO: Once typst/citationberg#17 is merged, we can remove this line.
         value
             .as_object_mut()
-            .expect("not an object")
+            .whatever_context("citation is not a JSON object")?
             .remove("custom");
 
         let item: citationberg::json::Item =
-            serde_json::from_value(value).expect("invalid CSL-JSON");
+            serde_json::from_value(value).whatever_context("citation not valid")?;
 
         let locales = hayagriva::archive::locales();
         let style = match ArchivedStyle::AmericanPsychologicalAssociation.get() {
@@ -424,7 +425,7 @@ impl RenderCsl {
                 .unwrap();
         }
 
-        Some(Event::InlineHtml(text.into()))
+        Ok(Some(Event::InlineHtml(text.into())))
     }
 }
 
@@ -442,7 +443,7 @@ fn transform_markdown(root: &Path, path: &Path, body: &str) -> Result<String, Wh
     let events = Parser::new_ext(body, opts)
         .map(|e| fix_links(root, parent, e))
         .filter_map(|r| match r {
-            Ok(e) => csl.render_csl(e).map(Ok),
+            Ok(e) => csl.render_csl(e).transpose(),
             err => Some(err),
         })
         .collect::<Result<Vec<_>, _>>()?
