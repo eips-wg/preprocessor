@@ -13,7 +13,7 @@ use hayagriva::archive::ArchivedStyle;
 use hayagriva::{BibliographyDriver, BibliographyRequest, CitationItem, CitationRequest};
 use lazy_static::lazy_static;
 
-use log::{debug, info, log_enabled, Level};
+use log::{debug, info, log_enabled, warn, Level};
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
 
 use pulldown_cmark_to_cmark::cmark;
@@ -457,6 +457,7 @@ fn transform_markdown(root: &Path, path: &Path, body: &str) -> Result<String, Wh
 }
 
 fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
+    let canon_root = std::fs::canonicalize(root).whatever_context("could not canonicalize root")?;
     let number_txt = path
         .file_name()
         .with_whatever_context(|| format!("no file name for `{}`", path.to_string_lossy()))?
@@ -476,6 +477,32 @@ fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
             Ok(f) if !f.file_type().is_file() => false,
             Ok(f) => f.path().extension().and_then(OsStr::to_str) == Some("md"),
             Err(_) => true,
+        })
+        .filter(|e| {
+            let f = match e {
+                Ok(f) => f,
+                _ => return true,
+            };
+
+            let candidate = match std::fs::canonicalize(f.path()) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "unable to canonicalize `{}`: {e}",
+                        f.path().to_string_lossy()
+                    );
+                    return false;
+                }
+            };
+
+            let in_root = candidate.starts_with(&canon_root);
+            if !in_root {
+                warn!(
+                    "asset `{}` not in root, skipping",
+                    f.path().to_string_lossy()
+                );
+            }
+            in_root
         });
     let dirs: Vec<_> = dir.collect();
 
