@@ -5,6 +5,7 @@
  */
 
 mod cache;
+mod config;
 mod find_root;
 mod git;
 mod github;
@@ -21,17 +22,15 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use fslock::LockFile;
-use git::RepositoryUse;
 use log::{debug, info};
 use snafu::{Report, ResultExt, Whatever};
+
+use crate::config::Config;
 
 const CONTENT_DIR: &str = "content";
 const BUILD_DIR: &str = "build";
 const REPO_DIR: &str = "repo";
 const OUTPUT_DIR: &str = "output";
-
-const THEME_REPO: &str = "https://github.com/eips-wg/theme.git";
-const THEME_REV: &str = "3deffd9494196c9053eecbaf5db567f02e0d0479";
 
 /// Build script for Ethereum EIPs and ERCs.
 #[derive(Parser, Debug)]
@@ -40,6 +39,10 @@ struct Args {
     /// Use ROOT as the base directory (instead of finding it automatically)
     #[clap(short = 'C')]
     root: Option<PathBuf>,
+
+    /// Use the staging repositories (for testing)
+    #[clap(long = "staging")]
+    staging: bool,
 
     #[clap(subcommand)]
     operation: Operation,
@@ -168,6 +171,7 @@ struct Prepared {
     root_path: PathBuf,
     repo_path: PathBuf,
     output_path: PathBuf,
+    config: Config,
 }
 
 impl Prepared {
@@ -211,6 +215,7 @@ impl Prepared {
 
     fn prepare(
         eipw: lint::CmdArgs,
+        config: Config,
         root_path: PathBuf,
         build_path: PathBuf,
     ) -> Result<Self, Whatever> {
@@ -220,7 +225,7 @@ impl Prepared {
         let content_path = repo_path.join(CONTENT_DIR);
         let output_path = build_path.join(OUTPUT_DIR);
 
-        let both = git::Fresh::new(&root_path, &repo_path)
+        let both = git::Fresh::new(&root_path, &repo_path, &config.locations)
             .whatever_context("initializing build repo")?
             .clone_src()
             .whatever_context("cloning source repo")?
@@ -240,12 +245,21 @@ impl Prepared {
 
         let cache = cache::Cache::open().whatever_context("unable to open cache")?;
 
-        lint::eipw(&cache, &root_path, &repo_path, changed_files, eipw)
-            .whatever_context("linting failed")?;
+        lint::eipw(
+            config.theme.repository.as_str(),
+            &config.theme.commit,
+            &cache,
+            &root_path,
+            &repo_path,
+            changed_files,
+            eipw,
+        )
+        .whatever_context("linting failed")?;
 
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
 
         Ok(Prepared {
+            config,
             root_path,
             cache,
             repo_path,
@@ -254,26 +268,43 @@ impl Prepared {
     }
 
     fn build(self) -> Result<(), Whatever> {
-        let repository_use = RepositoryUse::identify(&self.root_path)
+        let repository_use = self
+            .config
+            .locations
+            .identify_repository(&self.root_path)
             .whatever_context("cannot identify repository use")?;
         zola::build(
+            self.config.theme.repository.as_str(),
+            &self.config.theme.commit,
             &self.cache,
             &self.repo_path,
             &self.output_path,
-            repository_use.base_url(),
+            repository_use.location.base_url.as_str(),
         )
         .whatever_context("zola build failed")?;
         Ok(())
     }
 
     fn serve(self) -> Result<(), Whatever> {
-        zola::serve(&self.cache, &self.repo_path, &self.output_path)
-            .whatever_context("zola serve failed")?;
+        zola::serve(
+            self.config.theme.repository.as_str(),
+            &self.config.theme.commit,
+            &self.cache,
+            &self.repo_path,
+            &self.output_path,
+        )
+        .whatever_context("zola serve failed")?;
         Ok(())
     }
 
     fn check(self) -> Result<(), Whatever> {
-        zola::check(&self.cache, &self.repo_path).whatever_context("zola check failed")?;
+        zola::check(
+            self.config.theme.repository.as_str(),
+            &self.config.theme.commit,
+            &self.cache,
+            &self.repo_path,
+        )
+        .whatever_context("zola check failed")?;
         Ok(())
     }
 }
@@ -284,6 +315,12 @@ fn run() -> Result<(), Whatever> {
         print::print(print);
         return Ok(());
     }
+
+    let config = if args.staging {
+        Config::staging()
+    } else {
+        Config::production()
+    };
 
     let root_path = root(&args)?;
     let build_path = make_build_dir(&root_path)?;
@@ -303,18 +340,18 @@ fn run() -> Result<(), Whatever> {
             return Ok(());
         }
         Operation::Check { eipw } => {
-            Prepared::prepare(eipw, root_path, build_path)?.check()?;
+            Prepared::prepare(eipw, config, root_path, build_path)?.check()?;
         }
         Operation::Build { eipw } => {
-            Prepared::prepare(eipw, root_path, build_path)?.build()?;
+            Prepared::prepare(eipw, config, root_path, build_path)?.build()?;
         }
         Operation::Serve { eipw } => {
-            Prepared::prepare(eipw, root_path, build_path)?.serve()?;
+            Prepared::prepare(eipw, config, root_path, build_path)?.serve()?;
         }
         Operation::Changed { all, format } => {
             let repo_path = build_path.join(REPO_DIR);
 
-            let both = git::Fresh::new(&root_path, &repo_path)
+            let both = git::Fresh::new(&root_path, &repo_path, &config.locations)
                 .whatever_context("initializing build repo")?
                 .clone_src()
                 .whatever_context("cloning source repo")?

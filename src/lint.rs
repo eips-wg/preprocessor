@@ -257,6 +257,8 @@ fn version_cmp(
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn eipw(
+    theme_repo: &str,
+    theme_rev: &str,
     cache: &Cache,
     root_dir: &Path,
     repo_dir: &Path,
@@ -269,7 +271,7 @@ pub async fn eipw(
 
     let mut stdout = std::io::stdout();
 
-    let mut config_path = cache.repo(crate::THEME_REPO, crate::THEME_REV)?;
+    let mut config_path = cache.repo(theme_repo, theme_rev)?;
 
     config_path.push("config");
     config_path.push("eipw.toml");

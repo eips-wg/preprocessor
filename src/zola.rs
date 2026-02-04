@@ -96,13 +96,20 @@ pub fn find_zola() -> Result<(), Error> {
     Ok(())
 }
 
-pub fn check(cache: &Cache, project_path: &Path) -> Result<(), Error> {
+pub fn check(
+    theme_repo: &str,
+    theme_rev: &str,
+    cache: &Cache,
+    project_path: &Path,
+) -> Result<(), Error> {
     let args = ["check", "--drafts", "--skip-external-links"];
-    spawn_log(cache, project_path, args)?;
+    spawn_log(theme_repo, theme_rev, cache, project_path, args)?;
     Ok(())
 }
 
 pub fn build(
+    theme_repo: &str,
+    theme_rev: &str,
     cache: &Cache,
     project_path: &Path,
     output_path: &Path,
@@ -113,14 +120,20 @@ pub fn build(
         .map(OsString::from)
         .into_iter()
         .chain(std::iter::once(output_path.into()));
-    spawn_log(cache, project_path, args)?;
+    spawn_log(theme_repo, theme_rev, cache, project_path, args)?;
     if let Ok(url) = Url::from_file_path(output_path) {
         info!("HTML output to: {}", url);
     }
     Ok(())
 }
 
-pub fn serve(cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(), Error> {
+pub fn serve(
+    theme_repo: &str,
+    theme_rev: &str,
+    cache: &Cache,
+    project_path: &Path,
+    output_path: &Path,
+) -> Result<(), Error> {
     // TODO: Properly kill the child process when we receive ctrl-c.
     warn!("live reloading is not implemented");
     remove_output(output_path);
@@ -128,7 +141,7 @@ pub fn serve(cache: &Cache, project_path: &Path, output_path: &Path) -> Result<(
         .map(OsString::from)
         .into_iter()
         .chain(std::iter::once(output_path.into()));
-    spawn_log(cache, project_path, args)?;
+    spawn_log(theme_repo, theme_rev, cache, project_path, args)?;
     Ok(())
 }
 
@@ -141,7 +154,13 @@ fn remove_output(output_path: &Path) {
     }
 }
 
-fn spawn_log<U, I>(cache: &Cache, project_path: &Path, args: U) -> Result<(), Error>
+fn spawn_log<U, I>(
+    theme_repo: &str,
+    theme_rev: &str,
+    cache: &Cache,
+    project_path: &Path,
+    args: U,
+) -> Result<(), Error>
 where
     U: IntoIterator<Item = I>,
     I: Into<OsString>,
@@ -154,7 +173,7 @@ where
 
     find_zola()?;
 
-    let theme_dir = cache.repo(crate::THEME_REPO, crate::THEME_REV)?;
+    let theme_dir = cache.repo(theme_repo, theme_rev)?;
 
     let mut themes_dir = project_path.join("themes");
     if let Err(e) = std::fs::create_dir(&themes_dir) {

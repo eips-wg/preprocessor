@@ -5,20 +5,20 @@
  */
 
 use std::{
+    collections::HashMap,
     ffi::OsStr,
-    fmt,
-    path::{Path, PathBuf},
+    path::{absolute, Path, PathBuf},
 };
 
 use crate::{
     cache::Cache,
+    config::{Location, Locations},
     progress::{Git, ProgressIteratorExt},
 };
-use enum_map::{enum_map, Enum, EnumMap};
 use git2::{
     build::{CheckoutBuilder, TreeUpdateBuilder},
-    BranchType, Commit, FetchOptions, FileMode, ObjectType, Oid, Repository, RepositoryOpenFlags,
-    Signature, StatusOptions, Tree, TreeEntry, TreeWalkResult,
+    BranchType, Commit, FetchOptions, FileMode, ObjectType, Oid, RepositoryOpenFlags, Signature,
+    StatusOptions, Tree, TreeEntry, TreeWalkResult,
 };
 use log::{debug, info};
 use snafu::{ensure, Backtrace, IntoError, OptionExt, ResultExt, Snafu};
@@ -28,18 +28,25 @@ use url::Url;
 pub enum Error {
     #[snafu(display("cannot convert path into URL (`{}`)", path.to_string_lossy()))]
     PathUrl { path: PathBuf, backtrace: Backtrace },
+    #[snafu(display("i/o error accessing `{}`", path.to_string_lossy()))]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+        backtrace: Backtrace,
+    },
     #[snafu(display("unable to {what}"))]
     Git {
         what: &'static str,
         source: git2::Error,
         backtrace: Backtrace,
     },
-    #[snafu(display("unable to determine if repository is EIPs ({eips}) or ERCs ({ercs})"))]
-    Identify {
-        eips: bool,
-        ercs: bool,
+    #[snafu(display("unable to determine which repository is being built (could be: {})", titles.join(", ")))]
+    AmbiguousIdentify {
+        titles: Vec<String>,
         backtrace: Backtrace,
     },
+    #[snafu(display("unable to determine which repository is being built (none match)"))]
+    NoIdentify { backtrace: Backtrace },
     #[snafu(display("working tree or index has uncommitted modifications"))]
     Dirty { backtrace: Backtrace },
     #[snafu(display("unable to update tree ({msg})"))]
@@ -51,68 +58,67 @@ pub enum Error {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
-pub enum RepositoryUse {
-    Eips,
-    Ercs,
+#[derive(Debug, Clone)]
+pub struct RepositoryUse {
+    pub title: String,
+    pub location: Location,
+    pub other_repos: HashMap<String, Url>,
 }
 
-impl fmt::Display for RepositoryUse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let txt = match self {
-            Self::Ercs => "ERCs",
-            Self::Eips => "EIPs",
-        };
-        write!(f, "{}", txt)
-    }
-}
+impl Locations {
+    pub fn identify_repository(&self, path: &Path) -> Result<RepositoryUse, Error> {
+        let repo =
+            git2::Repository::open_ext(path, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr])
+                .context(GitSnafu {
+                    what: "identify open",
+                })?;
 
-lazy_static::lazy_static! {
-    static ref REPO_URLS: EnumMap<RepositoryUse, &'static str> = enum_map! {
-        RepositoryUse::Eips => "https://github.com/eips-wg/EIPs.git",
-        RepositoryUse::Ercs => "https://github.com/eips-wg/ERCs.git",
-    };
+        let containing_locations: Vec<_> = self
+            .0
+            .iter()
+            .filter_map(|(k, v)| match repo.revparse_single(&v.identifying_commit) {
+                Ok(_) => Some((k, v)),
+                _ => None,
+            })
+            .collect();
 
-    static ref BASE_URLS: EnumMap<RepositoryUse, &'static str> = enum_map! {
-        RepositoryUse::Eips => "https://eips-wg.github.io/EIPs/",
-        RepositoryUse::Ercs => "https://eips-wg.github.io/ERCs/",
-    };
-}
+        ensure!(
+            containing_locations.len() < 2,
+            AmbiguousIdentifySnafu {
+                titles: containing_locations
+                    .into_iter()
+                    .map(|x| x.0)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            }
+        );
+        ensure!(containing_locations.len() == 1, NoIdentifySnafu);
 
-impl RepositoryUse {
-    const EIP_COMMIT: &str = "0f44e2b94df4e504bb7b912f56ebd712db2ad396";
-    const ERC_COMMIT: &str = "8dd085d159cb123f545c272c0d871a5339550e79";
+        let (title, location) = containing_locations[0];
 
-    pub fn identify(path: &Path) -> Result<Self, Error> {
-        let repo = Repository::open_ext(path, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr])
-            .context(GitSnafu {
-                what: "identify open",
-            })?;
-        let eip = repo.revparse_single(Self::EIP_COMMIT).is_ok();
-        let erc = repo.revparse_single(Self::ERC_COMMIT).is_ok();
+        // TODO: this is a bit weird, and is a leftover from the previous architecture.
+        let other_repos = self
+            .0
+            .iter()
+            .filter_map(|(k, v)| {
+                if k == title || v.repository == location.repository {
+                    None
+                } else {
+                    Some((k.clone(), v.repository.clone()))
+                }
+            })
+            .collect();
 
-        match (eip, erc) {
-            (true, false) => Ok(Self::Eips),
-            (false, true) => Ok(Self::Ercs),
-            (eips, ercs) => IdentifySnafu { eips, ercs }.fail(),
-        }
-    }
-
-    fn url(self) -> &'static str {
-        REPO_URLS[self]
-    }
-
-    fn other_repos(self) -> Vec<(Self, &'static str)> {
-        REPO_URLS.into_iter().filter(|(k, _)| *k != self).collect()
-    }
-
-    pub fn base_url(self) -> &'static str {
-        BASE_URLS[self]
+        Ok(RepositoryUse {
+            title: title.clone(),
+            location: location.clone(),
+            other_repos,
+        })
     }
 }
 
 pub fn check_dirty(root_path: &Path) -> Result<(), Error> {
-    let repo = Repository::open(root_path).context(GitSnafu {
+    let repo = git2::Repository::open(root_path).context(GitSnafu {
         what: "open root repository",
     })?;
     let mut options = StatusOptions::default();
@@ -166,14 +172,15 @@ pub struct Fresh {
     src_repo_use: RepositoryUse,
     src_repo_url: Url,
 
-    working_repo: Repository,
+    working_repo: git2::Repository,
 }
 
 impl Fresh {
-    pub fn new(root_path: &Path, build_path: &Path) -> Result<Self, Error> {
-        check_dirty(root_path)?;
-        let src_repo_use = RepositoryUse::identify(root_path)?;
-        let src_repo_url = Url::from_directory_path(root_path)
+    pub fn new(root_path: &Path, build_path: &Path, locations: &Locations) -> Result<Self, Error> {
+        let root_path = absolute(root_path).context(IoSnafu { path: root_path })?;
+        check_dirty(&root_path)?;
+        let src_repo_use = locations.identify_repository(&root_path)?;
+        let src_repo_url = Url::from_directory_path(&root_path)
             .ok()
             .context(PathUrlSnafu { path: root_path })?;
 
@@ -233,14 +240,18 @@ impl Fresh {
 pub struct SourceOnly {
     src_repo_use: RepositoryUse,
 
-    working_repo: Repository,
+    working_repo: git2::Repository,
     local_head: Oid,
 }
 
 impl SourceOnly {
     pub fn fetch_upstream(self) -> Result<SourceWithUpstream, Error> {
-        info!("fetching latest {} repository", self.src_repo_use);
-        let latest_master = fetch(&self.working_repo, self.src_repo_use.url(), "master")?;
+        info!("fetching latest {} repository", self.src_repo_use.title);
+        let latest_master = fetch(
+            &self.working_repo,
+            self.src_repo_use.location.repository.as_str(),
+            "master",
+        )?;
         let upstream_head = latest_master.id();
         drop(latest_master);
         Ok(SourceWithUpstream {
@@ -255,7 +266,7 @@ impl SourceOnly {
 pub struct SourceWithUpstream {
     src_repo_use: RepositoryUse,
 
-    working_repo: Repository,
+    working_repo: git2::Repository,
     local_head: Oid,
     upstream_head: Oid,
 }
@@ -362,12 +373,16 @@ impl SourceWithUpstream {
     }
 
     pub fn merge(&self) -> Result<(), Error> {
-        let repo_use = self.src_repo_use;
+        let repo_use = &self.src_repo_use;
         let master_tree = self.local_head_tree()?;
         let mut local_head = self.local_head;
-        for (other_kind, other_repo) in repo_use.other_repos().iter().progress_ext("Merge Repos") {
+        for (other_kind, other_repo) in repo_use.other_repos.iter().progress_ext("Merge Repos") {
             info!("fetching {other_kind} repository");
-            let master_other = fetch(&self.working_repo, other_repo, "master:master-other")?;
+            let master_other = fetch(
+                &self.working_repo,
+                other_repo.as_str(),
+                "master:master-other",
+            )?;
             let other_tree = master_other.tree().context(GitSnafu {
                 what: "getting other tree",
             })?;
@@ -480,7 +495,11 @@ impl SourceWithUpstream {
     }
 }
 
-fn fetch<'a>(repo: &'a Repository, url: &'_ str, refspec: &'_ str) -> Result<Commit<'a>, Error> {
+fn fetch<'a>(
+    repo: &'a git2::Repository,
+    url: &'_ str,
+    refspec: &'_ str,
+) -> Result<Commit<'a>, Error> {
     debug!("fetching repository at `{url}`");
     let mut remote = repo.remote_anonymous(url).context(GitSnafu {
         what: "creating remote",
@@ -507,14 +526,15 @@ fn fetch<'a>(repo: &'a Repository, url: &'_ str, refspec: &'_ str) -> Result<Com
     Ok(commit)
 }
 
-fn open_or_init(dir: &Path) -> Result<Repository, Error> {
-    let repo = match Repository::open_ext(dir, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr]) {
-        Ok(r) => r,
-        Err(e) if e.code() == git2::ErrorCode::NotFound => {
-            Repository::init(dir).context(GitSnafu { what: "init repo" })?
-        }
-        Err(e) => return Err(GitSnafu { what: "open repo" }.into_error(e)),
-    };
+fn open_or_init(dir: &Path) -> Result<git2::Repository, Error> {
+    let repo =
+        match git2::Repository::open_ext(dir, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr]) {
+            Ok(r) => r,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                git2::Repository::init(dir).context(GitSnafu { what: "init repo" })?
+            }
+            Err(e) => return Err(GitSnafu { what: "open repo" }.into_error(e)),
+        };
     Ok(repo)
 }
 

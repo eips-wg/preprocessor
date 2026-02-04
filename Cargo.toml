@@ -26,7 +26,6 @@ duct = "1.1.1"
 eipw-lint = { version = "0.10.0", features = [ "tokio", "schema-version" ] }
 eipw-snippets = "0.2.0"
 eipw-preamble = "0.3.0"
-enum-map = "2.7.3"
 env_logger = "0.11.8"
 figment = { version = "0.10.19", features = ["toml"] }
 fslock = "0.2.1"
