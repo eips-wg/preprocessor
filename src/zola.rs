@@ -17,7 +17,7 @@ use url::Url;
 
 use crate::{cache::Cache, git};
 
-const MINIMUM_VERSION: Version = Version::new(0, 19, 2);
+const MINIMUM_VERSION: Version = Version::new(0, 22, 1);
 
 fn symlink_dir(original: &Path, link: &Path) -> Result<(), std::io::Error> {
     #[cfg(target_family = "windows")]
