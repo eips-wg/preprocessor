@@ -70,7 +70,7 @@ impl Config {
                 repository: "https://github.com/ethereum/eips-theme.git"
                     .try_into()
                     .unwrap(),
-                commit: "769d419d683bf9c5e65a0d27d8f6f3d14f46ac43".into(),
+                commit: "88a58af77795e92388bbfbe913650644257dd2d4".into(),
             },
             locations: Locations(locations),
         }
@@ -100,7 +100,7 @@ impl Config {
         Self {
             theme: Theme {
                 repository: "https://github.com/eips-wg/theme.git".try_into().unwrap(),
-                commit: "769d419d683bf9c5e65a0d27d8f6f3d14f46ac43".into(),
+                commit: "88a58af77795e92388bbfbe913650644257dd2d4".into(),
             },
             locations: Locations(locations),
         }
