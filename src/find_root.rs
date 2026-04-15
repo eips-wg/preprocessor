@@ -34,7 +34,7 @@ pub enum Error {
 pub fn is_root(path: &Path) -> Result<(), Error> {
     let git = path.join(".git");
     let contents = path.join(CONTENT_DIR);
-    if git.is_dir() && contents.is_dir() {
+    if (git.is_dir() || git.is_file()) && contents.is_dir() {
         Ok(())
     } else {
         NoRootSnafu.fail()

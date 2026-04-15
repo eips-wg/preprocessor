@@ -5,6 +5,7 @@
  */
 
 use std::{
+    collections::BTreeSet,
     collections::HashMap,
     ffi::OsStr,
     path::{absolute, Path, PathBuf},
@@ -17,12 +18,14 @@ use crate::{
 };
 use git2::{
     build::{CheckoutBuilder, TreeUpdateBuilder},
-    BranchType, Commit, FetchOptions, FileMode, ObjectType, Oid, RepositoryOpenFlags, Signature,
+    Commit, FetchOptions, FileMode, ObjectType, Oid, RepositoryOpenFlags, Signature, Status,
     StatusOptions, Tree, TreeEntry, TreeWalkResult,
 };
 use log::{debug, info};
 use snafu::{ensure, Backtrace, IntoError, OptionExt, ResultExt, Snafu};
 use url::Url;
+
+const DIRTY_PATH_DISPLAY_LIMIT: usize = 10;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -47,8 +50,21 @@ pub enum Error {
     },
     #[snafu(display("unable to determine which repository is being built (none match)"))]
     NoIdentify { backtrace: Backtrace },
-    #[snafu(display("working tree or index has uncommitted modifications"))]
-    Dirty { backtrace: Backtrace },
+    #[snafu(display("{message}"))]
+    Dirty {
+        message: String,
+        backtrace: Backtrace,
+    },
+    #[snafu(display(
+        "dirty mode cannot materialize conflicted path `{}`; resolve the conflict and try again",
+        path.to_string_lossy()
+    ))]
+    DirtyConflict { path: PathBuf, backtrace: Backtrace },
+    #[snafu(display(
+        "dirty mode cannot materialize `{}` because it is not a tracked file or symlink in the working tree",
+        path.to_string_lossy()
+    ))]
+    DirtyUnsupportedPath { path: PathBuf, backtrace: Backtrace },
     #[snafu(display("unable to update tree ({msg})"))]
     UpdateTree { msg: String, backtrace: Backtrace },
     #[snafu(context(false))]
@@ -56,6 +72,12 @@ pub enum Error {
         #[snafu(backtrace)]
         source: crate::cache::Error,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMaterialization {
+    Clean,
+    Dirty,
 }
 
 #[derive(Debug, Clone)]
@@ -117,25 +139,350 @@ impl Locations {
     }
 }
 
+impl RepositoryUse {
+    pub fn only_other_repo(&self) -> Option<(&str, &Url)> {
+        let mut repos = self.other_repos.iter();
+        let next = repos.next()?;
+        if repos.next().is_some() {
+            None
+        } else {
+            Some((next.0.as_str(), next.1))
+        }
+    }
+}
+
+fn is_generated_path(path: &Path) -> bool {
+    path.components()
+        .next()
+        .map(|component| component.as_os_str() == OsStr::new(super::BUILD_DIR))
+        .unwrap_or(false)
+}
+
+fn dirty_statuses(repo: &git2::Repository) -> Result<git2::Statuses<'_>, Error> {
+    let mut options = StatusOptions::default();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true);
+    repo.statuses(Some(&mut options)).context(GitSnafu {
+        what: "get root repository status",
+    })
+}
+
+fn format_dirty_rejection(tracked_paths: &BTreeSet<PathBuf>, untracked_count: usize) -> String {
+    let mut lines = vec![String::from(
+        "working tree or index has uncommitted modifications; the clean/default path requires a clean working tree:",
+    )];
+
+    for path in tracked_paths.iter().take(DIRTY_PATH_DISPLAY_LIMIT) {
+        lines.push(format!("- {}", path.to_string_lossy()));
+    }
+
+    if tracked_paths.len() > DIRTY_PATH_DISPLAY_LIMIT {
+        lines.push(format!(
+            "- ... and {} more tracked path(s)",
+            tracked_paths.len() - DIRTY_PATH_DISPLAY_LIMIT
+        ));
+    }
+
+    if untracked_count > 0 {
+        lines.push(format!(
+            "- ... plus {} untracked file(s) not listed",
+            untracked_count
+        ));
+    }
+
+    lines.push(String::new());
+
+    if untracked_count > 0 {
+        lines.push(String::from(
+            "Use `--profile dirty` or `--allow-dirty` to include tracked local changes, and commit/stash/remove any untracked files first.",
+        ));
+    } else {
+        lines.push(String::from(
+            "Use `--profile dirty` or `--allow-dirty` to include tracked local changes, or commit/stash them first.",
+        ));
+    }
+
+    lines.join("\n")
+}
+
 pub fn check_dirty(root_path: &Path) -> Result<(), Error> {
+    let (tracked_paths, untracked_count) = collect_dirty_paths(root_path)?;
+
+    if tracked_paths.is_empty() && untracked_count == 0 {
+        Ok(())
+    } else {
+        DirtySnafu {
+            message: format_dirty_rejection(&tracked_paths, untracked_count),
+        }
+        .fail()
+    }
+}
+
+fn entry_path(entry: &git2::StatusEntry<'_>) -> Option<PathBuf> {
+    entry
+        .head_to_index()
+        .and_then(|delta| delta.new_file().path().or_else(|| delta.old_file().path()))
+        .or_else(|| {
+            entry
+                .index_to_workdir()
+                .and_then(|delta| delta.new_file().path().or_else(|| delta.old_file().path()))
+        })
+        .or_else(|| entry.path().map(Path::new))
+        .map(Path::to_path_buf)
+}
+
+fn collect_dirty_paths(root_path: &Path) -> Result<(BTreeSet<PathBuf>, usize), Error> {
     let repo = git2::Repository::open(root_path).context(GitSnafu {
         what: "open root repository",
     })?;
-    let mut options = StatusOptions::default();
-    options.include_untracked(true);
-    let statuses = repo.statuses(Some(&mut options)).context(GitSnafu {
-        what: "get root repository status",
-    })?;
-    let mut statuses = statuses.iter().filter(|x| {
-        x.path()
-            .map(|x| !x.trim_end_matches('/').ends_with(super::BUILD_DIR))
-            .unwrap_or(false)
-    });
-    if statuses.next().is_some() {
-        DirtySnafu.fail()
-    } else {
-        Ok(())
+    let statuses = dirty_statuses(&repo)?;
+    let mut paths = BTreeSet::new();
+    let mut untracked_count = 0;
+
+    for entry in statuses.iter() {
+        let status = entry.status();
+        let path = entry_path(&entry).unwrap_or_else(|| PathBuf::from("<unknown>"));
+
+        if status.contains(Status::CONFLICTED) {
+            return DirtyConflictSnafu { path }.fail();
+        }
+
+        if status == Status::CURRENT || status == Status::IGNORED {
+            continue;
+        }
+
+        if status == Status::WT_NEW {
+            if !is_generated_path(&path) {
+                untracked_count += 1;
+            }
+            continue;
+        }
+
+        if let Some(delta) = entry.head_to_index() {
+            if let Some(old_path) = delta
+                .old_file()
+                .path()
+                .filter(|path| !is_generated_path(path))
+            {
+                paths.insert(old_path.to_path_buf());
+            }
+            if let Some(new_path) = delta
+                .new_file()
+                .path()
+                .filter(|path| !is_generated_path(path))
+            {
+                paths.insert(new_path.to_path_buf());
+            }
+        }
+
+        if let Some(delta) = entry.index_to_workdir() {
+            if let Some(old_path) = delta
+                .old_file()
+                .path()
+                .filter(|path| !is_generated_path(path))
+            {
+                paths.insert(old_path.to_path_buf());
+            }
+            if let Some(new_path) = delta
+                .new_file()
+                .path()
+                .filter(|path| !is_generated_path(path))
+            {
+                paths.insert(new_path.to_path_buf());
+            }
+        }
+
+        if !is_generated_path(&path) {
+            paths.insert(path);
+        }
     }
+
+    Ok((paths, untracked_count))
+}
+
+fn remove_existing_path(path: &Path) -> Result<(), std::io::Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(path)
+        }
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_index_path(index: &mut git2::Index, path: &Path) -> Result<(), Error> {
+    match index.remove_path(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => match index.remove_dir(path, -1)
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(()),
+            Err(error) => Err(GitSnafu {
+                what: "remove dirty path from index",
+            }
+            .into_error(error)),
+        },
+        Err(error) => Err(GitSnafu {
+            what: "remove dirty path from index",
+        }
+        .into_error(error)),
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    let target = std::fs::read_link(source)?;
+    std::os::unix::fs::symlink(target, destination)
+}
+
+#[cfg(target_family = "windows")]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    let target = std::fs::read_link(source)?;
+    let resolved_target = source
+        .parent()
+        .map(|parent| parent.join(&target))
+        .unwrap_or_else(|| target.clone());
+
+    if std::fs::metadata(&resolved_target)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        std::os::windows::fs::symlink_dir(target, destination)
+    } else {
+        std::os::windows::fs::symlink_file(target, destination)
+    }
+}
+
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+fn copy_symlink(_source: &Path, _destination: &Path) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no symlink implementation available",
+    ))
+}
+
+fn sync_dirty_path(
+    source_root: &Path,
+    working_root: &Path,
+    index: &mut git2::Index,
+    relative_path: &Path,
+) -> Result<(), Error> {
+    let source_path = source_root.join(relative_path);
+    let working_path = working_root.join(relative_path);
+
+    match std::fs::symlink_metadata(&source_path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            remove_existing_path(&working_path).context(IoSnafu {
+                path: working_path.clone(),
+            })?;
+            remove_index_path(index, relative_path)?;
+            Ok(())
+        }
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            if let Some(parent) = working_path.parent() {
+                std::fs::create_dir_all(parent).context(IoSnafu {
+                    path: parent.to_path_buf(),
+                })?;
+            }
+
+            remove_existing_path(&working_path).context(IoSnafu {
+                path: working_path.clone(),
+            })?;
+
+            if metadata.file_type().is_symlink() {
+                copy_symlink(&source_path, &working_path).context(IoSnafu {
+                    path: working_path.clone(),
+                })?;
+            } else {
+                std::fs::copy(&source_path, &working_path).context(IoSnafu {
+                    path: source_path.clone(),
+                })?;
+            }
+
+            index.add_path(relative_path).context(GitSnafu {
+                what: "add dirty path to index",
+            })?;
+            Ok(())
+        }
+        Ok(_) => DirtyUnsupportedPathSnafu {
+            path: relative_path.to_path_buf(),
+        }
+        .fail(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_existing_path(&working_path).context(IoSnafu {
+                path: working_path.clone(),
+            })?;
+            remove_index_path(index, relative_path)?;
+            Ok(())
+        }
+        Err(error) => Err(IoSnafu { path: source_path }.into_error(error)),
+    }
+}
+
+fn materialize_dirty_tree(
+    source_root: &Path,
+    working_repo: &git2::Repository,
+    local_head: Oid,
+) -> Result<Oid, Error> {
+    let (dirty_paths, untracked_count) = collect_dirty_paths(source_root)?;
+    if untracked_count > 0 {
+        info!("dirty mode ignores untracked files in the active content repo");
+    }
+
+    if dirty_paths.is_empty() {
+        return Ok(local_head);
+    }
+
+    let working_root = working_repo.workdir().context(UpdateTreeSnafu::<String> {
+        msg: "build repository workdir is unavailable".into(),
+    })?;
+    let mut index = working_repo.index().context(GitSnafu {
+        what: "open build repository index",
+    })?;
+
+    for path in dirty_paths {
+        sync_dirty_path(source_root, working_root, &mut index, &path)?;
+    }
+
+    index.write().context(GitSnafu {
+        what: "write build repository index",
+    })?;
+    let tree_id = index.write_tree().context(GitSnafu {
+        what: "write dirty materialization tree",
+    })?;
+    let tree = working_repo.find_tree(tree_id).context(GitSnafu {
+        what: "find dirty materialization tree",
+    })?;
+
+    let sig = Signature::now("eips-build", "eips-build@eips-build.invalid").context(GitSnafu {
+        what: "dirty commit signature",
+    })?;
+    let parent = working_repo.find_commit(local_head).context(GitSnafu {
+        what: "find clean local head commit",
+    })?;
+    let dirty_head = working_repo
+        .commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "Dirty working tree materialization",
+            &tree,
+            &[&parent],
+        )
+        .context(GitSnafu {
+            what: "commit dirty working tree materialization",
+        })?;
+
+    info!(
+        "materialized tracked dirty changes from the active content repo into `{}`",
+        working_root.to_string_lossy()
+    );
+
+    Ok(dirty_head)
 }
 
 fn check_conflict(master_tree: &Tree, path: &Path, entry: &TreeEntry) -> Result<(), Error> {
@@ -170,19 +517,29 @@ fn check_conflict(master_tree: &Tree, path: &Path, entry: &TreeEntry) -> Result<
 
 pub struct Fresh {
     src_repo_use: RepositoryUse,
+    src_repo_path: PathBuf,
     src_repo_url: Url,
+    source_materialization: SourceMaterialization,
 
     working_repo: git2::Repository,
 }
 
 impl Fresh {
-    pub fn new(root_path: &Path, build_path: &Path, locations: &Locations) -> Result<Self, Error> {
+    pub fn new(
+        root_path: &Path,
+        build_path: &Path,
+        src_repo_use: RepositoryUse,
+        source_materialization: SourceMaterialization,
+    ) -> Result<Self, Error> {
         let root_path = absolute(root_path).context(IoSnafu { path: root_path })?;
-        check_dirty(&root_path)?;
-        let src_repo_use = locations.identify_repository(&root_path)?;
+        if source_materialization == SourceMaterialization::Clean {
+            check_dirty(&root_path)?;
+        }
         let src_repo_url = Url::from_directory_path(&root_path)
             .ok()
-            .context(PathUrlSnafu { path: root_path })?;
+            .context(PathUrlSnafu {
+                path: root_path.clone(),
+            })?;
 
         debug!("source repository at `{src_repo_url}`");
 
@@ -190,14 +547,20 @@ impl Fresh {
 
         Ok(Self {
             working_repo,
+            src_repo_path: root_path,
             src_repo_url,
             src_repo_use,
+            source_materialization,
         })
     }
 
     pub fn clone_src(self) -> Result<SourceOnly, Error> {
         info!("cloning local repository");
-        let master = fetch(&self.working_repo, self.src_repo_url.as_str(), "HEAD")?;
+        let master = fetch(
+            &self.working_repo,
+            self.src_repo_url.as_str(),
+            "HEAD:refs/build-eips/source-head",
+        )?;
         self.working_repo
             .set_head_detached(master.id())
             .context(GitSnafu { what: "detach" })?;
@@ -226,9 +589,15 @@ impl Fresh {
             panic!("submodules not supported yet");
         }
 
-        let local_head = master.id();
+        let mut local_head = master.id();
         drop(master);
         drop(branch);
+
+        if self.source_materialization == SourceMaterialization::Dirty {
+            local_head =
+                materialize_dirty_tree(&self.src_repo_path, &self.working_repo, local_head)?;
+        }
+
         Ok(SourceOnly {
             local_head,
             src_repo_use: self.src_repo_use,
@@ -250,7 +619,7 @@ impl SourceOnly {
         let latest_master = fetch(
             &self.working_repo,
             self.src_repo_use.location.repository.as_str(),
-            "master",
+            "master:refs/build-eips/upstream-head",
         )?;
         let upstream_head = latest_master.id();
         drop(latest_master);
@@ -378,11 +747,13 @@ impl SourceWithUpstream {
         let mut local_head = self.local_head;
         for (other_kind, other_repo) in repo_use.other_repos.iter().progress_ext("Merge Repos") {
             info!("fetching {other_kind} repository");
-            let master_other = fetch(
-                &self.working_repo,
-                other_repo.as_str(),
-                "master:master-other",
-            )?;
+            // Local sibling overrides should follow the checked-out repo HEAD instead of assuming `master`.
+            let other_refspec = if other_repo.scheme() == "file" {
+                "HEAD:refs/build-eips/other-head"
+            } else {
+                "master:refs/build-eips/other-head"
+            };
+            let master_other = fetch(&self.working_repo, other_repo.as_str(), other_refspec)?;
             let other_tree = master_other.tree().context(GitSnafu {
                 what: "getting other tree",
             })?;
@@ -479,16 +850,6 @@ impl SourceWithUpstream {
                 .context(GitSnafu {
                     what: "checkout merged",
                 })?;
-
-            self.working_repo
-                .find_branch("master-other", BranchType::Local)
-                .context(GitSnafu {
-                    what: "find master-other",
-                })?
-                .delete()
-                .context(GitSnafu {
-                    what: "delete master-other",
-                })?;
         }
 
         Ok(())
@@ -501,7 +862,19 @@ fn fetch<'a>(
     refspec: &'_ str,
 ) -> Result<Commit<'a>, Error> {
     debug!("fetching repository at `{url}`");
-    let mut remote = repo.remote_anonymous(url).context(GitSnafu {
+    let remote_name = "__build_eips_fetch";
+    match repo.remote_delete(remote_name) {
+        Ok(()) => (),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => (),
+        Err(error) => {
+            return Err(GitSnafu {
+                what: "deleting temporary remote",
+            }
+            .into_error(error))
+        }
+    }
+
+    let mut remote = repo.remote(remote_name, url).context(GitSnafu {
         what: "creating remote",
     })?;
     {
@@ -514,14 +887,24 @@ fn fetch<'a>(
                 what: "fetching repo",
             })?;
     }
+    drop(remote);
+    repo.remote_delete(remote_name).context(GitSnafu {
+        what: "deleting temporary remote",
+    })?;
+
+    let fetched_ref = refspec
+        .split_once(':')
+        .map(|(_, destination)| destination)
+        .filter(|destination| !destination.is_empty())
+        .unwrap_or("FETCH_HEAD");
     let commit = repo
-        .revparse_single("FETCH_HEAD")
+        .revparse_single(fetched_ref)
         .context(GitSnafu {
-            what: "revparse FETCH_HEAD",
+            what: "revparse fetched ref",
         })?
         .peel_to_commit()
         .context(GitSnafu {
-            what: "peel FETCH_HEAD",
+            what: "peel fetched ref",
         })?;
     Ok(commit)
 }
