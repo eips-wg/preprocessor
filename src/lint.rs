@@ -92,17 +92,9 @@ struct Config {
     eipw: eipw_lint::config::DefaultOptions,
 }
 
-#[derive(Debug, clap::Args, Serialize, Deserialize)]
+#[derive(Debug, Clone, clap::Args, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CmdArgs {
-    /// Disable linting entirely
-    #[arg(long, exclusive(true))]
-    no_lint: bool,
-
-    /// Restrict linting to specific files and/or directories (relative to project root)
-    #[clap(required(false))]
-    sources: Vec<PathBuf>,
-
     /// Lint output format
     #[clap(long, value_enum, default_value_t)]
     format: Format,
@@ -259,15 +251,10 @@ fn version_cmp(
 pub async fn eipw(
     theme: &ThemeSource,
     cache: &Cache,
-    root_dir: &Path,
     repo_dir: &Path,
-    changed_paths: Vec<PathBuf>,
+    sources: Vec<PathBuf>,
     opts: CmdArgs,
 ) -> Result<(), Error> {
-    if opts.no_lint {
-        return Ok(());
-    }
-
     let mut stdout = std::io::stdout();
 
     let mut config_path = match theme {
@@ -303,36 +290,8 @@ pub async fn eipw(
         .await
         .context(FsSnafu { path: repo_dir })?;
 
-    let paths = if opts.sources.is_empty() {
-        changed_paths
-    } else {
-        let root_dir = tokio::fs::canonicalize(root_dir)
-            .await
-            .context(FsSnafu { path: root_dir })?;
-        let mut repo_relative_sources = Vec::with_capacity(opts.sources.len());
-        for source in &opts.sources {
-            let root_relative_source = root_dir.join(source);
-            let full_source = tokio::fs::canonicalize(&root_relative_source)
-                .await
-                .context(FsSnafu {
-                    path: root_relative_source,
-                })?;
-
-            let relative_source = match full_source.strip_prefix(&root_dir) {
-                Ok(r) => r,
-                Err(e) => {
-                    let err = std::io::Error::new(std::io::ErrorKind::NotFound, e);
-                    return Err(FsSnafu { path: full_source }.into_error(err));
-                }
-            };
-
-            repo_relative_sources.push(repo_dir.join(relative_source));
-        }
-
-        repo_relative_sources
-    };
-
-    let sources = collect_sources(paths).await?;
+    let sources: Vec<_> = sources.iter().map(|source| repo_dir.join(source)).collect();
+    let sources = collect_sources(sources).await?;
 
     let reporter = match opts.format {
         Format::Json => EitherReporter::Json(Json::default()),

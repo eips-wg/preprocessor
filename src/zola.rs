@@ -128,9 +128,8 @@ pub fn serve(
     output_path: &Path,
 ) -> Result<(), Error> {
     // TODO: Properly kill the child process when we receive ctrl-c.
-    warn!("live reloading is not implemented");
     remove_output(output_path);
-    let args = ["serve", "--drafts", "-o"]
+    let args = ["serve", "--drafts", "--fast", "--force", "-o"]
         .map(OsString::from)
         .into_iter()
         .chain(std::iter::once(output_path.into()));

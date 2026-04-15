@@ -303,6 +303,41 @@ fn collect_dirty_paths(root_path: &Path) -> Result<(BTreeSet<PathBuf>, usize), E
     Ok((paths, untracked_count))
 }
 
+pub fn working_tree_paths(root_path: &Path) -> Result<Vec<PathBuf>, Error> {
+    let (paths, _) = collect_dirty_paths(root_path)?;
+    Ok(paths.into_iter().collect())
+}
+
+pub fn sync_materialized_paths(
+    source_root: &Path,
+    build_repo_path: &Path,
+    relative_paths: &BTreeSet<PathBuf>,
+) -> Result<(), Error> {
+    if relative_paths.is_empty() {
+        return Ok(());
+    }
+
+    let working_repo = git2::Repository::open(build_repo_path).context(GitSnafu {
+        what: "open build repository",
+    })?;
+    let working_root = working_repo.workdir().context(UpdateTreeSnafu::<String> {
+        msg: "build repository workdir is unavailable".into(),
+    })?;
+    let mut index = working_repo.index().context(GitSnafu {
+        what: "open build repository index",
+    })?;
+
+    for path in relative_paths {
+        sync_dirty_path(source_root, working_root, &mut index, path)?;
+    }
+
+    index.write().context(GitSnafu {
+        what: "write build repository index",
+    })?;
+
+    Ok(())
+}
+
 fn remove_existing_path(path: &Path) -> Result<(), std::io::Error> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
