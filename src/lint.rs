@@ -11,8 +11,8 @@ use clap::ValueEnum;
 use log::debug;
 use semver::{Comparator, Op, VersionReq};
 
-use crate::cache::Cache;
 use crate::progress::ProgressIteratorExt;
+use crate::{cache::Cache, ThemeSource};
 
 use eipw_lint::reporters::{AdditionalHelp, Count, Json, Reporter, Text};
 use eipw_lint::Linter;
@@ -257,8 +257,7 @@ fn version_cmp(
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn eipw(
-    theme_repo: &str,
-    theme_rev: &str,
+    theme: &ThemeSource,
     cache: &Cache,
     root_dir: &Path,
     repo_dir: &Path,
@@ -271,7 +270,10 @@ pub async fn eipw(
 
     let mut stdout = std::io::stdout();
 
-    let mut config_path = cache.repo(theme_repo, theme_rev)?;
+    let mut config_path = match theme {
+        ThemeSource::Remote { repository, commit } => cache.repo(repository, commit)?,
+        ThemeSource::Local { path } => path.to_path_buf(),
+    };
 
     config_path.push("config");
     config_path.push("eipw.toml");

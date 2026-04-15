@@ -15,7 +15,7 @@ use semver::Version;
 use snafu::{ensure, Backtrace, IntoError, Report, ResultExt, Snafu};
 use url::Url;
 
-use crate::{cache::Cache, git};
+use crate::{cache::Cache, git, ThemeSource};
 
 const MINIMUM_VERSION: Version = Version::new(0, 22, 1);
 
@@ -96,20 +96,14 @@ pub fn find_zola() -> Result<(), Error> {
     Ok(())
 }
 
-pub fn check(
-    theme_repo: &str,
-    theme_rev: &str,
-    cache: &Cache,
-    project_path: &Path,
-) -> Result<(), Error> {
+pub fn check(theme: &ThemeSource, cache: &Cache, project_path: &Path) -> Result<(), Error> {
     let args = ["check", "--drafts", "--skip-external-links"];
-    spawn_log(theme_repo, theme_rev, cache, project_path, args)?;
+    spawn_log(theme, cache, project_path, args)?;
     Ok(())
 }
 
 pub fn build(
-    theme_repo: &str,
-    theme_rev: &str,
+    theme: &ThemeSource,
     cache: &Cache,
     project_path: &Path,
     output_path: &Path,
@@ -120,7 +114,7 @@ pub fn build(
         .map(OsString::from)
         .into_iter()
         .chain(std::iter::once(output_path.into()));
-    spawn_log(theme_repo, theme_rev, cache, project_path, args)?;
+    spawn_log(theme, cache, project_path, args)?;
     if let Ok(url) = Url::from_file_path(output_path) {
         info!("HTML output to: {}", url);
     }
@@ -128,8 +122,7 @@ pub fn build(
 }
 
 pub fn serve(
-    theme_repo: &str,
-    theme_rev: &str,
+    theme: &ThemeSource,
     cache: &Cache,
     project_path: &Path,
     output_path: &Path,
@@ -141,7 +134,7 @@ pub fn serve(
         .map(OsString::from)
         .into_iter()
         .chain(std::iter::once(output_path.into()));
-    spawn_log(theme_repo, theme_rev, cache, project_path, args)?;
+    spawn_log(theme, cache, project_path, args)?;
     Ok(())
 }
 
@@ -155,8 +148,7 @@ fn remove_output(output_path: &Path) {
 }
 
 fn spawn_log<U, I>(
-    theme_repo: &str,
-    theme_rev: &str,
+    theme: &ThemeSource,
     cache: &Cache,
     project_path: &Path,
     args: U,
@@ -173,7 +165,10 @@ where
 
     find_zola()?;
 
-    let theme_dir = cache.repo(theme_repo, theme_rev)?;
+    let theme_dir = match theme {
+        ThemeSource::Remote { repository, commit } => cache.repo(repository, commit)?,
+        ThemeSource::Local { path } => path.to_path_buf(),
+    };
 
     let mut themes_dir = project_path.join("themes");
     if let Err(e) = std::fs::create_dir(&themes_dir) {
