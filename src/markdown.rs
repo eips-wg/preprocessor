@@ -22,7 +22,7 @@ use regex::Regex;
 
 use serde::{Deserialize, Serialize};
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::read_to_string;
 use std::io::Write;
@@ -137,6 +137,19 @@ impl Default for FrontMatter {
     }
 }
 
+fn filesystem_modified(p: &Path) -> Result<Datetime, Whatever> {
+    let metadata = std::fs::metadata(p)
+        .with_whatever_context(|e| format!("unable to read metadata for `{}`: {e}", p.display()))?;
+    let modified = metadata.modified().with_whatever_context(|e| {
+        format!(
+            "unable to read filesystem modified time for `{}`: {e}",
+            p.display()
+        )
+    })?;
+    let date_time: DateTime<chrono::Utc> = modified.into();
+    Ok(date_time.to_rfc3339().parse().unwrap())
+}
+
 fn last_modified(p: &Path) -> Result<Datetime, Whatever> {
     // TODO: Replace this with `git2`
     let mut command = std::process::Command::new("git");
@@ -158,7 +171,16 @@ fn last_modified(p: &Path) -> Result<Datetime, Whatever> {
     }
 
     let date_str = std::str::from_utf8(&output.stdout)
-        .with_whatever_context(|e| format!("command {:?} output not UTF-8: {e}", command))?;
+        .with_whatever_context(|e| format!("command {:?} output not UTF-8: {e}", command))?
+        .trim();
+
+    if date_str.is_empty() {
+        debug!(
+            "falling back to filesystem modified time for `{}` because git has no timestamp for the current path",
+            p.to_string_lossy()
+        );
+        return filesystem_modified(p);
+    }
 
     let unix: i64 = date_str.parse().with_whatever_context(|e| {
         let err_str = std::str::from_utf8(&output.stderr).unwrap_or("<non-utf-8>");
@@ -273,6 +295,59 @@ pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
         } else if entry_path.extension().and_then(OsStr::to_str) == Some("md") {
             process_eip(root_path, &entry_path)?;
         }
+    }
+
+    Ok(())
+}
+
+pub fn preprocess_paths(
+    root_path: &Path,
+    relative_paths: &BTreeSet<PathBuf>,
+) -> Result<(), Whatever> {
+    let mut eips = BTreeSet::new();
+    let mut asset_dirs = BTreeSet::new();
+
+    for relative_path in relative_paths {
+        let Ok(content_relative_path) = relative_path.strip_prefix("content") else {
+            continue;
+        };
+
+        if content_relative_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        if content_relative_path.extension().and_then(OsStr::to_str) != Some("md") {
+            continue;
+        }
+
+        let mut components = content_relative_path.components();
+        let Some(first_component) = components.next() else {
+            continue;
+        };
+
+        if matches!(
+            components.next(),
+            Some(component) if component.as_os_str() == OsStr::new("assets")
+        ) {
+            let proposal_dir = root_path.join(first_component.as_os_str());
+            if proposal_dir.join("assets").exists() {
+                asset_dirs.insert(proposal_dir);
+            }
+            continue;
+        }
+
+        let path = root_path.join(content_relative_path);
+        if path.exists() {
+            eips.insert(path);
+        }
+    }
+
+    for path in eips {
+        process_eip(root_path, &path)?;
+    }
+
+    for path in asset_dirs {
+        process_assets(root_path, &path)?;
     }
 
     Ok(())

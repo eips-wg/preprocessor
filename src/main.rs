@@ -11,6 +11,7 @@ mod git;
 mod github;
 mod lint;
 mod markdown;
+mod preview;
 mod print;
 mod progress;
 mod zola;
@@ -19,11 +20,19 @@ use std::{
     collections::BTreeSet,
     ffi::OsStr,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use clap::{Parser, Subcommand};
 use fslock::LockFile;
-use log::{debug, info};
+use log::{debug, info, warn};
+use notify::{Event, RecursiveMode, Watcher};
 use snafu::{OptionExt, Report, ResultExt, Whatever};
 use url::Url;
 
@@ -96,6 +105,9 @@ enum Operation {
 
     /// Build the project and launch a web server to preview it
     Serve,
+
+    /// Serve the existing built output without rebuilding it
+    Preview,
 
     /// Remove temporary and output files
     Clean,
@@ -378,6 +390,9 @@ build:
 serve:
     build-eips -C "{{ invocation_directory() }}" serve
 
+preview:
+    build-eips -C "{{ invocation_directory() }}" preview
+
 parity-check:
     build-eips -C "{{ invocation_directory() }}" --profile parity check
 
@@ -387,14 +402,17 @@ parity-build:
 parity-serve:
     build-eips -C "{{ invocation_directory() }}" --profile parity serve
 
-dirty-check:
-    build-eips -C "{{ invocation_directory() }}" --profile dirty check
+parity-preview:
+    build-eips -C "{{ invocation_directory() }}" --profile parity preview
 
 dirty-build:
     build-eips -C "{{ invocation_directory() }}" --profile dirty build
 
 dirty-serve:
     build-eips -C "{{ invocation_directory() }}" --profile dirty serve
+
+dirty-preview:
+    build-eips -C "{{ invocation_directory() }}" --profile dirty preview
 
 editorial-lint:
     build-eips -C "{{ invocation_directory() }}" editorial lint --working-tree
@@ -768,6 +786,10 @@ fn build_path(
         .unwrap_or_else(|| root_path.join(BUILD_DIR))
 }
 
+fn output_path(build_path: &Path) -> PathBuf {
+    build_path.join(OUTPUT_DIR)
+}
+
 fn theme_source(
     baseline: &Config,
     workspace_config: Option<&LoadedWorkspaceConfig>,
@@ -896,6 +918,42 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     })
 }
 
+fn is_proposal_path(path: &Path) -> bool {
+    let mut path = path.to_path_buf();
+
+    match path.file_name() {
+        Some(name) if name == "index.md" => {
+            path.pop();
+        }
+        Some(_)
+            if path
+                .extension()
+                .map(|extension| extension == "md")
+                .unwrap_or(false) =>
+        {
+            path.set_extension("");
+        }
+        None | Some(_) => return false,
+    }
+
+    match path.file_name().and_then(OsStr::to_str) {
+        None => return false,
+        Some(name) if name.parse::<u64>().is_err() => return false,
+        Some(_) => {
+            path.pop();
+        }
+    }
+
+    match path.file_name() {
+        Some(name) if name == CONTENT_DIR => {
+            path.pop();
+        }
+        _ => return false,
+    }
+
+    path == OsStr::new("")
+}
+
 fn repo_relative_path(root_path: &Path, path: &Path) -> Result<PathBuf, Whatever> {
     if path.is_absolute() {
         snafu::whatever!(
@@ -943,7 +1001,7 @@ fn validate_editorial_targets(
 
         let relative = repo_relative_path(root_path, &path)?;
 
-        if !Prepared::is_proposal_path(relative.clone()) {
+        if !is_proposal_path(&relative) {
             if strict {
                 snafu::whatever!(
                     "editorial target `{}` is not a supported proposal path",
@@ -1021,53 +1079,191 @@ fn editorial_targets(
 }
 
 #[derive(Debug)]
+struct DirtyServeWatcher {
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+impl DirtyServeWatcher {
+    fn start(source_root: PathBuf, build_repo_path: PathBuf) -> Result<Self, Whatever> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            dirty_serve_sync_loop(source_root, build_repo_path, stop_thread, ready_tx)
+        });
+
+        match ready_rx
+            .recv()
+            .whatever_context("dirty serve watcher exited before initialization")?
+        {
+            Ok(()) => Ok(Self { stop, thread }),
+            Err(message) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = thread.join();
+                snafu::whatever!("{message}");
+            }
+        }
+    }
+
+    fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.thread.join();
+    }
+}
+
+fn path_is_watched_source_path(root_path: &Path, path: &Path) -> bool {
+    let Ok(relative_path) = path.strip_prefix(root_path) else {
+        return false;
+    };
+
+    relative_path
+        .components()
+        .next()
+        .map(|component| component.as_os_str() != OsStr::new(".git"))
+        .unwrap_or(false)
+}
+
+fn event_has_watched_source_path(root_path: &Path, event: &Event) -> bool {
+    event
+        .paths
+        .iter()
+        .any(|path| path_is_watched_source_path(root_path, path))
+}
+
+fn sync_dirty_serve_state(
+    source_root: &Path,
+    build_repo_path: &Path,
+    previous_dirty_paths: &mut BTreeSet<PathBuf>,
+) -> Result<(), Whatever> {
+    let current_dirty_paths: BTreeSet<_> = git::working_tree_paths(source_root)
+        .whatever_context("unable to list tracked dirty paths for dirty serve")?
+        .into_iter()
+        .collect();
+
+    let affected_paths: BTreeSet<_> = previous_dirty_paths
+        .union(&current_dirty_paths)
+        .cloned()
+        .collect();
+
+    if affected_paths.is_empty() {
+        *previous_dirty_paths = current_dirty_paths;
+        return Ok(());
+    }
+
+    git::sync_materialized_paths(source_root, build_repo_path, &affected_paths)
+        .whatever_context("unable to synchronize tracked paths into the materialized repo")?;
+    markdown::preprocess_paths(&build_repo_path.join(CONTENT_DIR), &affected_paths)
+        .whatever_context("unable to preprocess synchronized markdown during dirty serve")?;
+
+    info!(
+        "synchronized {} tracked path(s) into the materialized repo for dirty serve",
+        affected_paths.len()
+    );
+
+    *previous_dirty_paths = current_dirty_paths;
+    Ok(())
+}
+
+fn dirty_serve_sync_loop(
+    source_root: PathBuf,
+    build_repo_path: PathBuf,
+    stop: Arc<AtomicBool>,
+    ready_tx: mpsc::Sender<Result<(), String>>,
+) {
+    let (event_tx, event_rx) = mpsc::channel();
+    let mut watcher = match notify::recommended_watcher(move |result| {
+        let _ = event_tx.send(result);
+    }) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            let _ = ready_tx.send(Err(format!("unable to start dirty serve watcher: {error}")));
+            return;
+        }
+    };
+
+    if let Err(error) = watcher.watch(&source_root, RecursiveMode::Recursive) {
+        let _ = ready_tx.send(Err(format!(
+            "unable to watch `{}` for dirty serve changes: {error}",
+            source_root.to_string_lossy()
+        )));
+        return;
+    }
+
+    let mut previous_dirty_paths: BTreeSet<_> = match git::working_tree_paths(&source_root) {
+        Ok(paths) => paths.into_iter().collect(),
+        Err(error) => {
+            let _ = ready_tx.send(Err(format!(
+                "unable to capture initial dirty serve state: {}",
+                Report::from_error(error)
+            )));
+            return;
+        }
+    };
+
+    info!(
+        "watching `{}` for dirty serve changes",
+        source_root.to_string_lossy()
+    );
+    let _ = ready_tx.send(Ok(()));
+
+    while !stop.load(Ordering::Relaxed) {
+        let first_event = match event_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(event) => Some(event),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+
+        let Some(first_event) = first_event else {
+            continue;
+        };
+
+        let mut saw_relevant_event = match first_event {
+            Ok(event) => event_has_watched_source_path(&source_root, &event),
+            Err(error) => {
+                warn!("filesystem watcher error: {error}");
+                false
+            }
+        };
+
+        loop {
+            match event_rx.recv_timeout(Duration::from_millis(75)) {
+                Ok(Ok(event)) => {
+                    saw_relevant_event |= event_has_watched_source_path(&source_root, &event);
+                }
+                Ok(Err(error)) => warn!("filesystem watcher error: {error}"),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+
+        if !saw_relevant_event {
+            continue;
+        }
+
+        if let Err(error) =
+            sync_dirty_serve_state(&source_root, &build_repo_path, &mut previous_dirty_paths)
+        {
+            warn!(
+                "unable to synchronize dirty serve changes: {}",
+                Report::from_error(error)
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Prepared {
     cache: cache::Cache,
     repo_path: PathBuf,
     output_path: PathBuf,
     repository_use: git::RepositoryUse,
     theme: ThemeSource,
+    source_root: PathBuf,
+    source_materialization: git::SourceMaterialization,
 }
 
 impl Prepared {
-    fn is_proposal_path(p: PathBuf) -> bool {
-        // Only lint `content/00001.md` and `content/00001/index.md` files.
-        let mut p = p.to_path_buf();
-
-        // content/00000.md  |  content/00000/index.md
-        //         ^^^^^^^^  |                ^^^^^^^^
-        match p.file_name() {
-            Some(n) if n == "index.md" => {
-                p.pop();
-            }
-            Some(_) if p.extension().map(|x| x == "md").unwrap_or(false) => {
-                p.set_extension("");
-            }
-            None | Some(_) => return false,
-        }
-
-        // content/00000
-        //         ^^^^^
-        match p.file_name().and_then(OsStr::to_str) {
-            None => return false,
-            Some(f) if f.parse::<u64>().is_err() => return false,
-            Some(_) => {
-                p.pop();
-            }
-        }
-
-        // content
-        // ^^^^^^^
-        match p.file_name() {
-            Some(f) if f == "content" => {
-                p.pop();
-            }
-            _ => return false,
-        }
-
-        p == OsStr::new("")
-    }
-
     fn prepare(resolved: ResolvedExecution) -> Result<Self, Whatever> {
         zola::find_zola().whatever_context("unable to find suitable zola binary")?;
 
@@ -1081,7 +1277,7 @@ impl Prepared {
 
         let repo_path = build_path.join(REPO_DIR);
         let content_path = repo_path.join(CONTENT_DIR);
-        let output_path = build_path.join(OUTPUT_DIR);
+        let output_path = output_path(&build_path);
 
         let both = git::Fresh::new(
             &root_path,
@@ -1108,6 +1304,8 @@ impl Prepared {
             cache,
             repo_path,
             output_path,
+            source_root: root_path,
+            source_materialization,
         })
     }
 
@@ -1124,9 +1322,23 @@ impl Prepared {
     }
 
     fn serve(self) -> Result<(), Whatever> {
-        zola::serve(&self.theme, &self.cache, &self.repo_path, &self.output_path)
-            .whatever_context("zola serve failed")?;
-        Ok(())
+        let dirty_watcher = if self.source_materialization == git::SourceMaterialization::Dirty {
+            Some(
+                DirtyServeWatcher::start(self.source_root.clone(), self.repo_path.clone())
+                    .whatever_context("unable to start dirty serve watcher")?,
+            )
+        } else {
+            None
+        };
+
+        let result = zola::serve(&self.theme, &self.cache, &self.repo_path, &self.output_path)
+            .whatever_context("zola serve failed");
+
+        if let Some(dirty_watcher) = dirty_watcher {
+            dirty_watcher.stop();
+        }
+
+        result
     }
 
     fn check(self) -> Result<(), Whatever> {
@@ -1261,6 +1473,13 @@ fn run() -> Result<(), Whatever> {
     }
 
     let resolved = resolve_execution(&args)?;
+
+    if matches!(&args.operation, Operation::Preview) {
+        preview::serve(&output_path(&resolved.build_path))
+            .whatever_context("preview server failed")?;
+        return Ok(());
+    }
+
     let build_path = make_build_dir(&resolved.build_path)?;
     let mut lock_file = lock(&build_path)?;
 
@@ -1285,6 +1504,7 @@ fn run() -> Result<(), Whatever> {
         Operation::Serve => {
             Prepared::prepare(resolved)?.serve()?;
         }
+        Operation::Preview => unreachable!(),
         Operation::Changed { all, format } => {
             let repo_path = build_path.join(REPO_DIR);
 
@@ -1304,7 +1524,7 @@ fn run() -> Result<(), Whatever> {
                 .changed_files()
                 .whatever_context("unable to list changed files")?
                 .into_iter()
-                .filter(|p| all || Prepared::is_proposal_path(p.into()))
+                .filter(|p| all || is_proposal_path(p))
                 .map(|p| repo_path.join(p))
                 .collect();
 
