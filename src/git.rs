@@ -303,6 +303,11 @@ fn collect_dirty_paths(root_path: &Path) -> Result<(BTreeSet<PathBuf>, usize), E
     Ok((paths, untracked_count))
 }
 
+pub fn working_tree_paths(root_path: &Path) -> Result<Vec<PathBuf>, Error> {
+    let (paths, _) = collect_dirty_paths(root_path)?;
+    Ok(paths.into_iter().collect())
+}
+
 fn remove_existing_path(path: &Path) -> Result<(), std::io::Error> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {

@@ -16,6 +16,7 @@ mod progress;
 mod zola;
 
 use std::{
+    collections::BTreeSet,
     ffi::OsStr,
     path::{Path, PathBuf},
 };
@@ -91,25 +92,16 @@ enum Operation {
     },
 
     /// Build the project and output HTML
-    Build {
-        #[command(flatten)]
-        eipw: lint::CmdArgs,
-    },
+    Build,
 
     /// Build the project and launch a web server to preview it
-    Serve {
-        #[command(flatten)]
-        eipw: lint::CmdArgs,
-    },
+    Serve,
 
     /// Remove temporary and output files
     Clean,
 
     /// Analyze the repository and report errors, but don't build HTML files
-    Check {
-        #[command(flatten)]
-        eipw: lint::CmdArgs,
-    },
+    Check,
 
     /// List files changed since the last commit common to both the local and upstream repositories
     Changed {
@@ -118,6 +110,12 @@ enum Operation {
         all: bool,
         #[clap(long, value_enum, default_value_t)]
         format: ChangedFormat,
+    },
+
+    /// Run targeted editorial validation with eipw
+    Editorial {
+        #[command(subcommand)]
+        command: EditorialCommand,
     },
 
     /// Manage local multi-repo workspace state
@@ -144,6 +142,46 @@ enum WorkspaceCommand {
 
     /// Check whether the local workspace is ready for the local daily workflow
     Doctor,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+enum EditorialCommand {
+    /// Run eipw on explicitly selected proposal targets
+    Lint {
+        #[command(flatten)]
+        selectors: EditorialSelectorArgs,
+
+        #[command(flatten)]
+        eipw: lint::CmdArgs,
+    },
+
+    /// Run targeted editorial validation, then the runtime check path
+    Build {
+        #[command(flatten)]
+        selectors: EditorialSelectorArgs,
+
+        #[command(flatten)]
+        eipw: lint::CmdArgs,
+    },
+}
+
+#[derive(Debug, clap::Args, Clone)]
+struct EditorialSelectorArgs {
+    /// Repo-relative proposal path(s), such as `content/07949.md`
+    #[arg(value_name = "PATH")]
+    paths: Vec<PathBuf>,
+
+    /// Read repo-relative proposal paths from BATCH, one per line
+    #[arg(long)]
+    batch: Option<PathBuf>,
+
+    /// Select tracked dirty proposal files from the active content repo
+    #[arg(long)]
+    working_tree: bool,
+
+    /// Select proposal files changed versus the upstream merge-base
+    #[arg(long)]
+    against_upstream: bool,
 }
 
 #[derive(Debug, clap::ValueEnum, Clone, Default)]
@@ -255,6 +293,15 @@ impl DoctorReport {
     }
 }
 
+impl EditorialSelectorArgs {
+    fn selector_count(&self) -> usize {
+        usize::from(!self.paths.is_empty())
+            + usize::from(self.batch.is_some())
+            + usize::from(self.working_tree)
+            + usize::from(self.against_upstream)
+    }
+}
+
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
     let lock_path = build_path.join(".lock");
     let mut lock_file =
@@ -348,6 +395,12 @@ dirty-build:
 
 dirty-serve:
     build-eips -C "{{ invocation_directory() }}" --profile dirty serve
+
+editorial-lint:
+    build-eips -C "{{ invocation_directory() }}" editorial lint --working-tree
+
+editorial-build:
+    build-eips -C "{{ invocation_directory() }}" editorial build --working-tree
 "#
 }
 
@@ -843,6 +896,130 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     })
 }
 
+fn repo_relative_path(root_path: &Path, path: &Path) -> Result<PathBuf, Whatever> {
+    if path.is_absolute() {
+        snafu::whatever!(
+            "editorial selectors require repo-relative proposal paths, got `{}`",
+            path.to_string_lossy()
+        );
+    }
+
+    let full_path = root_path.join(path);
+    let canonical = full_path.canonicalize().whatever_context(format!(
+        "unable to resolve editorial target `{}`",
+        full_path.to_string_lossy()
+    ))?;
+
+    let relative = canonical
+        .strip_prefix(root_path)
+        .whatever_context(format!(
+            "editorial target `{}` escapes the active repository root",
+            path.to_string_lossy()
+        ))?
+        .to_path_buf();
+
+    Ok(relative)
+}
+
+fn validate_editorial_targets(
+    root_path: &Path,
+    paths: Vec<PathBuf>,
+    strict: bool,
+) -> Result<Vec<PathBuf>, Whatever> {
+    let mut unique = BTreeSet::new();
+    let mut targets = Vec::new();
+
+    for path in paths {
+        if path.is_absolute() {
+            snafu::whatever!(
+                "editorial selectors require repo-relative proposal paths, got `{}`",
+                path.to_string_lossy()
+            );
+        }
+
+        if !strict && !root_path.join(&path).exists() {
+            continue;
+        }
+
+        let relative = repo_relative_path(root_path, &path)?;
+
+        if !Prepared::is_proposal_path(relative.clone()) {
+            if strict {
+                snafu::whatever!(
+                    "editorial target `{}` is not a supported proposal path",
+                    relative.to_string_lossy()
+                );
+            }
+            continue;
+        }
+
+        if unique.insert(relative.clone()) {
+            targets.push(relative);
+        }
+    }
+
+    if strict && targets.is_empty() {
+        snafu::whatever!("editorial selector resolved no proposal files");
+    }
+
+    Ok(targets)
+}
+
+fn read_editorial_batch(path: &Path) -> Result<Vec<PathBuf>, Whatever> {
+    let contents =
+        std::fs::read_to_string(path).whatever_context("unable to read editorial batch file")?;
+    let mut paths = Vec::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        paths.push(PathBuf::from(line));
+    }
+
+    Ok(paths)
+}
+
+fn editorial_targets(
+    selectors: &EditorialSelectorArgs,
+    resolved: &ResolvedExecution,
+) -> Result<Vec<PathBuf>, Whatever> {
+    if selectors.selector_count() != 1 {
+        snafu::whatever!(
+            "choose exactly one editorial selector: explicit proposal paths, `--batch`, `--working-tree`, or `--against-upstream`"
+        );
+    }
+
+    let raw_targets = if !selectors.paths.is_empty() {
+        selectors.paths.clone()
+    } else if let Some(batch) = selectors.batch.as_deref() {
+        let batch = resolve_input_path(batch)?;
+        read_editorial_batch(&batch)?
+    } else if selectors.working_tree {
+        git::working_tree_paths(&resolved.root_path)
+            .whatever_context("unable to resolve working-tree editorial targets")?
+    } else {
+        let repo_path = resolved.build_path.join(REPO_DIR);
+        git::Fresh::new(
+            &resolved.root_path,
+            &repo_path,
+            resolved.repository_use.clone(),
+            resolved.source_materialization,
+        )
+        .whatever_context("initializing build repo for editorial target selection")?
+        .clone_src()
+        .whatever_context("cloning source repo for editorial target selection")?
+        .fetch_upstream()
+        .whatever_context("fetching upstream repo for editorial target selection")?
+        .changed_files()
+        .whatever_context("unable to list editorial targets against upstream")?
+    };
+
+    let strict = !selectors.paths.is_empty() || selectors.batch.is_some();
+    validate_editorial_targets(&resolved.root_path, raw_targets, strict)
+}
+
 #[derive(Debug)]
 struct Prepared {
     cache: cache::Cache,
@@ -891,7 +1068,7 @@ impl Prepared {
         p == OsStr::new("")
     }
 
-    fn prepare(eipw: lint::CmdArgs, resolved: ResolvedExecution) -> Result<Self, Whatever> {
+    fn prepare(resolved: ResolvedExecution) -> Result<Self, Whatever> {
         zola::find_zola().whatever_context("unable to find suitable zola binary")?;
 
         let ResolvedExecution {
@@ -918,21 +1095,10 @@ impl Prepared {
         .fetch_upstream()
         .whatever_context("fetching upstream repo")?;
 
-        let changed_files: Vec<_> = both
-            .changed_files()
-            .whatever_context("unable to list changed files")?
-            .into_iter()
-            .filter(|p| Self::is_proposal_path(p.into()))
-            .map(|p| repo_path.join(p))
-            .collect();
-
         both.merge()
             .whatever_context("unable to merge ERC/EIP repositories")?;
 
         let cache = cache::Cache::open().whatever_context("unable to open cache")?;
-
-        lint::eipw(&theme, &cache, &root_path, &repo_path, changed_files, eipw)
-            .whatever_context("linting failed")?;
 
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
 
@@ -968,6 +1134,36 @@ impl Prepared {
             .whatever_context("zola check failed")?;
         Ok(())
     }
+}
+
+fn run_editorial_lint(
+    resolved: &ResolvedExecution,
+    selectors: &EditorialSelectorArgs,
+    eipw: lint::CmdArgs,
+) -> Result<bool, Whatever> {
+    let targets = editorial_targets(selectors, resolved)?;
+    if targets.is_empty() {
+        info!("editorial selector resolved no proposal files; skipping editorial lint");
+        return Ok(false);
+    }
+
+    let cache = cache::Cache::open().whatever_context("unable to open cache")?;
+
+    lint::eipw(&resolved.theme, &cache, &resolved.root_path, targets, eipw)
+        .whatever_context("editorial lint failed")?;
+
+    Ok(true)
+}
+
+fn editorial_runtime_execution(
+    resolved: &ResolvedExecution,
+    selectors: &EditorialSelectorArgs,
+) -> ResolvedExecution {
+    let mut runtime = resolved.clone();
+    if selectors.working_tree {
+        runtime.source_materialization = git::SourceMaterialization::Dirty;
+    }
+    runtime
 }
 
 fn clone_missing_repo(url: &str, destination: &Path) -> Result<(), Whatever> {
@@ -1080,14 +1276,14 @@ fn run() -> Result<(), Whatever> {
                 .whatever_context("unable to remove build directory")?;
             return Ok(());
         }
-        Operation::Check { eipw } => {
-            Prepared::prepare(eipw, resolved)?.check()?;
+        Operation::Check => {
+            Prepared::prepare(resolved)?.check()?;
         }
-        Operation::Build { eipw } => {
-            Prepared::prepare(eipw, resolved)?.build()?;
+        Operation::Build => {
+            Prepared::prepare(resolved)?.build()?;
         }
-        Operation::Serve { eipw } => {
-            Prepared::prepare(eipw, resolved)?.serve()?;
+        Operation::Serve => {
+            Prepared::prepare(resolved)?.serve()?;
         }
         Operation::Changed { all, format } => {
             let repo_path = build_path.join(REPO_DIR);
@@ -1114,6 +1310,15 @@ fn run() -> Result<(), Whatever> {
 
             format.print(&changed_files, &repo_path);
         }
+        Operation::Editorial { command } => match command {
+            EditorialCommand::Lint { selectors, eipw } => {
+                run_editorial_lint(&resolved, &selectors, eipw)?;
+            }
+            EditorialCommand::Build { selectors, eipw } => {
+                run_editorial_lint(&resolved, &selectors, eipw)?;
+                Prepared::prepare(editorial_runtime_execution(&resolved, &selectors))?.check()?;
+            }
+        },
     }
 
     lock_file
