@@ -8,6 +8,7 @@ mod changed;
 mod cli;
 mod config;
 mod context;
+mod editorial;
 mod execution;
 mod find_root;
 mod git;
@@ -33,7 +34,8 @@ use log::{debug, info};
 use snafu::{Report, ResultExt, Whatever};
 
 use crate::{
-    cli::{Args, Operation, RuntimeOperation},
+    cli::{Args, EditorialCommand, Operation, RuntimeOperation},
+    editorial::{editorial_runtime_execution, run_editorial_lint},
     execution::{resolve_execution, validate_non_execution_command_flags},
     layout::output_path,
     pipeline::Prepared,
@@ -112,19 +114,28 @@ fn run() -> Result<(), Whatever> {
                 .whatever_context("unable to remove build directory")?;
             return Ok(());
         }
-        RuntimeOperation::Check { eipw } => {
-            Prepared::prepare(eipw, resolved)?.check()?;
+        RuntimeOperation::Check => {
+            Prepared::prepare(resolved)?.check()?;
         }
-        RuntimeOperation::Build { eipw } => {
-            Prepared::prepare(eipw, resolved)?.build()?;
+        RuntimeOperation::Build => {
+            Prepared::prepare(resolved)?.build()?;
         }
-        RuntimeOperation::Serve { eipw } => {
-            Prepared::prepare(eipw, resolved)?.serve()?;
+        RuntimeOperation::Serve => {
+            Prepared::prepare(resolved)?.serve()?;
         }
         RuntimeOperation::Preview => unreachable!(),
         RuntimeOperation::Changed { all, format } => {
             changed::run(&resolved, &build_path, all, &format)?;
         }
+        RuntimeOperation::Editorial { command } => match command {
+            EditorialCommand::Lint { selectors, eipw } => {
+                run_editorial_lint(&resolved, &selectors, eipw)?;
+            }
+            EditorialCommand::Check { selectors, eipw } => {
+                run_editorial_lint(&resolved, &selectors, eipw.clone())?;
+                Prepared::prepare(editorial_runtime_execution(resolved, &selectors))?.check()?;
+            }
+        },
     }
 
     lock_file

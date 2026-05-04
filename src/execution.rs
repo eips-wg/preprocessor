@@ -129,7 +129,7 @@ pub(crate) fn resolve_execution_settings(
 
     let (staging, allow_dirty, default_sibling) = if let Some(staging) = explicit_environment {
         (staging, false, SelectedSource::Remote)
-    } else if args.operation.is_plain_site_command() {
+    } else if args.operation.is_plain_site_command() || args.operation.is_editorial_command() {
         (true, !clean, SelectedSource::WorkspaceLocal)
     } else {
         (false, false, SelectedSource::Remote)
@@ -239,6 +239,7 @@ fn operation_requires_theme(operation: &Operation) -> bool {
         Operation::Build { .. }
             | Operation::Serve { .. }
             | Operation::Check { .. }
+            | Operation::Editorial { .. }
             | Operation::Parity { .. }
     )
 }
@@ -713,6 +714,17 @@ base_url = "http://localhost:4000"
                 false,
                 SelectedSource::Remote,
             ),
+            (
+                &[
+                    "build-eips",
+                    "--remote-siblings",
+                    "editorial",
+                    "lint",
+                    "content/0001.md",
+                ][..],
+                true,
+                SelectedSource::Remote,
+            ),
         ];
 
         for (arguments, allow_dirty, sibling) in cases {
@@ -847,6 +859,7 @@ base_url = "http://localhost:4000"
             &["build-eips", "--staging", "build"][..],
             &["build-eips", "--production", "check"][..],
             &["build-eips", "parity", "build"][..],
+            &["build-eips", "editorial", "check", "--against-upstream"][..],
         ] {
             let args = parse_args(arguments);
             let theme_path = super::resolve_theme_path(Some(&workspace_config), &args.operation)
@@ -875,11 +888,126 @@ base_url = "http://localhost:4000"
     }
 
     #[test]
+    fn editorial_dispatch_uses_local_first_for_all_editorial_commands() {
+        let workspace_config = load_workspace_config("");
+
+        assert_settings(
+            &["build-eips", "editorial", "lint", "content/0001.md"],
+            &["ERCs"],
+            Some(&workspace_config),
+            ExecutionSettings {
+                build_root: None,
+                staging: true,
+                allow_dirty: true,
+                sibling: SelectedSource::WorkspaceLocal,
+            },
+        );
+        assert_settings(
+            &["build-eips", "editorial", "check", "content/0001.md"],
+            &["ERCs"],
+            Some(&workspace_config),
+            ExecutionSettings {
+                build_root: None,
+                staging: true,
+                allow_dirty: true,
+                sibling: SelectedSource::WorkspaceLocal,
+            },
+        );
+        assert_settings(
+            &[
+                "build-eips",
+                "--remote-siblings",
+                "editorial",
+                "lint",
+                "content/0001.md",
+            ],
+            &["ERCs"],
+            Some(&workspace_config),
+            ExecutionSettings {
+                build_root: None,
+                staging: true,
+                allow_dirty: true,
+                sibling: SelectedSource::Remote,
+            },
+        );
+        assert_settings(
+            &[
+                "build-eips",
+                "--staging",
+                "editorial",
+                "lint",
+                "content/0001.md",
+            ],
+            &["ERCs"],
+            None,
+            ExecutionSettings {
+                build_root: None,
+                staging: true,
+                allow_dirty: false,
+                sibling: SelectedSource::Remote,
+            },
+        );
+        assert_settings(
+            &[
+                "build-eips",
+                "--production",
+                "editorial",
+                "lint",
+                "content/0001.md",
+            ],
+            &["ERCs"],
+            None,
+            ExecutionSettings {
+                build_root: None,
+                staging: false,
+                allow_dirty: false,
+                sibling: SelectedSource::Remote,
+            },
+        );
+        assert_settings(
+            &[
+                "build-eips",
+                "--staging",
+                "editorial",
+                "check",
+                "--against-upstream",
+            ],
+            &["ERCs"],
+            None,
+            ExecutionSettings {
+                build_root: None,
+                staging: true,
+                allow_dirty: false,
+                sibling: SelectedSource::Remote,
+            },
+        );
+        assert_settings(
+            &[
+                "build-eips",
+                "--production",
+                "editorial",
+                "check",
+                "--against-upstream",
+            ],
+            &["ERCs"],
+            None,
+            ExecutionSettings {
+                build_root: None,
+                staging: false,
+                allow_dirty: false,
+                sibling: SelectedSource::Remote,
+            },
+        );
+    }
+
+    #[test]
     fn local_first_theme_commands_without_workspace_config_report_combined_setup_error() {
         for arguments in [
             &["build-eips", "build"][..],
             &["build-eips", "serve"][..],
             &["build-eips", "check"][..],
+            &["build-eips", "editorial", "lint", "content/0001.md"][..],
+            &["build-eips", "editorial", "check", "content/0001.md"][..],
         ] {
             assert_combined_missing_workspace_error(arguments);
         }
