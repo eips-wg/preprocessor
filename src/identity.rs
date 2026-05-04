@@ -65,4 +65,29 @@ impl ActiveRepoIdentity {
             Self::Legacy { .. } => None,
         }
     }
+
+    pub(crate) fn repository_use(&self, staging: bool) -> Result<git::RepositoryUse, Whatever> {
+        match self {
+            Self::Manifest(manifest) => {
+                let manifest = manifest.manifest();
+                Ok(git::RepositoryUse {
+                    title: manifest.repo_id.clone(),
+                    location: manifest.active_endpoint(staging),
+                    other_repos: manifest.sibling_repositories(staging),
+                })
+            }
+            Self::Legacy { repo_id } => {
+                let baseline = if staging {
+                    Config::staging()
+                } else {
+                    Config::production()
+                };
+                let Some(repository_use) = baseline.locations.repository_use_for_title(repo_id)
+                else {
+                    snafu::whatever!("legacy repository metadata for `{repo_id}` is unavailable");
+                };
+                Ok(repository_use)
+            }
+        }
+    }
 }
