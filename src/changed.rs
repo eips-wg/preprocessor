@@ -61,12 +61,25 @@ pub(crate) fn run(
 ) -> Result<(), Whatever> {
     let repo_path = build_path.join(REPO_DIR);
 
-    let both = git::Fresh::new(root_path, &repo_path, &config.locations)
-        .whatever_context("initializing build repo")?
-        .clone_src()
-        .whatever_context("cloning source repo")?
-        .fetch_upstream()
-        .whatever_context("fetching upstream repo")?;
+    let repo_id = config
+        .locations
+        .identify_repository_title(root_path)
+        .whatever_context("cannot identify repository use")?;
+    let Some(repository_use) = config.locations.repository_use_for_title(&repo_id) else {
+        snafu::whatever!("repository metadata for `{repo_id}` is unavailable");
+    };
+
+    let both = git::Fresh::new(
+        root_path,
+        &repo_path,
+        repository_use,
+        git::SourceMaterialization::Clean,
+    )
+    .whatever_context("initializing build repo")?
+    .clone_src()
+    .whatever_context("cloning source repo")?
+    .fetch_upstream()
+    .whatever_context("fetching upstream repo")?;
 
     let changed_files: Vec<_> = both
         .changed_files()
