@@ -124,8 +124,10 @@ fn cli_only_requested(args: &Args) -> bool {
 }
 
 fn only_cli_is_applicable(args: &Args, explicit_environment: Option<bool>) -> bool {
-    matches!(args.operation, Operation::Build { .. })
-        && explicit_environment.is_none()
+    matches!(
+        args.operation,
+        Operation::Build { .. } | Operation::Serve { .. }
+    ) && explicit_environment.is_none()
         && !args.operation.clean_cli_args().clean
         && !args.remote_siblings
 }
@@ -145,7 +147,7 @@ pub(crate) fn resolve_execution_settings(
     let clean = args.operation.clean_cli_args().clean;
 
     if cli_only_requested(args) && !only_cli_is_applicable(args, explicit_environment) {
-        snafu::whatever!("--only is supported only for local dirty build commands");
+        snafu::whatever!("--only is supported only for local dirty build and serve commands");
     }
 
     let (staging, allow_dirty, default_sibling) = if let Some(staging) = explicit_environment {
@@ -199,15 +201,19 @@ fn resolve_only_selection(
     workspace_config: Option<&LoadedWorkspaceConfig>,
 ) -> Result<Option<BTreeSet<ProposalNumber>>, Whatever> {
     let explicit_environment = explicit_environment_or_parity(args)?;
-    let applicable = matches!(args.operation, Operation::Build { .. })
-        && explicit_environment.is_none()
+    let applicable = matches!(
+        args.operation,
+        Operation::Build { .. } | Operation::Serve { .. }
+    ) && explicit_environment.is_none()
         && settings.allow_dirty
         && settings.sibling == SelectedSource::WorkspaceLocal;
 
     if let Some(only) = args.operation.only_cli_args() {
         if let Some(numbers) = dedupe_only_numbers(&only.only) {
             if !applicable {
-                snafu::whatever!("--only is supported only for local dirty build commands");
+                snafu::whatever!(
+                    "--only is supported only for local dirty build and serve commands"
+                );
             }
             return Ok(Some(numbers));
         }
@@ -663,7 +669,7 @@ base_url = "http://localhost:4000"
     }
 
     #[test]
-    fn build_only_cli_selection_overrides_config_and_dedupes() {
+    fn only_cli_selection_overrides_config_and_dedupes_for_build_and_serve() {
         let workspace_config = load_workspace_config(
             r#"
 [render]
@@ -678,10 +684,17 @@ only = [555]
             ),
             Some(vec![555, 678])
         );
+        assert_eq!(
+            only_selection_for(
+                &["build-eips", "serve", "--only", "678", "555", "678"],
+                Some(&workspace_config),
+            ),
+            Some(vec![555, 678])
+        );
     }
 
     #[test]
-    fn build_only_config_selection_applies_to_local_dirty_build_only() {
+    fn render_only_config_selection_applies_to_local_dirty_build_and_serve_only() {
         let workspace_config = load_workspace_config(
             r#"
 [render]
@@ -693,22 +706,30 @@ only = [555, 678, 555]
             only_selection_for(&["build-eips", "build"], Some(&workspace_config)),
             Some(vec![555, 678])
         );
+        assert_eq!(
+            only_selection_for(&["build-eips", "serve"], Some(&workspace_config)),
+            Some(vec![555, 678])
+        );
 
         for arguments in [
             &["build-eips", "build", "--clean"][..],
             &["build-eips", "--remote-siblings", "build"][..],
             &["build-eips", "--staging", "build"][..],
             &["build-eips", "--production", "build"][..],
-            &["build-eips", "serve"][..],
+            &["build-eips", "serve", "--clean"][..],
+            &["build-eips", "--remote-siblings", "serve"][..],
+            &["build-eips", "--staging", "serve"][..],
+            &["build-eips", "--production", "serve"][..],
             &["build-eips", "check"][..],
             &["build-eips", "parity", "build"][..],
+            &["build-eips", "parity", "serve"][..],
         ] {
             assert!(only_selection_for(arguments, Some(&workspace_config)).is_none());
         }
     }
 
     #[test]
-    fn build_only_cli_selection_rejects_non_local_dirty_modes() {
+    fn only_cli_selection_rejects_non_local_dirty_build_and_serve_modes() {
         let workspace_config = load_workspace_config("");
 
         for arguments in [
@@ -716,13 +737,19 @@ only = [555, 678, 555]
             &["build-eips", "--remote-siblings", "build", "--only", "555"][..],
             &["build-eips", "--staging", "build", "--only", "555"][..],
             &["build-eips", "--production", "build", "--only", "555"][..],
+            &["build-eips", "serve", "--only", "555", "--clean"][..],
+            &["build-eips", "--remote-siblings", "serve", "--only", "555"][..],
+            &["build-eips", "--staging", "serve", "--only", "555"][..],
+            &["build-eips", "--production", "serve", "--only", "555"][..],
         ] {
             let args = parse_args(arguments);
             let error = resolve_execution_settings(&args, &[], Some(&workspace_config))
                 .unwrap_err()
                 .to_string();
 
-            assert!(error.contains("--only is supported only for local dirty build commands"));
+            assert!(
+                error.contains("--only is supported only for local dirty build and serve commands")
+            );
         }
     }
 
@@ -740,6 +767,9 @@ only = []
         assert!(only_selection_for(&["build-eips", "build"], Some(&missing_render)).is_none());
         assert!(only_selection_for(&["build-eips", "build"], Some(&missing_only)).is_none());
         assert!(only_selection_for(&["build-eips", "build"], Some(&empty_only)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&missing_render)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&missing_only)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&empty_only)).is_none());
     }
 
     #[test]

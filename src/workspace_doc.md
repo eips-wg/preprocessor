@@ -40,3 +40,30 @@ port = 1111
 [site]
 base_url = "http://127.0.0.1:1111"
 ```
+
+## Render Specific Proposals Only
+
+Full local `build` and `serve` runs can take time because they process every
+proposal file. When you want to quickly test a single proposal or a specific
+batch, add a list of desired proposal numbers to the workspace
+`.build-eips.toml`:
+
+```toml
+[render]
+only = [555, 678]
+```
+
+Whenever `[render].only` is populated, regular local dirty `build` and `serve`
+commands render only those proposal pages. Links and references to excluded
+proposals are rewritten to the canonical public site.
+
+Use CLI `--only` when you want a one-run target list; it overrides any
+proposals in `[render].only` for that run:
+
+```sh
+build-eips serve --only 555
+build-eips build --only 555
+build-eips build --only 555 678
+```
+
+Multiple proposal numbers in the CLI are space-separated; no commas.
