@@ -22,10 +22,10 @@ use regex::Regex;
 
 use serde::{Deserialize, Serialize};
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::read_to_string;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 
 use snafu::{whatever, OptionExt, ResultExt, Whatever};
@@ -45,6 +45,26 @@ use crate::{
         ProposalAssetKind, ProposalNumber, ProposalReference,
     },
 };
+
+#[derive(Clone, Copy)]
+enum MissingPathMode {
+    Error,
+    Ignore,
+}
+
+impl MissingPathMode {
+    fn should_ignore_io_error(self, error: &std::io::Error) -> bool {
+        matches!(self, Self::Ignore)
+            && matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+    }
+
+    fn should_ignore_walkdir_error(self, error: &walkdir::Error) -> bool {
+        error
+            .io_error()
+            .map(|error| self.should_ignore_io_error(error))
+            .unwrap_or(false)
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Author {
@@ -143,6 +163,19 @@ impl Default for FrontMatter {
     }
 }
 
+fn filesystem_modified(p: &Path) -> Result<Datetime, Whatever> {
+    let metadata = std::fs::metadata(p)
+        .with_whatever_context(|e| format!("unable to read metadata for `{}`: {e}", p.display()))?;
+    let modified = metadata.modified().with_whatever_context(|e| {
+        format!(
+            "unable to read filesystem modified time for `{}`: {e}",
+            p.display()
+        )
+    })?;
+    let date_time: DateTime<chrono::Utc> = modified.into();
+    Ok(date_time.to_rfc3339().parse().unwrap())
+}
+
 fn last_modified(p: &Path) -> Result<Datetime, Whatever> {
     // TODO: Replace this with `git2`
     let mut command = std::process::Command::new("git");
@@ -164,7 +197,16 @@ fn last_modified(p: &Path) -> Result<Datetime, Whatever> {
     }
 
     let date_str = std::str::from_utf8(&output.stdout)
-        .with_whatever_context(|e| format!("command {:?} output not UTF-8: {e}", command))?;
+        .with_whatever_context(|e| format!("command {:?} output not UTF-8: {e}", command))?
+        .trim();
+
+    if date_str.is_empty() {
+        debug!(
+            "falling back to filesystem modified time for `{}` because git has no timestamp for the current path",
+            p.to_string_lossy()
+        );
+        return filesystem_modified(p);
+    }
 
     let unix: i64 = date_str.parse().with_whatever_context(|e| {
         let err_str = std::str::from_utf8(&output.stderr).unwrap_or("<non-utf-8>");
@@ -737,12 +779,12 @@ pub fn preprocess(root_path: &Path, only_plan: Option<&OnlyRenderPlan>) -> Resul
                 if let Some(plan) = only_plan {
                     let index_relative_path = relative_path.join("index.md");
                     if plan.should_preprocess_markdown(&index_relative_path) {
-                        process_eip(root_path, &index_path, only_plan)?;
+                        process_eip(root_path, &index_path, only_plan, MissingPathMode::Error)?;
                     }
                 } else {
-                    process_eip(root_path, &index_path, only_plan)?;
+                    process_eip(root_path, &index_path, only_plan, MissingPathMode::Error)?;
                 }
-                process_assets(root_path, &entry_path, only_plan)?;
+                process_assets(root_path, &entry_path, only_plan, MissingPathMode::Error)?;
             }
         } else if entry_path.extension().and_then(OsStr::to_str) == Some("md") {
             let relative_path = entry_path
@@ -758,9 +800,66 @@ pub fn preprocess(root_path: &Path, only_plan: Option<&OnlyRenderPlan>) -> Resul
                 .map(|plan| plan.should_preprocess_markdown(relative_path))
                 .unwrap_or(true)
             {
-                process_eip(root_path, &entry_path, only_plan)?;
+                process_eip(root_path, &entry_path, only_plan, MissingPathMode::Error)?;
             }
         }
+    }
+
+    Ok(())
+}
+
+pub fn preprocess_paths(
+    root_path: &Path,
+    relative_paths: &BTreeSet<PathBuf>,
+    only_plan: Option<&OnlyRenderPlan>,
+) -> Result<(), Whatever> {
+    let mut eips = BTreeSet::new();
+    let mut asset_dirs = BTreeSet::new();
+
+    for relative_path in relative_paths {
+        let Ok(content_relative_path) = relative_path.strip_prefix("content") else {
+            continue;
+        };
+
+        if content_relative_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        if content_relative_path.extension().and_then(OsStr::to_str) != Some("md") {
+            continue;
+        }
+
+        if only_plan
+            .map(|plan| !plan.should_sync_dirty_path(relative_path))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let mut components = content_relative_path.components();
+        let Some(first_component) = components.next() else {
+            continue;
+        };
+
+        if matches!(
+            components.next(),
+            Some(component) if component.as_os_str() == OsStr::new("assets")
+        ) {
+            let proposal_dir = root_path.join(first_component.as_os_str());
+            asset_dirs.insert(proposal_dir);
+            continue;
+        }
+
+        let path = root_path.join(content_relative_path);
+        eips.insert(path);
+    }
+
+    for path in eips {
+        process_eip(root_path, &path, only_plan, MissingPathMode::Ignore)?;
+    }
+
+    for path in asset_dirs {
+        process_assets(root_path, &path, only_plan, MissingPathMode::Ignore)?;
     }
 
     Ok(())
@@ -963,6 +1062,26 @@ fn fix_links<'a, 'b>(
             } else {
                 parent.join(Path::new(iri_path))
             };
+            let normalized_root = normalize_path_lexically(root);
+            let normalized_child = normalize_path_lexically(&child);
+            if let Some(public_url) = only_plan.and_then(|plan| {
+                normalized_child
+                    .strip_prefix(&normalized_root)
+                    .ok()
+                    .and_then(|relative_path| plan.external_url_for_content_target(relative_path))
+            }) {
+                let mut external_url = public_url.to_owned();
+                if let Some(query) = iri_ref.query() {
+                    external_url.push('?');
+                    external_url.push_str(query.as_str());
+                }
+                if let Some(fragment) = iri_ref.fragment() {
+                    external_url.push('#');
+                    external_url.push_str(fragment.as_str());
+                }
+                *dest_url = CowStr::from(external_url);
+                return Ok(e);
+            }
             let canonicalized = canonicalize_md(&child)?;
             if let Some(public_url) =
                 only_plan.and_then(|plan| plan.external_url_for_canonical_target(&canonicalized))
@@ -1082,8 +1201,63 @@ fn process_assets(
     root: &Path,
     path: &Path,
     only_plan: Option<&OnlyRenderPlan>,
+    missing_path_mode: MissingPathMode,
 ) -> Result<(), Whatever> {
     let canon_root = std::fs::canonicalize(root).whatever_context("could not canonicalize root")?;
+    let assets_dir = path.join("assets");
+
+    let mut entries = Vec::new();
+    let mut ignored_missing_path = false;
+
+    for entry in WalkDir::new(&assets_dir).follow_links(true).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if missing_path_mode.should_ignore_walkdir_error(&error) => {
+                ignored_missing_path = true;
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_whatever_context(|_| {
+                    format!("couldn't read entry in `{}`", assets_dir.to_string_lossy())
+                });
+            }
+        };
+
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        if entry.path().extension().and_then(OsStr::to_str) != Some("md") {
+            continue;
+        }
+
+        let candidate = match std::fs::canonicalize(entry.path()) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "unable to canonicalize `{}`: {e}",
+                    entry.path().to_string_lossy()
+                );
+                continue;
+            }
+        };
+
+        let in_root = candidate.starts_with(&canon_root);
+        if !in_root {
+            warn!(
+                "asset `{}` not in root, skipping",
+                entry.path().to_string_lossy()
+            );
+            continue;
+        }
+
+        entries.push(entry);
+    }
+
+    if entries.is_empty() && ignored_missing_path {
+        return Ok(());
+    }
+
     let number_txt = path
         .file_name()
         .with_whatever_context(|| format!("no file name for `{}`", path.to_string_lossy()))?
@@ -1094,53 +1268,17 @@ fn process_assets(
         format!("can't parse number for `{}`", path.to_string_lossy())
     })?;
 
-    let assets_dir = path.join("assets");
-
-    let dir = WalkDir::new(&assets_dir)
-        .follow_links(true)
-        .into_iter()
-        .filter(|e| match e {
-            Ok(f) if !f.file_type().is_file() => false,
-            Ok(f) => f.path().extension().and_then(OsStr::to_str) == Some("md"),
-            Err(_) => true,
-        })
-        .filter(|e| {
-            let f = match e {
-                Ok(f) => f,
-                _ => return true,
-            };
-
-            let candidate = match std::fs::canonicalize(f.path()) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        "unable to canonicalize `{}`: {e}",
-                        f.path().to_string_lossy()
-                    );
-                    return false;
-                }
-            };
-
-            let in_root = candidate.starts_with(&canon_root);
-            if !in_root {
-                warn!(
-                    "asset `{}` not in root, skipping",
-                    f.path().to_string_lossy()
-                );
-            }
-            in_root
-        });
-    let dirs: Vec<_> = dir.collect();
-
-    for entry in dirs.into_iter().progress_ext("Assets") {
-        let entry = entry.with_whatever_context(|_| {
-            format!("couldn't read entry in `{}`", assets_dir.to_string_lossy())
-        })?;
-
+    for entry in entries.into_iter().progress_ext("Assets") {
         let path = entry.path();
-        let contents = read_to_string(path).with_whatever_context(|_| {
-            format!("could not read file `{}`", path.to_string_lossy())
-        })?;
+        let contents = match read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if missing_path_mode.should_ignore_io_error(&error) => continue,
+            Err(error) => {
+                return Err(error).with_whatever_context(|_| {
+                    format!("could not read file `{}`", path.to_string_lossy())
+                });
+            }
+        };
         if is_generated_zola_markdown(&contents) {
             continue;
         }
@@ -1180,7 +1318,11 @@ fn process_assets(
             ..Default::default()
         };
 
-        write_file(path, front_matter, &contents).whatever_context("couldn't write file")?;
+        match write_file(path, front_matter, &contents) {
+            Ok(()) => {}
+            Err(error) if missing_path_mode.should_ignore_io_error(&error) => continue,
+            Err(error) => return Err(error).whatever_context("couldn't write file"),
+        }
     }
 
     Ok(())
@@ -1190,10 +1332,17 @@ fn process_eip(
     root: &Path,
     path: &Path,
     only_plan: Option<&OnlyRenderPlan>,
+    missing_path_mode: MissingPathMode,
 ) -> Result<(), Whatever> {
     let path_lossy = path.to_string_lossy();
-    let contents = read_to_string(path)
-        .with_whatever_context(|_| format!("could not read file `{}`", path_lossy))?;
+    let contents = match read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if missing_path_mode.should_ignore_io_error(&error) => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_whatever_context(|_| format!("could not read file `{}`", path_lossy));
+        }
+    };
     if is_generated_zola_markdown(&contents) {
         return Ok(());
     }
@@ -1322,7 +1471,11 @@ fn process_eip(
         }
     }
 
-    write_file(Path::new(&path), front_matter, &body).whatever_context("couldn't write file")?;
+    match write_file(path, front_matter, &body) {
+        Ok(()) => {}
+        Err(error) if missing_path_mode.should_ignore_io_error(&error) => return Ok(()),
+        Err(error) => return Err(error).whatever_context("couldn't write file"),
+    }
 
     Ok(())
 }
@@ -1338,9 +1491,9 @@ mod tests {
     use toml::Value as TomlValue;
 
     use super::{
-        absolute_rendered_path_for_content_path, preprocess, proposal_asset_exists_in_content_tree,
-        relative_url_from_rendered_paths, resolve_proposal_asset_path, ProposalAssetPath,
-        ProposalAssetPathResolution,
+        absolute_rendered_path_for_content_path, preprocess, preprocess_paths,
+        proposal_asset_exists_in_content_tree, relative_url_from_rendered_paths,
+        resolve_proposal_asset_path, ProposalAssetPath, ProposalAssetPathResolution,
     };
     use crate::proposal::ProposalAssetKind;
     use crate::proposal::{OnlyRenderPlan, ProposalNumber};
@@ -1408,6 +1561,10 @@ mod tests {
             .map(number)
             .collect::<BTreeSet<_>>();
         OnlyRenderPlan::build(content_root, selected).unwrap()
+    }
+
+    fn repo_paths(paths: &[&str]) -> BTreeSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
     }
 
     fn rendered_body(path: &Path) -> String {
@@ -2127,6 +2284,46 @@ mod tests {
     }
 
     #[test]
+    fn targeted_preprocess_paths_rewrites_selected_dirty_markdown_with_plan() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(
+                    555,
+                    None,
+                    "requires: 155\n",
+                    "See [EIP-155](./00155.md#list-of-chain-id-s).",
+                ),
+            ),
+            ("00155.md", proposal_markdown(155, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess_paths(&content, &repo_paths(&["content/00555.md"]), Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        let requires = front_matter["extra"]["requires"].as_array().unwrap();
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-155#list-of-chain-id-s"));
+        assert_eq!(
+            requires[0].as_str().unwrap(),
+            "https://eips.ethereum.org/EIPS/eip-155"
+        );
+    }
+
+    #[test]
+    fn targeted_preprocess_paths_ignores_deleted_dirty_markdown() {
+        let (_temp, content) =
+            content_repo(&[("00555.md", proposal_markdown(555, None, "", "Selected."))]);
+        let plan = only_plan(&content, &[555]);
+        std::fs::remove_file(content.join("00555.md")).unwrap();
+
+        preprocess_paths(&content, &repo_paths(&["content/00555.md"]), Some(&plan)).unwrap();
+
+        assert!(!content.join("00555.md").exists());
+    }
+
+    #[test]
     fn targeted_preprocess_rewrites_retained_non_proposal_links_to_public_urls() {
         let (_temp, content) = content_repo(&[
             (
@@ -2146,6 +2343,79 @@ mod tests {
     }
 
     #[test]
+    fn targeted_preprocess_paths_rewrites_retained_non_proposal_markdown_with_plan() {
+        let (_temp, content) = content_repo(&[
+            (
+                "_index.md",
+                "---\ntitle: Home\n---\nSee [EIP-678](/00678.md).\n".to_owned(),
+            ),
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            ("00678.md", proposal_markdown(678, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess_paths(&content, &repo_paths(&["content/_index.md"]), Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("_index.md"));
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-678"));
+        assert!(!body.contains("@/00678.md"));
+    }
+
+    #[test]
+    fn targeted_preprocess_paths_rewrites_selected_asset_markdown_with_plan() {
+        let (_temp, content) = content_repo(&[
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            (
+                "00555/assets/guide.md",
+                "See [EIP-678](/00678.md).\n".to_owned(),
+            ),
+            ("00555/assets/diagram.png", "image\n".to_owned()),
+            (
+                "00678.md",
+                proposal_markdown(678, Some("ERC"), "", "Unselected."),
+            ),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess_paths(
+            &content,
+            &repo_paths(&["content/00555/assets/guide.md"]),
+            Some(&plan),
+        )
+        .unwrap();
+
+        let body = rendered_body(&content.join("00555/assets/guide.md"));
+        assert!(body.contains("https://ercs.ethereum.org/ERCS/erc-678"));
+        assert_eq!(
+            std::fs::read_to_string(content.join("00555/assets/diagram.png")).unwrap(),
+            "image\n"
+        );
+    }
+
+    #[test]
+    fn targeted_preprocess_paths_ignores_deleted_dirty_asset_dir() {
+        let (_temp, content) = content_repo(&[
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            (
+                "00555/assets/guide.md",
+                "See [EIP-678](/00678.md).\n".to_owned(),
+            ),
+            ("00678.md", proposal_markdown(678, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+        std::fs::remove_dir_all(content.join("00555/assets")).unwrap();
+
+        preprocess_paths(
+            &content,
+            &repo_paths(&["content/00555/assets/guide.md"]),
+            Some(&plan),
+        )
+        .unwrap();
+
+        assert!(!content.join("00555/assets").exists());
+    }
+
+    #[test]
     fn targeted_preprocess_preserves_query_and_fragment_on_external_links() {
         let (_temp, content) = content_repo(&[
             (
@@ -2157,7 +2427,10 @@ mod tests {
                     "See [Fragment](./00155.md#list-of-chain-id-s).\nSee [Query](./00155.md?foo=bar#list-of-chain-id-s).",
                 ),
             ),
-            ("00155.md", proposal_markdown(155, None, "", "Unselected.")),
+            (
+                "00155.md",
+                proposal_markdown(155, None, "", "Unselected."),
+            ),
         ]);
         let plan = only_plan(&content, &[555]);
 

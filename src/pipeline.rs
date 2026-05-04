@@ -154,6 +154,7 @@ impl Prepared {
             self.source_materialization,
             &self.source_root,
             &self.repo_path,
+            self.only_plan.clone(),
             self.local_theme_sync.clone(),
         );
         let dirty_watcher = if sync_config.has_targets() {

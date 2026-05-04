@@ -23,7 +23,7 @@ use log::{debug, info, warn};
 use notify::{Event, RecursiveMode, Watcher};
 use snafu::{Report, ResultExt, Whatever};
 
-use crate::{git, layout::CONTENT_DIR, markdown};
+use crate::{git, layout::CONTENT_DIR, markdown, proposal::OnlyRenderPlan};
 
 #[derive(Debug)]
 pub(crate) struct DirtyServeWatcher {
@@ -35,6 +35,7 @@ pub(crate) struct DirtyServeWatcher {
 struct ActiveRepoServeSync {
     source_root: PathBuf,
     build_repo_path: PathBuf,
+    only_plan: Option<OnlyRenderPlan>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,27 +122,37 @@ fn event_has_theme_index_path(index_path: &Path, event: &Event) -> bool {
 fn sync_dirty_serve_state(
     source_root: &Path,
     build_repo_path: &Path,
+    only_plan: Option<&OnlyRenderPlan>,
     previous_dirty_paths: &mut BTreeSet<PathBuf>,
 ) -> Result<(), Whatever> {
-    let current_dirty_paths: BTreeSet<_> = git::working_tree_paths(source_root)
-        .whatever_context("unable to list tracked dirty paths for dirty serve")?
-        .into_iter()
-        .collect();
+    let current_dirty_paths = filter_dirty_paths(
+        git::working_tree_paths(source_root)
+            .whatever_context("unable to list tracked dirty paths for dirty serve")?,
+        only_plan,
+    );
 
-    let affected_paths: BTreeSet<_> = previous_dirty_paths
-        .union(&current_dirty_paths)
-        .cloned()
-        .collect();
+    let affected_paths = affected_dirty_paths(previous_dirty_paths, &current_dirty_paths);
 
     if affected_paths.is_empty() {
         *previous_dirty_paths = current_dirty_paths;
         return Ok(());
     }
 
+    for path in selected_deleted_proposal_markdown_paths(source_root, &affected_paths, only_plan) {
+        warn!(
+            "selected proposal path `{}` was removed from the source repo; removing it from the targeted serve build input",
+            path.to_string_lossy()
+        );
+    }
+
     git::sync_materialized_paths(source_root, build_repo_path, &affected_paths)
         .whatever_context("unable to synchronize tracked paths into the materialized repo")?;
-    markdown::preprocess(&build_repo_path.join(CONTENT_DIR), None)
-        .whatever_context("unable to preprocess synchronized markdown during dirty serve")?;
+    markdown::preprocess_paths(
+        &build_repo_path.join(CONTENT_DIR),
+        &affected_paths,
+        only_plan,
+    )
+    .whatever_context("unable to preprocess synchronized markdown during dirty serve")?;
 
     info!(
         "synchronized {} tracked path(s) into the materialized repo for dirty serve",
@@ -152,11 +163,69 @@ fn sync_dirty_serve_state(
     Ok(())
 }
 
-fn capture_active_dirty_paths(source_root: &Path) -> Result<BTreeSet<PathBuf>, Whatever> {
-    Ok(git::working_tree_paths(source_root)
-        .whatever_context("unable to list tracked dirty paths for dirty serve")?
+fn filter_dirty_paths(
+    dirty_paths: impl IntoIterator<Item = PathBuf>,
+    only_plan: Option<&OnlyRenderPlan>,
+) -> BTreeSet<PathBuf> {
+    dirty_paths
         .into_iter()
-        .collect())
+        .filter(|path| {
+            only_plan
+                .map(|plan| plan.should_sync_dirty_path(path))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn affected_dirty_paths(
+    previous_dirty_paths: &BTreeSet<PathBuf>,
+    current_dirty_paths: &BTreeSet<PathBuf>,
+) -> BTreeSet<PathBuf> {
+    previous_dirty_paths
+        .union(current_dirty_paths)
+        .cloned()
+        .collect()
+}
+
+fn selected_deleted_proposal_markdown_paths(
+    source_root: &Path,
+    affected_paths: &BTreeSet<PathBuf>,
+    only_plan: Option<&OnlyRenderPlan>,
+) -> Vec<PathBuf> {
+    let Some(only_plan) = only_plan else {
+        return Vec::new();
+    };
+
+    affected_paths
+        .iter()
+        .filter(|path| only_plan.is_selected_proposal_markdown_path(path))
+        .filter(
+            |path| match std::fs::symlink_metadata(source_root.join(path)) {
+                Ok(_) => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    true
+                }
+                Err(_) => false,
+            },
+        )
+        .cloned()
+        .collect()
+}
+
+fn capture_active_dirty_paths(
+    source_root: &Path,
+    only_plan: Option<&OnlyRenderPlan>,
+) -> Result<BTreeSet<PathBuf>, Whatever> {
+    Ok(filter_dirty_paths(
+        git::working_tree_paths(source_root)
+            .whatever_context("unable to list tracked dirty paths for dirty serve")?,
+        only_plan,
+    ))
 }
 
 fn sync_theme_serve_state(
@@ -273,7 +342,10 @@ fn dirty_serve_sync_loop(
     }
 
     let mut previous_active_dirty_paths: BTreeSet<_> = match &sync_config.active_repo {
-        Some(active_repo) => match capture_active_dirty_paths(&active_repo.source_root) {
+        Some(active_repo) => match capture_active_dirty_paths(
+            &active_repo.source_root,
+            active_repo.only_plan.as_ref(),
+        ) {
             Ok(paths) => paths,
             Err(error) => {
                 let _ = ready_tx.send(Err(format!(
@@ -385,6 +457,7 @@ fn dirty_serve_sync_loop(
                 if let Err(error) = sync_dirty_serve_state(
                     &active_repo.source_root,
                     &active_repo.build_repo_path,
+                    active_repo.only_plan.as_ref(),
                     &mut previous_active_dirty_paths,
                 ) {
                     warn!(
@@ -416,6 +489,7 @@ pub(crate) fn serve_sync_config(
     source_materialization: git::SourceMaterialization,
     source_root: &Path,
     repo_path: &Path,
+    only_plan: Option<OnlyRenderPlan>,
     local_theme_sync: Option<LocalThemeServeSync>,
 ) -> ServeSyncConfig {
     ServeSyncConfig {
@@ -423,6 +497,7 @@ pub(crate) fn serve_sync_config(
             ActiveRepoServeSync {
                 source_root: source_root.to_path_buf(),
                 build_repo_path: repo_path.to_path_buf(),
+                only_plan,
             }
         }),
         local_theme: local_theme_sync,
@@ -431,14 +506,25 @@ pub(crate) fn serve_sync_config(
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        collections::BTreeSet,
+        path::{Path, PathBuf},
+    };
 
+    use git2::{IndexAddOption, Repository, Signature};
     use notify::{Event, EventKind};
     use tempfile::TempDir;
 
-    use crate::git::SourceMaterialization;
+    use crate::{
+        git::SourceMaterialization,
+        proposal::{OnlyRenderPlan, ProposalNumber},
+    };
 
-    use super::{event_has_theme_index_path, serve_sync_config, LocalThemeServeSync};
+    use super::{
+        affected_dirty_paths, event_has_theme_index_path, filter_dirty_paths,
+        selected_deleted_proposal_markdown_paths, serve_sync_config, sync_dirty_serve_state,
+        LocalThemeServeSync,
+    };
 
     fn fake_theme_sync(root: &Path) -> LocalThemeServeSync {
         LocalThemeServeSync {
@@ -446,6 +532,114 @@ mod tests {
             mounted_theme_dir: root.join("repo/themes/eips-theme"),
             theme_index_path: root.join("theme/.git/index"),
         }
+    }
+
+    fn number(value: u32) -> ProposalNumber {
+        ProposalNumber::from_u32(value).unwrap()
+    }
+
+    fn write_file(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn commit_all(repo: &Repository, message: &str) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("build-eips test", "build-eips@example.test").unwrap();
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).unwrap())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .unwrap();
+    }
+
+    fn init_repo(root: &Path, files: &[(&str, &str)]) -> Repository {
+        std::fs::create_dir_all(root).unwrap();
+        let repo = Repository::init(root).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+        for (relative, contents) in files {
+            write_file(root, relative, contents);
+        }
+        commit_all(&repo, "initial");
+        repo
+    }
+
+    fn proposal_markdown(value: u32, extra_preamble: &str, body: &str) -> String {
+        format!("---\neip: {value}\ntitle: Proposal {value}\n{extra_preamble}---\n{body}\n")
+    }
+
+    fn only_plan(root: &Path) -> OnlyRenderPlan {
+        let content = root.join("content");
+        write_file(&content, "00555.md", &proposal_markdown(555, "", "Body"));
+        write_file(&content, "00678.md", &proposal_markdown(678, "", "Body"));
+        OnlyRenderPlan::build(&content, [number(555)].into_iter().collect()).unwrap()
+    }
+
+    fn paths(paths: &[&str]) -> BTreeSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    fn rendered_body(path: &Path) -> String {
+        let contents = std::fs::read_to_string(path).unwrap();
+        contents.split_once("\n+++\n").unwrap().1.to_owned()
+    }
+
+    fn dirty_sync_fixture() -> (TempDir, PathBuf, PathBuf, OnlyRenderPlan) {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let build = temp.path().join("build/repo");
+        let selected = proposal_markdown(555, "requires: 678\n", "See [EIP-678](/00678.md).");
+        let unselected = proposal_markdown(678, "", "Unselected.");
+        init_repo(
+            &source,
+            &[
+                ("content/00555.md", selected.as_str()),
+                ("content/00555/assets/diagram.png", "selected image\n"),
+                ("content/00678.md", unselected.as_str()),
+                ("content/00678/assets/diagram.png", "unselected image\n"),
+                (
+                    "content/_index.md",
+                    "---\ntitle: Home\n---\nSee [EIP-678](/00678.md).\n",
+                ),
+            ],
+        );
+        let plan =
+            OnlyRenderPlan::build(&source.join("content"), [number(555)].into_iter().collect())
+                .unwrap();
+        init_repo(
+            &build,
+            &[
+                ("content/00555.md", selected.as_str()),
+                ("content/00555/assets/diagram.png", "selected image\n"),
+                (
+                    "content/_index.md",
+                    "---\ntitle: Home\n---\nSee [EIP-678](/00678.md).\n",
+                ),
+            ],
+        );
+        (temp, source, build, plan)
     }
 
     #[test]
@@ -465,15 +659,23 @@ mod tests {
     #[test]
     fn local_serve_syncs_theme_and_dirty_active_repo() {
         let temp = TempDir::new().unwrap();
+        let plan = only_plan(temp.path());
 
         let sync_config = serve_sync_config(
             SourceMaterialization::Dirty,
             &temp.path().join("Core"),
             &temp.path().join(".local-build/Core/repo"),
+            Some(plan),
             Some(fake_theme_sync(temp.path())),
         );
 
         assert!(sync_config.active_repo.is_some());
+        assert!(sync_config
+            .active_repo
+            .as_ref()
+            .unwrap()
+            .only_plan
+            .is_some());
         assert!(sync_config.local_theme.is_some());
     }
 
@@ -485,10 +687,131 @@ mod tests {
             SourceMaterialization::Clean,
             &temp.path().join("Core"),
             &temp.path().join(".local-build/Core/repo"),
+            None,
             Some(fake_theme_sync(temp.path())),
         );
 
         assert!(sync_config.active_repo.is_none());
         assert!(sync_config.local_theme.is_some());
+    }
+
+    #[test]
+    fn only_dirty_path_filter_runs_before_union_and_keeps_selected_deletions() {
+        let temp = TempDir::new().unwrap();
+        let plan = only_plan(temp.path());
+        let previous_raw = paths(&[
+            "content/00555.md",
+            "content/00678.md",
+            "content/00678/assets/diagram.png",
+        ]);
+        let current_raw = paths(&["content/00555/assets/diagram.png", "content/00999.md"]);
+
+        let previous_filtered = filter_dirty_paths(previous_raw, Some(&plan));
+        let current_filtered = filter_dirty_paths(current_raw, Some(&plan));
+        let affected = affected_dirty_paths(&previous_filtered, &current_filtered);
+
+        assert_eq!(
+            affected,
+            paths(&["content/00555.md", "content/00555/assets/diagram.png"])
+        );
+    }
+
+    #[test]
+    fn selected_deleted_proposal_markdown_paths_reports_only_selected_markdown_deletions() {
+        let (_temp, source, _build, plan) = dirty_sync_fixture();
+        std::fs::remove_file(source.join("content/00555.md")).unwrap();
+        std::fs::remove_file(source.join("content/00555/assets/diagram.png")).unwrap();
+        std::fs::remove_file(source.join("content/_index.md")).unwrap();
+
+        let affected_paths = paths(&[
+            "content/00555.md",
+            "content/00555/assets/diagram.png",
+            "content/_index.md",
+            "content/00678.md",
+        ]);
+
+        assert_eq!(
+            selected_deleted_proposal_markdown_paths(&source, &affected_paths, Some(&plan)),
+            vec![PathBuf::from("content/00555.md")]
+        );
+        assert!(
+            selected_deleted_proposal_markdown_paths(&source, &affected_paths, None).is_empty()
+        );
+    }
+
+    #[test]
+    fn only_dirty_sync_does_not_reintroduce_unselected_markdown_or_assets() {
+        let (_temp, source, build, plan) = dirty_sync_fixture();
+        write_file(
+            &source,
+            "content/00678.md",
+            &proposal_markdown(678, "", "Dirty unselected."),
+        );
+        write_file(
+            &source,
+            "content/00678/assets/diagram.png",
+            "dirty unselected image\n",
+        );
+        let mut previous_dirty_paths = BTreeSet::new();
+
+        sync_dirty_serve_state(&source, &build, Some(&plan), &mut previous_dirty_paths).unwrap();
+
+        assert!(!build.join("content/00678.md").exists());
+        assert!(!build.join("content/00678/assets/diagram.png").exists());
+        assert!(previous_dirty_paths.is_empty());
+    }
+
+    #[test]
+    fn only_dirty_sync_copies_selected_assets_without_markdown_preprocessing() {
+        let (_temp, source, build, plan) = dirty_sync_fixture();
+        write_file(
+            &source,
+            "content/00555/assets/diagram.png",
+            "dirty selected image\n",
+        );
+        let mut previous_dirty_paths = BTreeSet::new();
+
+        sync_dirty_serve_state(&source, &build, Some(&plan), &mut previous_dirty_paths).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(build.join("content/00555/assets/diagram.png")).unwrap(),
+            "dirty selected image\n"
+        );
+        assert!(previous_dirty_paths.contains(Path::new("content/00555/assets/diagram.png")));
+    }
+
+    #[test]
+    fn only_dirty_sync_preprocesses_selected_and_retained_markdown_with_plan() {
+        let (_temp, source, build, plan) = dirty_sync_fixture();
+        write_file(
+            &source,
+            "content/00555.md",
+            &proposal_markdown(555, "requires: 678\n", "Dirty [EIP-678](/00678.md)."),
+        );
+        write_file(
+            &source,
+            "content/_index.md",
+            "---\ntitle: Home\n---\nDirty [EIP-678](/00678.md).\n",
+        );
+        let mut previous_dirty_paths = BTreeSet::new();
+
+        sync_dirty_serve_state(&source, &build, Some(&plan), &mut previous_dirty_paths).unwrap();
+
+        let selected = std::fs::read_to_string(build.join("content/00555.md")).unwrap();
+        let index_body = rendered_body(&build.join("content/_index.md"));
+        assert!(selected.contains("https://eips.ethereum.org/EIPS/eip-678"));
+        assert!(index_body.contains("https://eips.ethereum.org/EIPS/eip-678"));
+    }
+
+    #[test]
+    fn only_dirty_sync_propagates_selected_proposal_deletion() {
+        let (_temp, source, build, plan) = dirty_sync_fixture();
+        std::fs::remove_file(source.join("content/00555.md")).unwrap();
+        let mut previous_dirty_paths = BTreeSet::new();
+
+        sync_dirty_serve_state(&source, &build, Some(&plan), &mut previous_dirty_paths).unwrap();
+
+        assert!(!build.join("content/00555.md").exists());
+        assert!(previous_dirty_paths.contains(Path::new("content/00555.md")));
     }
 }

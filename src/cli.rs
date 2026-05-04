@@ -109,6 +109,9 @@ pub(crate) enum Operation {
 
         #[command(flatten)]
         clean: CleanCliArgs,
+
+        #[command(flatten)]
+        only: OnlyCliArgs,
     },
 
     /// Remove the selected build directory and generated output
@@ -284,10 +287,9 @@ impl Operation {
 
     pub(crate) fn only_cli_args(&self) -> Option<&OnlyCliArgs> {
         match self {
-            Self::Build { only, .. } => Some(only),
+            Self::Build { only, .. } | Self::Serve { only, .. } => Some(only),
             Self::Print { .. }
             | Self::Preview { .. }
-            | Self::Serve { .. }
             | Self::Clean
             | Self::Check { .. }
             | Self::Changed { .. }
@@ -449,9 +451,10 @@ mod tests {
     }
 
     #[test]
-    fn only_flag_parses_one_or_more_proposal_numbers_on_build() {
+    fn only_flag_parses_one_or_more_proposal_numbers_on_build_and_serve() {
         let one = parse_args(&["build-eips", "build", "--only", "00555"]);
         let many = parse_args(&["build-eips", "build", "--only", "555", "678", "897"]);
+        let serve = parse_args(&["build-eips", "serve", "--only", "555", "678"]);
 
         match one.operation {
             Operation::Build { only, .. } => {
@@ -472,10 +475,22 @@ mod tests {
             }
             other => panic!("unexpected operation: {other:?}"),
         }
+        match serve.operation {
+            Operation::Serve { only, .. } => {
+                assert_eq!(
+                    only.only,
+                    vec![
+                        ProposalNumber::from_u32(555).unwrap(),
+                        ProposalNumber::from_u32(678).unwrap(),
+                    ]
+                );
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
     }
 
     #[test]
-    fn only_flag_rejects_invalid_selectors_and_non_build_commands() {
+    fn only_flag_rejects_invalid_selectors_and_non_targeted_commands() {
         for selector in [
             "+555",
             "0",
@@ -491,9 +506,9 @@ mod tests {
             );
         }
 
-        assert!(Args::try_parse_from(["build-eips", "serve", "--only", "555"]).is_err());
         assert!(Args::try_parse_from(["build-eips", "check", "--only", "555"]).is_err());
         assert!(Args::try_parse_from(["build-eips", "parity", "build", "--only", "555"]).is_err());
+        assert!(Args::try_parse_from(["build-eips", "parity", "serve", "--only", "555"]).is_err());
     }
 
     #[test]
