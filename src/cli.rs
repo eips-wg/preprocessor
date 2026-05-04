@@ -146,6 +146,10 @@ pub(crate) enum Operation {
         /// Also clone template for proposal-family scaffold work
         #[arg(long)]
         template: bool,
+
+        /// Also clone preprocessor and eipw for platform development
+        #[arg(long)]
+        platform_dev: bool,
     },
 
     /// Check workspace layout, local repos, and required tools
@@ -767,18 +771,38 @@ mod tests {
     fn workspace_lifecycle_commands_parse() {
         let plain = parse_args(&["build-eips", "init", "/tmp/workspace"]);
         let template = parse_args(&["build-eips", "init", "/tmp/workspace", "--template"]);
+        let combined = parse_args(&[
+            "build-eips",
+            "init",
+            "/tmp/workspace",
+            "--template",
+            "--platform-dev",
+        ]);
         let doctor = parse_args(&["build-eips", "doctor"]);
 
         assert!(matches!(
             plain.operation,
             Operation::Init {
                 template: false,
+                platform_dev: false,
                 ..
             }
         ));
         assert!(matches!(
             template.operation,
-            Operation::Init { template: true, .. }
+            Operation::Init {
+                template: true,
+                platform_dev: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            combined.operation,
+            Operation::Init {
+                template: true,
+                platform_dev: true,
+                ..
+            }
         ));
         assert!(matches!(doctor.operation, Operation::Doctor));
     }

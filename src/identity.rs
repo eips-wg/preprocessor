@@ -86,7 +86,7 @@ impl ActiveRepoIdentity {
                 let manifest = manifest.manifest();
                 Ok(git::RepositoryUse {
                     title: manifest.repo_id.clone(),
-                    location: manifest.active_endpoint(staging),
+                    location: manifest.active_endpoint(staging).clone(),
                     other_repos: manifest.sibling_repositories(staging),
                 })
             }

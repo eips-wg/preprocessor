@@ -23,21 +23,27 @@ pub const DEFAULT_THEME_DIR: &str = "theme";
 pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
 pub const DEFAULT_SERVER_PORT: u16 = 1111;
 pub const DEFAULT_SITE_BASE_URL: &str = "http://127.0.0.1:1111";
-const RESERVED_REPO_IDS: &[&str] = &["theme", "preprocessor", "eipw"];
+const RESERVED_WORKSPACE_NAMES: &[&str] = &[DEFAULT_THEME_DIR, "preprocessor", "eipw"];
 
 #[derive(Debug, Snafu)]
 pub enum RepoManifestError {
-    #[snafu(display("i/o error while accessing `{}`", path.to_string_lossy()))]
+    #[snafu(
+        context(name(RepoManifestIoSnafu)),
+        display("i/o error while accessing `{}`", path.to_string_lossy())
+    )]
     Io {
         path: PathBuf,
         source: std::io::Error,
         backtrace: Backtrace,
     },
 
-    #[snafu(display(
-        "unable to parse repo manifest `{}`",
-        manifest_path.to_string_lossy()
-    ))]
+    #[snafu(
+        context(name(RepoManifestParseSnafu)),
+        display(
+            "unable to parse repo manifest `{}`",
+            manifest_path.to_string_lossy()
+        )
+    )]
     Parse {
         manifest_path: PathBuf,
         #[snafu(source(from(toml::de::Error, Box::new)))]
@@ -226,7 +232,7 @@ impl RepoManifest {
             Some("must not be `.` or `..`")
         } else if key.contains('/') || key.contains('\\') {
             Some("must be a single safe path component")
-        } else if RESERVED_REPO_IDS.contains(&key) {
+        } else if RESERVED_WORKSPACE_NAMES.contains(&key) {
             Some("collides with a reserved workspace/platform directory name")
         } else {
             None
@@ -312,7 +318,7 @@ impl LoadedRepoManifest {
             {
                 Ok(None)
             }
-            Err(error) => Err(IoSnafu {
+            Err(error) => Err(RepoManifestIoSnafu {
                 path: manifest_path,
             }
             .into_error(error)),
@@ -321,20 +327,22 @@ impl LoadedRepoManifest {
 
     #[cfg(test)]
     pub fn from_path(path: &Path) -> Result<Self, RepoManifestError> {
-        let manifest_path = path.canonicalize().with_context(|_| IoSnafu {
+        let manifest_path = path.canonicalize().with_context(|_| RepoManifestIoSnafu {
             path: path.to_path_buf(),
         })?;
-        let contents = std::fs::read_to_string(&manifest_path).with_context(|_| IoSnafu {
-            path: manifest_path.clone(),
-        })?;
+        let contents =
+            std::fs::read_to_string(&manifest_path).with_context(|_| RepoManifestIoSnafu {
+                path: manifest_path.clone(),
+            })?;
         Self::from_contents(manifest_path, &contents)
     }
 
     fn from_contents(manifest_path: PathBuf, contents: &str) -> Result<Self, RepoManifestError> {
-        let manifest =
-            toml::from_str::<RawRepoManifest>(contents).with_context(|_| ParseSnafu {
+        let manifest = toml::from_str::<RawRepoManifest>(contents).with_context(|_| {
+            RepoManifestParseSnafu {
                 manifest_path: manifest_path.clone(),
-            })?;
+            }
+        })?;
         let manifest = RepoManifest::from_raw(manifest, &manifest_path)?;
 
         Ok(Self {

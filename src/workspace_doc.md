@@ -1,10 +1,12 @@
 # build-eips Workspace
 
-This directory is a local multi-repo workspace for building and checking EIPs/ERCs with the shared theme and proposal sibling repos.
+This directory is a local multi-repo workspace for building, serving, previewing, and validating EIPs/ERCs with the shared theme and proposal sibling repos.
+
+The workspace keeps the proposal repos, theme repo, generated build output, and local workspace settings in one predictable layout. Run commands from an active proposal repo such as `EIPs/` or `ERCs/`, or from this workspace root with `-C EIPs` or `-C ERCs`.
 
 ## Workspace Layout
 
-After initialization, the minimal workspace should look like this:
+After running a setup script, the minimal operational workspace should look like this:
 
 ```text
 EIPs-project/
@@ -16,9 +18,81 @@ EIPs-project/
 └── theme/
 ```
 
-Use `build-eips init ..` from an active proposal repo such as `EIPs/` or `ERCs/` to create missing sibling repos, clone `theme/`, create `.local-build/`, write `.build-eips.toml`, and generate this guide.
+Optional setup flags can add more repos:
 
-Pass `--template` when proposal template work also needs the optional `template/` repo.
+```text
+EIPs-project/
+├── template/       # --template
+├── preprocessor/  # --platform-dev
+└── eipw/          # --platform-dev
+```
+
+- `.build-eips.toml`: workspace settings.
+- `WORKSPACE.md`: generated workspace guide.
+- `.local-build/`: generated build output and materialized repositories.
+- `EIPs/` and `ERCs/`: proposal source repositories.
+- `theme/`: workspace-local Zola theme required by build, serve, and check commands.
+- `template/`: optional proposal template repository.
+- `preprocessor/`: optional local `build-eips` development checkout.
+- `eipw/`: optional local `eipw` development checkout.
+
+If the optional repos are missing, rerun build-eips init with the needed flags.
+
+From an active proposal repo:
+
+```sh
+build-eips init .. --template
+build-eips init .. --platform-dev
+build-eips init .. --template --platform-dev
+```
+
+From the workspace root:
+
+```sh
+build-eips -C EIPs init . --template
+build-eips -C EIPs init . --platform-dev
+build-eips -C EIPs init . --template --platform-dev
+```
+
+## Requirements And Troubleshooting
+
+Local workspace commands require these tools on `PATH`:
+
+- Git
+- `build-eips`
+- Zola 0.22.1
+
+Git must be installed separately. The setup scripts locate or install `build-eips` and Zola, add locally installed tool directories to `PATH` for the current shell session, and print guidance for making those `PATH` changes permanent.
+
+Run `build-eips doctor` after setup and whenever a command cannot find a repo, config file, theme, or required tool:
+
+```sh
+build-eips doctor
+```
+
+From the workspace root, anchor the command through an active proposal repo:
+
+```sh
+build-eips -C EIPs doctor
+build-eips -C ERCs doctor
+```
+
+`build-eips doctor` checks:
+
+- required tools: Git, `build-eips`, and Zola 0.22.1
+- the active proposal repo manifest
+- `.build-eips.toml`
+- workspace-local sibling proposal repos
+- workspace-local `theme/`
+- optional setup helper tools used by setup scripts
+
+If a fresh shell cannot find `build-eips` or Zola, rerun the setup script or apply the permanent `PATH` guidance printed by the setup script.
+
+If a sibling repo, `theme/`, or optional platform repo is missing, rerun `build-eips init` with the needed flags.
+
+If `theme/` or `preprocessor/` setup cannot create the default `EIPs/` checkout, check that Git is installed and that the workspace `EIPs/` path does not already exist as a non-git directory. Set `ACTIVE_REPO_ROOT` when you want setup to use an existing ERCs or custom proposal repo checkout.
+
+If `build-eips doctor` reports that Zola is missing or too old, rerun the setup script to install the supported Zola version.
 
 ## Local Commands
 

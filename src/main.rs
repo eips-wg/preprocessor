@@ -77,8 +77,13 @@ fn run() -> Result<(), Whatever> {
         return Ok(());
     }
 
-    if let Operation::Init { path, template } = &args.operation {
-        init_workspace(&args, path.clone(), *template)?;
+    if let Operation::Init {
+        path,
+        template,
+        platform_dev,
+    } = &args.operation
+    {
+        init_workspace(&args, path.clone(), *template, *platform_dev)?;
         return Ok(());
     }
 
