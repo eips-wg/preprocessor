@@ -250,12 +250,11 @@ mod tests {
         process::{Command, ExitStatus},
     };
 
-    use tempfile::TempDir;
-
     use crate::{
         config::ServerBinding,
         layout::{mounted_theme_path, theme_config_path},
     };
+    use tempfile::TempDir;
 
     use super::{find_zola, mount_theme, serve_args};
 
@@ -312,21 +311,6 @@ mod tests {
     }
 
     #[test]
-    fn mounted_theme_paths_are_under_project_themes_directory() {
-        let project_path = PathBuf::from("/tmp/project");
-        let mounted_theme = mounted_theme_path(&project_path);
-
-        assert_eq!(
-            mounted_theme,
-            PathBuf::from("/tmp/project/themes/eips-theme")
-        );
-        assert_eq!(
-            theme_config_path(&mounted_theme),
-            PathBuf::from("/tmp/project/themes/eips-theme/config/zola.toml")
-        );
-    }
-
-    #[test]
     fn serve_args_include_configured_interface_and_port() {
         let server_binding = ServerBinding {
             host: "0.0.0.0".to_owned(),
@@ -379,6 +363,21 @@ mod tests {
                 OsString::from("-o"),
                 OsString::from("/tmp/build-output"),
             ]
+        );
+    }
+
+    #[test]
+    fn mounted_theme_paths_are_under_project_themes_directory() {
+        let project_path = PathBuf::from("/tmp/project");
+        let mounted_theme = mounted_theme_path(&project_path);
+
+        assert_eq!(
+            mounted_theme,
+            PathBuf::from("/tmp/project/themes/eips-theme")
+        );
+        assert_eq!(
+            theme_config_path(&mounted_theme),
+            PathBuf::from("/tmp/project/themes/eips-theme/config/zola.toml")
         );
     }
 

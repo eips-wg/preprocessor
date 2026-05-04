@@ -4,6 +4,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+//! Shared build layout names and path helpers.
+
 use std::path::{Path, PathBuf};
 
 pub(crate) const CONTENT_DIR: &str = "content";

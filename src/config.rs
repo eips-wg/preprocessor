@@ -361,15 +361,6 @@ impl LoadedRepoManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Theme {
-    /// Where to fetch the theme from.
-    pub repository: Url,
-
-    /// Specific revision to checkout from the theme repository.
-    pub commit: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LegacyLocation {
     /// Git repository to fetch proposals from.
     pub repository: Url,
@@ -399,7 +390,6 @@ pub struct LegacyLocations(pub HashMap<String, LegacyLocation>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub theme: Theme,
     pub locations: LegacyLocations,
 }
 
@@ -426,12 +416,6 @@ impl Config {
         );
 
         Self {
-            theme: Theme {
-                repository: "https://github.com/ethereum/eips-theme.git"
-                    .try_into()
-                    .unwrap(),
-                commit: "0ddac35da36d311a8401c6cfb79c9991f78b647d".into(),
-            },
             locations: LegacyLocations(locations),
         }
     }
@@ -458,10 +442,6 @@ impl Config {
         );
 
         Self {
-            theme: Theme {
-                repository: "https://github.com/eips-wg/theme.git".try_into().unwrap(),
-                commit: "0ddac35da36d311a8401c6cfb79c9991f78b647d".into(),
-            },
             locations: LegacyLocations(locations),
         }
     }
@@ -498,7 +478,7 @@ impl WorkspaceConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RenderSettings {
-    /// Proposal numbers to render for applicable local build commands.
+    /// Proposal numbers to render for applicable local build and serve commands.
     #[serde(default)]
     pub only: Vec<ProposalNumber>,
 }
@@ -652,10 +632,10 @@ impl LoadedWorkspaceConfig {
         &self.workspace_root
     }
 
-    pub fn workspace_build_root(&self, repo_id: &str) -> PathBuf {
+    pub fn workspace_build_root(&self, repo_name: &str) -> PathBuf {
         self.workspace_root
             .join(DEFAULT_BUILD_ROOT_BASE)
-            .join(repo_id)
+            .join(repo_name)
     }
 
     pub fn server_settings(&self) -> &ServerSettings {
@@ -674,8 +654,8 @@ impl LoadedWorkspaceConfig {
         self.workspace_root.join(DEFAULT_THEME_DIR)
     }
 
-    pub fn local_repo_path(&self, repo_id: &str) -> PathBuf {
-        self.workspace_root.join(repo_id)
+    pub fn local_repo_path(&self, repo_name: &str) -> PathBuf {
+        self.workspace_root.join(repo_name)
     }
 }
 
@@ -719,11 +699,11 @@ mod tests {
     };
     use crate::proposal::ProposalNumber;
 
-    struct TestRepo {
+    struct TestWorkspace {
         tempdir: TempDir,
     }
 
-    impl TestRepo {
+    impl TestWorkspace {
         fn new() -> Self {
             Self {
                 tempdir: TempDir::new().unwrap(),
@@ -744,6 +724,12 @@ mod tests {
                 std::fs::create_dir_all(parent).unwrap();
             }
             std::fs::write(&path, contents).unwrap();
+            path
+        }
+
+        fn create_dir(&self, relative: impl AsRef<Path>) -> PathBuf {
+            let path = self.path(relative);
+            std::fs::create_dir_all(&path).unwrap();
             path
         }
     }
@@ -775,15 +761,17 @@ base_url = "https://staging.example.test/{repo_id}/"
 
     #[test]
     fn missing_repo_manifest_loads_as_none() {
-        let repo = TestRepo::new();
+        let workspace = TestWorkspace::new();
 
-        assert!(LoadedRepoManifest::load(repo.root()).unwrap().is_none());
+        assert!(LoadedRepoManifest::load(workspace.root())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn malformed_repo_manifest_reports_parse_error() {
-        let repo = TestRepo::new();
-        let manifest_path = repo.write_file(REPO_MANIFEST_FILE, "repo_id = [");
+        let workspace = TestWorkspace::new();
+        let manifest_path = workspace.write_file(REPO_MANIFEST_FILE, "repo_id = [");
 
         let error = LoadedRepoManifest::from_path(&manifest_path).unwrap_err();
 
@@ -792,8 +780,8 @@ base_url = "https://staging.example.test/{repo_id}/"
 
     #[test]
     fn parses_repo_manifest_with_directional_siblings() {
-        let repo = TestRepo::new();
-        let manifest_path = repo.write_file(
+        let workspace = TestWorkspace::new();
+        let manifest_path = workspace.write_file(
             REPO_MANIFEST_FILE,
             &manifest_text(
                 "Core",
@@ -818,8 +806,8 @@ base_url = "https://staging.example.test/EIPs/"
 
     #[test]
     fn repo_manifest_requires_identity_and_environments() {
-        let repo = TestRepo::new();
-        let manifest_path = repo.write_file(
+        let workspace = TestWorkspace::new();
+        let manifest_path = workspace.write_file(
             REPO_MANIFEST_FILE,
             r#"
 [production]
@@ -833,7 +821,7 @@ base_url = "https://example.test/Core/"
 
         assert!(reason.contains("missing required `repo_id` entry"));
 
-        let manifest_path = repo.write_file(
+        let manifest_path = workspace.write_file(
             REPO_MANIFEST_FILE,
             r#"
 repo_id = "Core"
@@ -848,7 +836,7 @@ base_url = "https://example.test/Core/"
 
         assert!(reason.contains("missing required `staging` entry"));
 
-        let manifest_path = repo.write_file(
+        let manifest_path = workspace.write_file(
             REPO_MANIFEST_FILE,
             r#"
 repo_id = "Core"
@@ -866,8 +854,8 @@ base_url = "https://staging.example.test/Core/"
 
     #[test]
     fn repo_manifest_rejects_unsafe_and_reserved_keys() {
-        let repo = TestRepo::new();
-        let manifest_path = repo.write_file(REPO_MANIFEST_FILE, &manifest_text("theme", ""));
+        let workspace = TestWorkspace::new();
+        let manifest_path = workspace.write_file(REPO_MANIFEST_FILE, &manifest_text("theme", ""));
 
         let reason =
             manifest_invalid_reason(LoadedRepoManifest::from_path(&manifest_path).unwrap_err());
@@ -875,7 +863,8 @@ base_url = "https://staging.example.test/Core/"
         assert!(reason.contains("repo_id `theme`"));
         assert!(reason.contains("reserved"));
 
-        let manifest_path = repo.write_file(REPO_MANIFEST_FILE, &manifest_text("Core/Meta", ""));
+        let manifest_path =
+            workspace.write_file(REPO_MANIFEST_FILE, &manifest_text("Core/Meta", ""));
         let reason =
             manifest_invalid_reason(LoadedRepoManifest::from_path(&manifest_path).unwrap_err());
 
@@ -885,8 +874,8 @@ base_url = "https://staging.example.test/Core/"
 
     #[test]
     fn repo_manifest_rejects_self_sibling() {
-        let repo = TestRepo::new();
-        let manifest_path = repo.write_file(
+        let workspace = TestWorkspace::new();
+        let manifest_path = workspace.write_file(
             REPO_MANIFEST_FILE,
             &manifest_text(
                 "Core",
@@ -909,9 +898,9 @@ base_url = "https://staging.example.test/Core/"
     }
 
     #[test]
-    fn repo_manifest_rejects_duplicate_sibling_repositories() {
-        let repo = TestRepo::new();
-        let manifest_path = repo.write_file(
+    fn repo_manifest_rejects_duplicate_sibling_repositories_per_environment() {
+        let workspace = TestWorkspace::new();
+        let manifest_path = workspace.write_file(
             REPO_MANIFEST_FILE,
             &manifest_text(
                 "Core",
@@ -938,18 +927,17 @@ base_url = "https://staging.example.test/ERCs/"
         let reason =
             manifest_invalid_reason(LoadedRepoManifest::from_path(&manifest_path).unwrap_err());
 
-        assert!(reason.contains("duplicate production sibling repository"));
-        assert!(reason.contains("https://example.test/shared.git"));
+        assert!(reason.contains("duplicate production sibling repository declaration"));
     }
 
     #[test]
     fn parses_default_workspace_config() {
-        let repo = TestRepo::new();
-        let config_path = repo.write_file(LOCAL_CONFIG_FILE, &default_workspace_config_text());
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(LOCAL_CONFIG_FILE, &default_workspace_config_text());
 
         let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
 
-        assert_eq!(config.workspace_root(), repo.root());
+        assert_eq!(config.workspace_root(), workspace.root());
         assert_eq!(config.server_settings(), &ServerSettings::default());
         assert_eq!(
             config.site_settings().base_url.as_ref().unwrap().as_str(),
@@ -978,8 +966,8 @@ base_url = "https://staging.example.test/ERCs/"
 
     #[test]
     fn parses_workspace_config_server_settings() {
-        let repo = TestRepo::new();
-        let config_path = repo.write_file(
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
 [server]
@@ -1001,8 +989,8 @@ port = 8080
 
     #[test]
     fn missing_server_settings_use_default_binding() {
-        let repo = TestRepo::new();
-        let config_path = repo.write_file(
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
 [site]
@@ -1020,8 +1008,8 @@ base_url = "http://localhost:4000"
 
     #[test]
     fn parses_workspace_config_site_settings() {
-        let repo = TestRepo::new();
-        let config_path = repo.write_file(
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
 [site]
@@ -1039,8 +1027,8 @@ base_url = "http://localhost:4000"
 
     #[test]
     fn invalid_workspace_config_site_base_url_errors() {
-        let repo = TestRepo::new();
-        let config_path = repo.write_file(
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
 [site]
@@ -1056,8 +1044,8 @@ base_url = "not a url"
 
     #[test]
     fn missing_site_settings_preserve_no_base_url_override() {
-        let repo = TestRepo::new();
-        let config_path = repo.write_file(
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
 [server]
@@ -1073,8 +1061,8 @@ port = 1111
 
     #[test]
     fn minimal_workspace_config_parses() {
-        let repo = TestRepo::new();
-        let config_path = repo.write_file(
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
 [server]
@@ -1097,8 +1085,8 @@ base_url = "http://127.0.0.1:1111"
 
     #[test]
     fn empty_workspace_config_uses_defaults() {
-        let repo = TestRepo::new();
-        let config_path = repo.write_file(LOCAL_CONFIG_FILE, " \n");
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(LOCAL_CONFIG_FILE, " \n");
 
         let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
 
@@ -1109,8 +1097,8 @@ base_url = "http://127.0.0.1:1111"
 
     #[test]
     fn parses_workspace_config_render_only_settings() {
-        let repo = TestRepo::new();
-        let config_path = repo.write_file(
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
 [render]
@@ -1139,8 +1127,8 @@ only = [555, 678, 555]
         ];
 
         for (name, contents) in cases {
-            let repo = TestRepo::new();
-            let config_path = repo.write_file(LOCAL_CONFIG_FILE, contents);
+            let workspace = TestWorkspace::new();
+            let config_path = workspace.write_file(LOCAL_CONFIG_FILE, contents);
             let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
 
             assert!(
@@ -1160,9 +1148,9 @@ only = [555, 678, 555]
         ];
 
         for (name, contents) in cases {
-            let repo = TestRepo::new();
+            let workspace = TestWorkspace::new();
             let config_path =
-                repo.write_file(LOCAL_CONFIG_FILE, &format!("[render]\n{contents}\n"));
+                workspace.write_file(LOCAL_CONFIG_FILE, &format!("[render]\n{contents}\n"));
             let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
 
             assert!(
@@ -1212,8 +1200,8 @@ repository = "https://github.com/eips-wg/theme.git"
         ];
 
         for (field, contents) in cases {
-            let repo = TestRepo::new();
-            let config_path = repo.write_file(LOCAL_CONFIG_FILE, &contents);
+            let workspace = TestWorkspace::new();
+            let config_path = workspace.write_file(LOCAL_CONFIG_FILE, &contents);
             let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
 
             assert!(
@@ -1225,10 +1213,9 @@ repository = "https://github.com/eips-wg/theme.git"
 
     #[test]
     fn discover_path_walks_upward() {
-        let repo = TestRepo::new();
-        let config_path = repo.write_file(LOCAL_CONFIG_FILE, &default_workspace_config_text());
-        let nested = repo.path("EIPs/content");
-        std::fs::create_dir_all(&nested).unwrap();
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(LOCAL_CONFIG_FILE, &default_workspace_config_text());
+        let nested = workspace.create_dir("EIPs/content");
 
         assert_eq!(discover_path(&nested).unwrap(), config_path);
         assert_eq!(
@@ -1242,9 +1229,8 @@ repository = "https://github.com/eips-wg/theme.git"
 
     #[test]
     fn missing_workspace_config_is_not_discovered() {
-        let repo = TestRepo::new();
-        let nested = repo.path("EIPs/content");
-        std::fs::create_dir_all(&nested).unwrap();
+        let workspace = TestWorkspace::new();
+        let nested = workspace.create_dir("EIPs/content");
 
         assert!(discover_path(&nested).is_none());
         assert!(LoadedWorkspaceConfig::discover(&nested).unwrap().is_none());

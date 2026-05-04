@@ -388,6 +388,7 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
     let settings = resolve_execution_settings(args, &sibling_ids, workspace_config.as_ref())?;
     let only = resolve_only_selection(args, &settings, workspace_config.as_ref())?;
     let theme_path = resolve_theme_path(workspace_config.as_ref(), &args.operation)?;
+
     let mut repository_use = active_repo.repository_use(settings.staging)?;
     apply_sibling_sources(
         &mut repository_use,
@@ -439,8 +440,8 @@ mod tests {
 
     use super::{
         explicit_environment_or_parity, resolve_base_url_override, resolve_execution_settings,
-        resolve_only_selection, resolve_server_binding, validate_non_execution_command_flags,
-        ExecutionSettings, SelectedSource,
+        resolve_only_selection, resolve_server_binding, resolve_theme_path,
+        validate_non_execution_command_flags, ExecutionSettings, SelectedSource,
     };
 
     fn parse_args(arguments: &[&str]) -> Args {
@@ -482,7 +483,7 @@ mod tests {
 
     fn assert_theme_only_missing_workspace_error(arguments: &[&str]) {
         let args = parse_args(arguments);
-        let error = super::resolve_theme_path(None, &args.operation).unwrap_err();
+        let error = resolve_theme_path(None, &args.operation).unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains(
@@ -526,26 +527,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_env_or_parity_provenance_is_classified_separately_from_local_defaults() {
-        let cases: &[(&[&str], Option<bool>)] = &[
-            (&["build-eips", "--staging", "build"], Some(true)),
-            (&["build-eips", "--production", "build"], Some(false)),
-            (&["build-eips", "parity", "build"], Some(true)),
-            (&["build-eips", "build"], None),
-            (&["build-eips", "serve"], None),
-            (&["build-eips", "check"], None),
-        ];
-
-        for (arguments, expected) in cases {
-            let args = parse_args(arguments);
-            assert_eq!(explicit_environment_or_parity(&args).unwrap(), *expected);
-        }
-    }
-
-    #[test]
     fn server_binding_resolution_uses_cli_config_then_defaults() {
         assert_eq!(
-            resolve_server_binding(None, &Default::default()),
+            resolve_server_binding(None, &ServerCliArgs::default()),
             ServerBinding {
                 host: "127.0.0.1".to_owned(),
                 port: 1111,
@@ -561,7 +545,7 @@ port = 8080
         );
 
         assert_eq!(
-            resolve_server_binding(Some(&workspace_config), &Default::default()),
+            resolve_server_binding(Some(&workspace_config), &ServerCliArgs::default()),
             ServerBinding {
                 host: "0.0.0.0".to_owned(),
                 port: 8080,
@@ -593,6 +577,23 @@ port = 8080
                 port: 4000,
             }
         );
+    }
+
+    #[test]
+    fn explicit_env_or_parity_provenance_is_classified_separately_from_local_defaults() {
+        let cases: &[(&[&str], Option<bool>)] = &[
+            (&["build-eips", "--staging", "build"], Some(true)),
+            (&["build-eips", "--production", "build"], Some(false)),
+            (&["build-eips", "parity", "build"], Some(true)),
+            (&["build-eips", "build"], None),
+            (&["build-eips", "serve"], None),
+            (&["build-eips", "check"], None),
+        ];
+
+        for (arguments, expected) in cases {
+            let args = parse_args(arguments);
+            assert_eq!(explicit_environment_or_parity(&args).unwrap(), *expected);
+        }
     }
 
     #[test]
@@ -637,6 +638,46 @@ base_url = "http://localhost:4000"
                 .unwrap()
                 .is_none());
         }
+
+        for arguments in [
+            &[
+                "build-eips",
+                "--staging",
+                "build",
+                "--base-url",
+                "http://localhost:5000",
+            ][..],
+            &[
+                "build-eips",
+                "--production",
+                "build",
+                "--base-url",
+                "http://localhost:5000",
+            ][..],
+            &[
+                "build-eips",
+                "parity",
+                "build",
+                "--base-url",
+                "http://localhost:5000",
+            ][..],
+            &[
+                "build-eips",
+                "parity",
+                "serve",
+                "--base-url",
+                "http://localhost:5000",
+            ][..],
+        ] {
+            let args = parse_args(arguments);
+            assert_eq!(
+                resolve_base_url_override(&args, Some(&workspace_config))
+                    .unwrap()
+                    .unwrap()
+                    .as_str(),
+                "http://localhost:5000/"
+            );
+        }
     }
 
     #[test]
@@ -669,110 +710,6 @@ base_url = "http://localhost:4000"
     }
 
     #[test]
-    fn only_cli_selection_overrides_config_and_dedupes_for_build_and_serve() {
-        let workspace_config = load_workspace_config(
-            r#"
-[render]
-only = [555]
-"#,
-        );
-
-        assert_eq!(
-            only_selection_for(
-                &["build-eips", "build", "--only", "678", "555", "678"],
-                Some(&workspace_config),
-            ),
-            Some(vec![555, 678])
-        );
-        assert_eq!(
-            only_selection_for(
-                &["build-eips", "serve", "--only", "678", "555", "678"],
-                Some(&workspace_config),
-            ),
-            Some(vec![555, 678])
-        );
-    }
-
-    #[test]
-    fn render_only_config_selection_applies_to_local_dirty_build_and_serve_only() {
-        let workspace_config = load_workspace_config(
-            r#"
-[render]
-only = [555, 678, 555]
-"#,
-        );
-
-        assert_eq!(
-            only_selection_for(&["build-eips", "build"], Some(&workspace_config)),
-            Some(vec![555, 678])
-        );
-        assert_eq!(
-            only_selection_for(&["build-eips", "serve"], Some(&workspace_config)),
-            Some(vec![555, 678])
-        );
-
-        for arguments in [
-            &["build-eips", "build", "--clean"][..],
-            &["build-eips", "--remote-siblings", "build"][..],
-            &["build-eips", "--staging", "build"][..],
-            &["build-eips", "--production", "build"][..],
-            &["build-eips", "serve", "--clean"][..],
-            &["build-eips", "--remote-siblings", "serve"][..],
-            &["build-eips", "--staging", "serve"][..],
-            &["build-eips", "--production", "serve"][..],
-            &["build-eips", "check"][..],
-            &["build-eips", "parity", "build"][..],
-            &["build-eips", "parity", "serve"][..],
-        ] {
-            assert!(only_selection_for(arguments, Some(&workspace_config)).is_none());
-        }
-    }
-
-    #[test]
-    fn only_cli_selection_rejects_non_local_dirty_build_and_serve_modes() {
-        let workspace_config = load_workspace_config("");
-
-        for arguments in [
-            &["build-eips", "build", "--only", "555", "--clean"][..],
-            &["build-eips", "--remote-siblings", "build", "--only", "555"][..],
-            &["build-eips", "--staging", "build", "--only", "555"][..],
-            &["build-eips", "--production", "build", "--only", "555"][..],
-            &["build-eips", "serve", "--only", "555", "--clean"][..],
-            &["build-eips", "--remote-siblings", "serve", "--only", "555"][..],
-            &["build-eips", "--staging", "serve", "--only", "555"][..],
-            &["build-eips", "--production", "serve", "--only", "555"][..],
-        ] {
-            let args = parse_args(arguments);
-            let error = resolve_execution_settings(&args, &[], Some(&workspace_config))
-                .unwrap_err()
-                .to_string();
-
-            assert!(
-                error.contains("--only is supported only for local dirty build and serve commands")
-            );
-        }
-    }
-
-    #[test]
-    fn missing_render_config_and_empty_only_disable_filtering() {
-        let missing_render = load_workspace_config("");
-        let missing_only = load_workspace_config("[render]\n");
-        let empty_only = load_workspace_config(
-            r#"
-[render]
-only = []
-"#,
-        );
-
-        assert!(only_selection_for(&["build-eips", "build"], Some(&missing_render)).is_none());
-        assert!(only_selection_for(&["build-eips", "build"], Some(&missing_only)).is_none());
-        assert!(only_selection_for(&["build-eips", "build"], Some(&empty_only)).is_none());
-        assert!(only_selection_for(&["build-eips", "serve"], Some(&missing_render)).is_none());
-        assert!(only_selection_for(&["build-eips", "serve"], Some(&missing_only)).is_none());
-        assert!(only_selection_for(&["build-eips", "serve"], Some(&empty_only)).is_none());
-    }
-
-    #[test]
     fn plain_site_commands_are_local_first_dirty_staging() {
         let workspace_config = load_workspace_config("");
         let expected = ExecutionSettings {
@@ -793,6 +730,47 @@ only = []
                 Some(&workspace_config),
                 expected.clone(),
             );
+        }
+    }
+
+    #[test]
+    fn zola_runtime_commands_require_workspace_local_theme() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
+        std::fs::write(&config_path, "").unwrap();
+        std::fs::create_dir(workspace.path().join(config::DEFAULT_THEME_DIR)).unwrap();
+        let workspace_config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        for arguments in [
+            &["build-eips", "build"][..],
+            &["build-eips", "check"][..],
+            &["build-eips", "serve"][..],
+            &["build-eips", "--staging", "build"][..],
+            &["build-eips", "--production", "check"][..],
+            &["build-eips", "parity", "build"][..],
+            &["build-eips", "editorial", "check", "--against-upstream"][..],
+        ] {
+            let args = parse_args(arguments);
+            let theme_path = resolve_theme_path(Some(&workspace_config), &args.operation)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(theme_path, workspace.path().join(config::DEFAULT_THEME_DIR));
+        }
+    }
+
+    #[test]
+    fn non_theme_commands_do_not_require_workspace_local_theme() {
+        for arguments in [
+            &["build-eips", "changed"][..],
+            &["build-eips", "clean"][..],
+            &["build-eips", "preview"][..],
+            &["build-eips", "doctor"][..],
+            &["build-eips", "print", "schema-version"][..],
+        ] {
+            let args = parse_args(arguments);
+
+            assert!(resolve_theme_path(None, &args.operation).unwrap().is_none());
         }
     }
 
@@ -920,6 +898,103 @@ only = []
     }
 
     #[test]
+    fn only_selection_dedupes_and_cli_replaces_config() {
+        let workspace_config = load_workspace_config(
+            r#"
+[render]
+only = [678, 555, 678]
+"#,
+        );
+
+        assert_eq!(
+            only_selection_for(&["build-eips", "build"], Some(&workspace_config)).unwrap(),
+            vec![555, 678]
+        );
+        assert_eq!(
+            only_selection_for(
+                &["build-eips", "build", "--only", "00555", "555", "897"],
+                Some(&workspace_config)
+            )
+            .unwrap(),
+            vec![555, 897]
+        );
+        assert_eq!(
+            only_selection_for(&["build-eips", "serve"], Some(&workspace_config)).unwrap(),
+            vec![555, 678]
+        );
+        assert_eq!(
+            only_selection_for(
+                &["build-eips", "serve", "--only", "00555", "555", "897"],
+                Some(&workspace_config)
+            )
+            .unwrap(),
+            vec![555, 897]
+        );
+    }
+
+    #[test]
+    fn only_cli_rejects_parsed_non_applicable_build_and_serve_modes() {
+        for arguments in [
+            &["build-eips", "--staging", "build", "--only", "555"][..],
+            &["build-eips", "--production", "build", "--only", "555"][..],
+            &["build-eips", "build", "--clean", "--only", "555"][..],
+            &["build-eips", "--remote-siblings", "build", "--only", "555"][..],
+            &["build-eips", "--staging", "serve", "--only", "555"][..],
+            &["build-eips", "--production", "serve", "--only", "555"][..],
+            &["build-eips", "serve", "--clean", "--only", "555"][..],
+            &["build-eips", "--remote-siblings", "serve", "--only", "555"][..],
+        ] {
+            let args = parse_args(arguments);
+            let error = resolve_execution_settings(&args, &[], None).unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("--only is supported only for local dirty build and serve commands"));
+        }
+    }
+
+    #[test]
+    fn render_only_config_is_ignored_outside_applicable_build_commands() {
+        let workspace_config = load_workspace_config(
+            r#"
+[render]
+only = [999999]
+"#,
+        );
+
+        for arguments in [
+            &["build-eips", "check"][..],
+            &["build-eips", "build", "--clean"][..],
+            &["build-eips", "serve", "--clean"][..],
+            &["build-eips", "--staging", "build"][..],
+            &["build-eips", "--staging", "serve"][..],
+            &["build-eips", "parity", "build"][..],
+            &["build-eips", "parity", "serve"][..],
+        ] {
+            assert!(only_selection_for(arguments, Some(&workspace_config)).is_none());
+        }
+    }
+
+    #[test]
+    fn missing_render_config_and_empty_only_disable_filtering() {
+        let missing_render = load_workspace_config("");
+        let missing_only = load_workspace_config("[render]\n");
+        let empty_only = load_workspace_config(
+            r#"
+[render]
+only = []
+"#,
+        );
+
+        assert!(only_selection_for(&["build-eips", "build"], Some(&missing_render)).is_none());
+        assert!(only_selection_for(&["build-eips", "build"], Some(&missing_only)).is_none());
+        assert!(only_selection_for(&["build-eips", "build"], Some(&empty_only)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&missing_render)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&missing_only)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&empty_only)).is_none());
+    }
+
+    #[test]
     fn non_site_commands_do_not_require_workspace_local_sources() {
         for arguments in [
             &["build-eips", "changed"][..],
@@ -1018,49 +1093,6 @@ only = []
                 message.contains("execution override flags cannot be used"),
                 "unexpected error for {arguments:?}: {message}"
             );
-        }
-    }
-
-    #[test]
-    fn zola_runtime_commands_require_workspace_local_theme() {
-        let workspace = TempDir::new().unwrap();
-        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
-        std::fs::write(&config_path, "").unwrap();
-        std::fs::create_dir(workspace.path().join(config::DEFAULT_THEME_DIR)).unwrap();
-        let workspace_config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
-
-        for arguments in [
-            &["build-eips", "build"][..],
-            &["build-eips", "check"][..],
-            &["build-eips", "serve"][..],
-            &["build-eips", "--staging", "build"][..],
-            &["build-eips", "--production", "check"][..],
-            &["build-eips", "parity", "build"][..],
-            &["build-eips", "editorial", "check", "--against-upstream"][..],
-        ] {
-            let args = parse_args(arguments);
-            let theme_path = super::resolve_theme_path(Some(&workspace_config), &args.operation)
-                .unwrap()
-                .unwrap();
-
-            assert_eq!(theme_path, workspace.path().join(config::DEFAULT_THEME_DIR));
-        }
-    }
-
-    #[test]
-    fn non_theme_commands_do_not_require_workspace_local_theme() {
-        for arguments in [
-            &["build-eips", "changed"][..],
-            &["build-eips", "clean"][..],
-            &["build-eips", "preview"][..],
-            &["build-eips", "doctor"][..],
-            &["build-eips", "print", "schema-version"][..],
-        ] {
-            let args = parse_args(arguments);
-
-            assert!(super::resolve_theme_path(None, &args.operation)
-                .unwrap()
-                .is_none());
         }
     }
 
@@ -1228,7 +1260,7 @@ only = []
     }
 
     #[test]
-    fn zero_sibling_local_first_without_workspace_config_can_resolve_sibling_policy() {
+    fn zero_sibling_local_first_without_workspace_config_only_requires_theme_resolution() {
         let args = parse_args(&["build-eips", "build"]);
         let settings = resolve_execution_settings(&args, &[], None).unwrap();
 
@@ -1270,8 +1302,7 @@ only = []
         let workspace_config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
         let args = parse_args(&["build-eips", "build"]);
 
-        let error =
-            super::resolve_theme_path(Some(&workspace_config), &args.operation).unwrap_err();
+        let error = resolve_theme_path(Some(&workspace_config), &args.operation).unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains(&format!(

@@ -858,7 +858,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
     }
 
     #[test]
-    fn workspace_doc_text_mentions_setup_reference_content() {
+    fn workspace_doc_text_mentions_required_workspace_reference_content() {
         let text = workspace_doc_text();
 
         for expected in [
@@ -868,12 +868,13 @@ base_url = "https://staging.example.test/{sibling_id}/"
             "build-eips doctor",
             "build-eips build",
             "build-eips serve",
-            "--platform-dev",
-            "preprocessor/",
-            "eipw/",
+            "build-eips preview",
+            "build-eips editorial check",
             "[render]",
             "only = [",
             "--only",
+            "--remote-siblings",
+            "--base-url",
         ] {
             assert!(
                 text.contains(expected),
