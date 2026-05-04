@@ -77,9 +77,6 @@ pub(crate) enum Operation {
     /// Build the project and output HTML
     Build {
         #[command(flatten)]
-        eipw: lint::CmdArgs,
-
-        #[command(flatten)]
         base_url: BaseUrlCliArgs,
 
         #[command(flatten)]
@@ -94,9 +91,6 @@ pub(crate) enum Operation {
 
     /// Build a fresh temporary site, serve it locally, and watch tracked edits
     Serve {
-        #[command(flatten)]
-        eipw: lint::CmdArgs,
-
         #[command(flatten)]
         server: ServerCliArgs,
 
@@ -113,9 +107,6 @@ pub(crate) enum Operation {
     /// Validate that the site builds cleanly without writing HTML output
     Check {
         #[command(flatten)]
-        eipw: lint::CmdArgs,
-
-        #[command(flatten)]
         clean: CleanCliArgs,
     },
 
@@ -126,6 +117,12 @@ pub(crate) enum Operation {
         all: bool,
         #[clap(long, value_enum, default_value_t)]
         format: ChangedFormat,
+    },
+
+    /// Run targeted editorial lint or check workflows
+    Editorial {
+        #[command(subcommand)]
+        command: EditorialCommand,
     },
 
     /// Create workspace config, docs, build root, and missing local repos
@@ -153,17 +150,11 @@ pub(crate) enum ProfiledOperation {
     /// Build the project and output HTML
     Build {
         #[command(flatten)]
-        eipw: lint::CmdArgs,
-
-        #[command(flatten)]
         base_url: BaseUrlCliArgs,
     },
 
     /// Build the project and launch a web server to preview it
     Serve {
-        #[command(flatten)]
-        eipw: lint::CmdArgs,
-
         #[command(flatten)]
         server: ServerCliArgs,
 
@@ -172,10 +163,47 @@ pub(crate) enum ProfiledOperation {
     },
 
     /// Validate that the site builds cleanly without writing HTML output
-    Check {
+    Check,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub(crate) enum EditorialCommand {
+    /// Run eipw lint checks on selected proposal files
+    Lint {
+        #[command(flatten)]
+        selectors: EditorialSelectorArgs,
+
         #[command(flatten)]
         eipw: lint::CmdArgs,
     },
+
+    /// Run eipw lint checks, then validate the site build
+    Check {
+        #[command(flatten)]
+        selectors: EditorialSelectorArgs,
+
+        #[command(flatten)]
+        eipw: lint::CmdArgs,
+    },
+}
+
+#[derive(Debug, clap::Args, Clone)]
+pub(crate) struct EditorialSelectorArgs {
+    /// Proposal number(s) or repo-relative proposal path(s), such as `4` or `content/07949.md`
+    #[arg(value_name = "TARGET")]
+    pub(crate) paths: Vec<PathBuf>,
+
+    /// Read proposal numbers or repo-relative proposal paths from BATCH, one per line
+    #[arg(long)]
+    pub(crate) batch: Option<PathBuf>,
+
+    /// Select tracked dirty proposal files from the active content repo
+    #[arg(long)]
+    pub(crate) working_tree: bool,
+
+    /// Select proposal files changed versus the upstream merge-base
+    #[arg(long)]
+    pub(crate) against_upstream: bool,
 }
 
 #[derive(Debug, clap::ValueEnum, Clone, Default)]
@@ -188,12 +216,13 @@ pub(crate) enum ChangedFormat {
 
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeOperation {
-    Build { eipw: lint::CmdArgs },
-    Serve { eipw: lint::CmdArgs },
+    Build,
+    Serve,
     Preview,
     Clean,
-    Check { eipw: lint::CmdArgs },
+    Check,
     Changed { all: bool, format: ChangedFormat },
+    Editorial { command: EditorialCommand },
 }
 
 impl Operation {
@@ -206,6 +235,7 @@ impl Operation {
             | Self::Clean
             | Self::Check { .. }
             | Self::Changed { .. }
+            | Self::Editorial { .. }
             | Self::Init { .. }
             | Self::Doctor => ServerCliArgs::default(),
         }
@@ -220,6 +250,7 @@ impl Operation {
             | Self::Clean
             | Self::Check { .. }
             | Self::Changed { .. }
+            | Self::Editorial { .. }
             | Self::Init { .. }
             | Self::Doctor => BaseUrlCliArgs::default(),
         }
@@ -234,6 +265,7 @@ impl Operation {
             | Self::Preview { .. }
             | Self::Clean
             | Self::Changed { .. }
+            | Self::Editorial { .. }
             | Self::Init { .. }
             | Self::Doctor
             | Self::Parity { .. } => CleanCliArgs::default(),
@@ -247,17 +279,24 @@ impl Operation {
         )
     }
 
+    pub(crate) fn is_editorial_command(&self) -> bool {
+        matches!(self, Self::Editorial { .. })
+    }
+
     pub(crate) fn runtime_operation(&self) -> Option<RuntimeOperation> {
         match self {
             Self::Print { .. } | Self::Init { .. } | Self::Doctor => None,
-            Self::Build { eipw, .. } => Some(RuntimeOperation::Build { eipw: eipw.clone() }),
-            Self::Serve { eipw, .. } => Some(RuntimeOperation::Serve { eipw: eipw.clone() }),
+            Self::Build { .. } => Some(RuntimeOperation::Build),
+            Self::Serve { .. } => Some(RuntimeOperation::Serve),
             Self::Preview { .. } => Some(RuntimeOperation::Preview),
             Self::Clean => Some(RuntimeOperation::Clean),
-            Self::Check { eipw, .. } => Some(RuntimeOperation::Check { eipw: eipw.clone() }),
+            Self::Check { .. } => Some(RuntimeOperation::Check),
             Self::Changed { all, format } => Some(RuntimeOperation::Changed {
                 all: *all,
                 format: format.clone(),
+            }),
+            Self::Editorial { command } => Some(RuntimeOperation::Editorial {
+                command: command.clone(),
             }),
             Self::Parity { command } => Some(command.runtime_operation()),
         }
@@ -289,9 +328,9 @@ impl ProfiledOperation {
 
     fn runtime_operation(&self) -> RuntimeOperation {
         match self {
-            Self::Build { eipw, .. } => RuntimeOperation::Build { eipw: eipw.clone() },
-            Self::Serve { eipw, .. } => RuntimeOperation::Serve { eipw: eipw.clone() },
-            Self::Check { eipw } => RuntimeOperation::Check { eipw: eipw.clone() },
+            Self::Build { .. } => RuntimeOperation::Build,
+            Self::Serve { .. } => RuntimeOperation::Serve,
+            Self::Check => RuntimeOperation::Check,
         }
     }
 }
@@ -330,11 +369,20 @@ impl ChangedFormat {
     }
 }
 
+impl EditorialSelectorArgs {
+    pub(crate) fn selector_count(&self) -> usize {
+        usize::from(!self.paths.is_empty())
+            + usize::from(self.batch.is_some())
+            + usize::from(self.working_tree)
+            + usize::from(self.against_upstream)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::{Args, Operation, ProfiledOperation, RuntimeOperation};
+    use super::{Args, EditorialCommand, Operation, ProfiledOperation, RuntimeOperation};
 
     fn parse_args(arguments: &[&str]) -> Args {
         Args::try_parse_from(arguments).unwrap()
@@ -413,8 +461,7 @@ mod tests {
                     args.operation.runtime_operation().unwrap(),
                     *expected_runtime_operation
                 ),
-                (RuntimeOperation::Build { .. }, "build")
-                    | (RuntimeOperation::Serve { .. }, "serve")
+                (RuntimeOperation::Build, "build") | (RuntimeOperation::Serve, "serve")
             ));
             assert_eq!(
                 args.operation
@@ -487,7 +534,7 @@ mod tests {
             let args = parse_args(arguments);
             let runtime_operation = args.operation.runtime_operation().unwrap();
             match runtime_operation {
-                RuntimeOperation::Serve { .. } if *expect_serve => {}
+                RuntimeOperation::Serve if *expect_serve => {}
                 RuntimeOperation::Preview if !*expect_serve => {}
                 other => panic!("unexpected runtime operation: {other:?}"),
             }
@@ -508,11 +555,68 @@ mod tests {
             &["build-eips", "--remote-sibling-repo", "build"][..],
             &["build-eips", "workspace", "init", "/tmp/workspace"][..],
             &["build-eips", "workspace", "doctor"][..],
+            &["build-eips", "editorial", "build", "1"][..],
             &["build-eips", "parity", "preview"][..],
             &["build-eips", "parity", "clean"][..],
             &["build-eips", "parity", "changed"][..],
         ] {
             assert!(Args::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn eipw_flags_parse_only_on_editorial_commands() {
+        let command_prefixes: &[&[&str]] = &[
+            &["build-eips", "build"],
+            &["build-eips", "check"],
+            &["build-eips", "serve"],
+            &["build-eips", "parity", "build"],
+            &["build-eips", "parity", "check"],
+            &["build-eips", "parity", "serve"],
+        ];
+        let eipw_flags: &[&[&str]] = &[
+            &["--no-default-lints"],
+            &["-D", "markdown-refs"],
+            &["--deny", "markdown-refs"],
+            &["-W", "markdown-link-status"],
+            &["--warn", "markdown-link-status"],
+            &["-A", "preamble-required"],
+            &["--allow", "preamble-required"],
+        ];
+
+        for command_prefix in command_prefixes {
+            for eipw_flag in eipw_flags {
+                let arguments = command_prefix
+                    .iter()
+                    .chain(eipw_flag.iter())
+                    .copied()
+                    .collect::<Vec<_>>();
+                assert!(
+                    Args::try_parse_from(arguments.clone()).is_err(),
+                    "expected {arguments:?} to reject eipw flags"
+                );
+            }
+        }
+
+        for command in ["lint", "check"] {
+            let args = parse_args(&[
+                "build-eips",
+                "editorial",
+                command,
+                "content/00001.md",
+                "--no-default-lints",
+                "-D",
+                "markdown-refs",
+                "--warn",
+                "markdown-link-status",
+                "--allow",
+                "preamble-required",
+            ]);
+
+            assert!(matches!(
+                args.operation.runtime_operation(),
+                Some(RuntimeOperation::Editorial { .. })
+            ));
         }
     }
 
@@ -552,6 +656,14 @@ mod tests {
                 "--base-url",
                 "http://localhost:4000",
             ],
+            &[
+                "build-eips",
+                "editorial",
+                "lint",
+                "--working-tree",
+                "--base-url",
+                "http://localhost:4000",
+            ],
             &["build-eips", "print", "--base-url", "http://localhost:4000"],
         ];
 
@@ -578,6 +690,18 @@ mod tests {
             Operation::Init { template: true, .. }
         ));
         assert!(matches!(doctor.operation, Operation::Doctor));
+    }
+
+    #[test]
+    fn editorial_check_parses_as_runtime_editorial_command() {
+        let args = parse_args(&["build-eips", "editorial", "check", "--working-tree"]);
+
+        assert!(matches!(
+            args.operation.runtime_operation(),
+            Some(RuntimeOperation::Editorial {
+                command: EditorialCommand::Check { .. }
+            })
+        ));
     }
 
     #[test]

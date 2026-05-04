@@ -813,6 +813,10 @@ pub struct SourceOnly {
 }
 
 impl SourceOnly {
+    pub fn merge(&self) -> Result<(), Error> {
+        merge_sibling_repositories(&self.working_repo, &self.src_repo_use, self.local_head)
+    }
+
     pub fn fetch_upstream(self) -> Result<SourceWithUpstream, Error> {
         info!("fetching latest {} repository", self.src_repo_use.title);
         let latest_master = fetch(
@@ -892,41 +896,138 @@ impl SourceWithUpstream {
         Ok(changed_files)
     }
 
-    fn check_ignored(&self, tree: &Tree) -> Result<(), Error> {
-        let mut walk_error = None;
-        let walk_result = tree.walk(git2::TreeWalkMode::PreOrder, |a, b| {
-            if b.kind() != Some(ObjectType::Blob) {
-                return TreeWalkResult::Ok;
+    pub fn merge(&self) -> Result<(), Error> {
+        merge_sibling_repositories(&self.working_repo, &self.src_repo_use, self.local_head)
+    }
+}
+
+fn check_ignored(working_repo: &git2::Repository, tree: &Tree) -> Result<(), Error> {
+    let mut walk_error = None;
+    let walk_result = tree.walk(git2::TreeWalkMode::PreOrder, |a, b| {
+        if b.kind() != Some(ObjectType::Blob) {
+            return TreeWalkResult::Ok;
+        }
+
+        let path = match b.name() {
+            None => a.to_owned(),
+            Some(p) => format!("{a}{p}"),
+        };
+
+        debug!("checking if `{path}` is ignored");
+
+        match working_repo.is_path_ignored(&path) {
+            Ok(false) => TreeWalkResult::Ok,
+            Ok(true) => {
+                walk_error = Some(
+                    UpdateTreeSnafu {
+                        msg: format!("contains ignored path `{path}`"),
+                    }
+                    .build(),
+                );
+                TreeWalkResult::Abort
+            }
+            Err(e) => {
+                walk_error = Some(
+                    GitSnafu {
+                        what: "check ignored",
+                    }
+                    .into_error(e),
+                );
+                TreeWalkResult::Abort
+            }
+        }
+    });
+
+    if let Some(error) = walk_error {
+        return Err(error);
+    }
+
+    walk_result.context(GitSnafu {
+        what: "traverse tree",
+    })?;
+
+    Ok(())
+}
+
+fn merge_sibling_repositories(
+    working_repo: &git2::Repository,
+    repo_use: &RepositoryUse,
+    mut local_head: Oid,
+) -> Result<(), Error> {
+    for (index, (other_kind, other_repo)) in repo_use
+        .other_repos
+        .iter()
+        .progress_ext("Merge Repos")
+        .enumerate()
+    {
+        let local_commit = working_repo.find_commit(local_head).context(GitSnafu {
+            what: "find local head commit",
+        })?;
+        let local_tree = local_commit.tree().context(GitSnafu {
+            what: "getting local head tree",
+        })?;
+        info!("fetching {other_kind} repository");
+        // Local sibling overrides should follow the checked-out repo HEAD instead of assuming `master`.
+        let other_ref = format!("refs/build-eips/other-head-{index}");
+        let other_refspec = if other_repo.scheme() == "file" {
+            format!("+HEAD:{other_ref}")
+        } else {
+            format!("+master:{other_ref}")
+        };
+        let master_other = fetch(working_repo, other_repo.as_str(), &other_refspec)?;
+        let other_tree = master_other.tree().context(GitSnafu {
+            what: "getting other tree",
+        })?;
+
+        let mut tree_builder = TreeUpdateBuilder::new();
+        let prefix = format!("{}/", CONTENT_DIR);
+        let mut walk_error: Option<Error> = None;
+        let walk_result = other_tree.walk(git2::TreeWalkMode::PreOrder, |a, b| {
+            if !a.starts_with(&prefix) && (!a.is_empty() || b.name() != Some(CONTENT_DIR)) {
+                return TreeWalkResult::Skip;
             }
 
-            let path = match b.name() {
-                None => a.to_owned(),
-                Some(p) => format!("{a}{p}"),
-            };
-
-            debug!("checking if `{path}` is ignored");
-
-            match self.working_repo.is_path_ignored(&path) {
-                Ok(false) => TreeWalkResult::Ok,
-                Ok(true) => {
+            let name = match b.name() {
+                Some(n) => n,
+                None => {
                     walk_error = Some(
                         UpdateTreeSnafu {
-                            msg: format!("contains ignored path `{path}`"),
+                            msg: format!("tree entry without name in `{a}`"),
                         }
                         .build(),
                     );
-                    TreeWalkResult::Abort
+                    return TreeWalkResult::Abort;
                 }
-                Err(e) => {
+            };
+
+            let path = format!("{}{}", a, name);
+            match b.kind() {
+                Some(ObjectType::Blob) => (),
+                Some(ObjectType::Tree) => return TreeWalkResult::Ok,
+                kind => {
                     walk_error = Some(
-                        GitSnafu {
-                            what: "check ignored",
+                        UpdateTreeSnafu {
+                            msg: format!("unknown blob type `{kind:?}` for `{path}`"),
                         }
-                        .into_error(e),
+                        .build(),
                     );
-                    TreeWalkResult::Abort
+                    return TreeWalkResult::Abort;
                 }
             }
+
+            if path == CONTENT_INDEX_PATH {
+                debug!("skip sibling homepage `{path}`");
+                return TreeWalkResult::Ok;
+            }
+
+            if let Err(e) = check_conflict(&local_tree, Path::new(&path), b) {
+                walk_error = Some(e);
+                return TreeWalkResult::Abort;
+            }
+
+            debug!("upsert `{path}`");
+            tree_builder.upsert(path, b.id(), FileMode::Blob);
+            TreeWalkResult::Ok
         });
 
         if let Some(error) = walk_error {
@@ -937,149 +1038,53 @@ impl SourceWithUpstream {
             what: "traverse tree",
         })?;
 
-        Ok(())
-    }
+        let merged_tree_oid = tree_builder
+            .create_updated(working_repo, &local_tree)
+            .context(GitSnafu { what: "build tree" })?;
+        let merged_tree = working_repo.find_tree(merged_tree_oid).unwrap();
 
-    pub fn merge(&self) -> Result<(), Error> {
-        let repo_use = &self.src_repo_use;
-        let mut local_head = self.local_head;
-        for (index, (other_kind, other_repo)) in repo_use
-            .other_repos
-            .iter()
-            .progress_ext("Merge Repos")
-            .enumerate()
-        {
-            let local_commit = self
-                .working_repo
-                .find_commit(local_head)
-                .context(GitSnafu {
-                    what: "find local head commit",
-                })?;
-            let local_tree = local_commit.tree().context(GitSnafu {
-                what: "getting local head tree",
+        check_ignored(working_repo, &merged_tree)?;
+
+        let sig =
+            Signature::now("eips-build", "eips-build@eips-build.invalid").context(GitSnafu {
+                what: "commit signature",
             })?;
-            info!("fetching {other_kind} repository");
-            // Local sibling overrides should follow the checked-out repo HEAD instead of assuming `master`.
-            let other_ref = format!("refs/build-eips/other-head-{index}");
-            let other_refspec = if other_repo.scheme() == "file" {
-                format!("+HEAD:{other_ref}")
-            } else {
-                format!("+master:{other_ref}")
-            };
-            let master_other = fetch(&self.working_repo, other_repo.as_str(), &other_refspec)?;
-            let other_tree = master_other.tree().context(GitSnafu {
-                what: "getting other tree",
+        let msg = format!("Merge {other_repo}");
+        local_head = working_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                &msg,
+                &merged_tree,
+                &[&local_commit, &master_other],
+            )
+            .context(GitSnafu { what: "committing" })?;
+
+        working_repo
+            .checkout_head(Some(CheckoutBuilder::default().force()))
+            .context(GitSnafu {
+                what: "checkout merged",
             })?;
 
-            let mut tree_builder = TreeUpdateBuilder::new();
-            let prefix = format!("{}/", CONTENT_DIR);
-            let mut walk_error: Option<Error> = None;
-            let walk_result = other_tree.walk(git2::TreeWalkMode::PreOrder, |a, b| {
-                if !a.starts_with(&prefix) && (!a.is_empty() || b.name() != Some(CONTENT_DIR)) {
-                    return TreeWalkResult::Skip;
+        drop(merged_tree);
+        drop(other_tree);
+        drop(master_other);
+        drop(local_tree);
+        drop(local_commit);
+        match working_repo.find_reference(&other_ref) {
+            Ok(mut reference) => {
+                if let Err(error) = reference.delete() {
+                    debug!("unable to delete temporary sibling ref `{other_ref}`: {error}");
                 }
-
-                let name = match b.name() {
-                    Some(n) => n,
-                    None => {
-                        walk_error = Some(
-                            UpdateTreeSnafu {
-                                msg: format!("tree entry without name in `{a}`"),
-                            }
-                            .build(),
-                        );
-                        return TreeWalkResult::Abort;
-                    }
-                };
-
-                let path = format!("{}{}", a, name);
-                match b.kind() {
-                    Some(ObjectType::Blob) => (),
-                    Some(ObjectType::Tree) => return TreeWalkResult::Ok,
-                    kind => {
-                        walk_error = Some(
-                            UpdateTreeSnafu {
-                                msg: format!("unknown blob type `{kind:?}` for `{path}`"),
-                            }
-                            .build(),
-                        );
-                        return TreeWalkResult::Abort;
-                    }
-                }
-
-                if path == CONTENT_INDEX_PATH {
-                    debug!("skip sibling homepage `{path}`");
-                    return TreeWalkResult::Ok;
-                }
-
-                if let Err(e) = check_conflict(&local_tree, Path::new(&path), b) {
-                    walk_error = Some(e);
-                    return TreeWalkResult::Abort;
-                }
-
-                debug!("upsert `{path}`");
-                tree_builder.upsert(path, b.id(), FileMode::Blob);
-                TreeWalkResult::Ok
-            });
-
-            if let Some(error) = walk_error {
-                return Err(error);
             }
-
-            walk_result.context(GitSnafu {
-                what: "traverse tree",
-            })?;
-
-            let merged_tree_oid = tree_builder
-                .create_updated(&self.working_repo, &local_tree)
-                .context(GitSnafu { what: "build tree" })?;
-            let merged_tree = self.working_repo.find_tree(merged_tree_oid).unwrap();
-
-            self.check_ignored(&merged_tree)?;
-
-            let sig = Signature::now("eips-build", "eips-build@eips-build.invalid").context(
-                GitSnafu {
-                    what: "commit signature",
-                },
-            )?;
-            let msg = format!("Merge {other_repo}");
-            local_head = self
-                .working_repo
-                .commit(
-                    Some("HEAD"),
-                    &sig,
-                    &sig,
-                    &msg,
-                    &merged_tree,
-                    &[&local_commit, &master_other],
-                )
-                .context(GitSnafu { what: "committing" })?;
-
-            self.working_repo
-                .checkout_head(Some(CheckoutBuilder::default().force()))
-                .context(GitSnafu {
-                    what: "checkout merged",
-                })?;
-
-            drop(merged_tree);
-            drop(other_tree);
-            drop(master_other);
-            drop(local_tree);
-            drop(local_commit);
-            match self.working_repo.find_reference(&other_ref) {
-                Ok(mut reference) => {
-                    if let Err(error) = reference.delete() {
-                        debug!("unable to delete temporary sibling ref `{other_ref}`: {error}");
-                    }
-                }
-                Err(error) => {
-                    debug!("temporary sibling ref `{other_ref}` was not deleted: {error}");
-                }
+            Err(error) => {
+                debug!("temporary sibling ref `{other_ref}` was not deleted: {error}");
             }
         }
-
-        Ok(())
     }
+
+    Ok(())
 }
 
 fn fetch<'a>(

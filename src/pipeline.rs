@@ -12,12 +12,11 @@ use snafu::{OptionExt, ResultExt, Whatever};
 use url::Url;
 
 use crate::{
-    changed,
     config::ServerBinding,
     execution::ResolvedExecution,
     git,
     layout::{mounted_theme_path, output_path, CONTENT_DIR, REPO_DIR},
-    lint, markdown,
+    markdown,
     serve::{serve_sync_config, DirtyServeWatcher, LocalThemeServeSync},
     zola,
 };
@@ -42,6 +41,29 @@ fn prepare_theme_for_zola(
     ))
 }
 
+fn prepare_runtime_source(
+    root_path: &Path,
+    repo_path: &Path,
+    repository_use: &git::RepositoryUse,
+    source_materialization: git::SourceMaterialization,
+) -> Result<(), Whatever> {
+    let source = git::Fresh::new(
+        root_path,
+        repo_path,
+        repository_use.clone(),
+        source_materialization,
+    )
+    .whatever_context("initializing build repo")?
+    .clone_src()
+    .whatever_context("cloning source repo")?;
+
+    source
+        .merge()
+        .whatever_context("unable to merge ERC/EIP repositories")?;
+
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(crate) struct Prepared {
     repo_path: PathBuf,
@@ -56,10 +78,7 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
-    pub(crate) fn prepare(
-        eipw: lint::CmdArgs,
-        resolved: ResolvedExecution,
-    ) -> Result<Self, Whatever> {
+    pub(crate) fn prepare(resolved: ResolvedExecution) -> Result<Self, Whatever> {
         zola::find_zola().whatever_context("unable to find suitable zola binary")?;
 
         let ResolvedExecution {
@@ -78,31 +97,12 @@ impl Prepared {
         let content_path = repo_path.join(CONTENT_DIR);
         let output_path = output_path(&build_path);
 
-        let both = git::Fresh::new(
+        prepare_runtime_source(
             &root_path,
             &repo_path,
-            repository_use.clone(),
+            &repository_use,
             source_materialization,
-        )
-        .whatever_context("initializing build repo")?
-        .clone_src()
-        .whatever_context("cloning source repo")?
-        .fetch_upstream()
-        .whatever_context("fetching upstream repo")?;
-
-        let changed_files: Vec<_> = both
-            .changed_files()
-            .whatever_context("unable to list changed files")?
-            .into_iter()
-            .filter(|p| changed::is_proposal_path(p.into()))
-            .map(|p| repo_path.join(p))
-            .collect();
-
-        both.merge()
-            .whatever_context("unable to merge ERC/EIP repositories")?;
-
-        lint::eipw(&theme_path, &root_path, &repo_path, changed_files, eipw)
-            .whatever_context("linting failed")?;
+        )?;
 
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
         let (theme_path, local_theme_sync) = prepare_theme_for_zola(theme_path, &repo_path)?;
@@ -175,14 +175,29 @@ impl Prepared {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
+    use clap::Parser;
     use git2::{IndexAddOption, Repository, Signature};
     use tempfile::TempDir;
+    use url::Url;
 
-    use crate::layout::{mounted_theme_path, theme_config_path};
+    use crate::{
+        changed,
+        cli::{Args, ChangedFormat, EditorialCommand, RuntimeOperation},
+        config,
+        editorial::editorial_runtime_execution,
+        execution::{resolve_execution, ResolvedExecution},
+        git::SourceMaterialization,
+        layout::{mounted_theme_path, theme_config_path, REPO_DIR},
+    };
 
-    use super::prepare_theme_for_zola;
+    use super::{prepare_runtime_source, prepare_theme_for_zola};
+
+    struct RuntimeWorkspace {
+        _temp: TempDir,
+        active_path: PathBuf,
+    }
 
     fn write_file(root: &Path, relative: impl AsRef<Path>, contents: &str) {
         let path = root.join(relative);
@@ -232,6 +247,96 @@ mod tests {
         repo
     }
 
+    fn file_url(path: &Path) -> Url {
+        Url::from_directory_path(path).unwrap()
+    }
+
+    fn repo_manifest_text(repo_id: &str, repository: &Url, siblings: &[(&str, Url)]) -> String {
+        let mut manifest = format!(
+            r#"
+repo_id = "{repo_id}"
+
+[production]
+repository = "{repository}"
+base_url = "https://example.test/{repo_id}/"
+
+[staging]
+repository = "{repository}"
+base_url = "https://staging.example.test/{repo_id}/"
+"#
+        );
+
+        for (sibling_id, sibling_repository) in siblings {
+            manifest.push_str(&format!(
+                r#"
+[siblings.{sibling_id}.production]
+repository = "{sibling_repository}"
+base_url = "https://example.test/{sibling_id}/"
+
+[siblings.{sibling_id}.staging]
+repository = "{sibling_repository}"
+base_url = "https://staging.example.test/{sibling_id}/"
+"#
+            ));
+        }
+
+        manifest
+    }
+
+    fn runtime_workspace(with_sibling: bool) -> RuntimeWorkspace {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let active_path = workspace_root.join("EIPs");
+        let sibling_path = workspace_root.join("ERCs");
+        let missing_upstream = file_url(&temp.path().join("missing-upstream"));
+        let siblings = with_sibling.then(|| ("ERCs", file_url(&sibling_path)));
+        let siblings = siblings.into_iter().collect::<Vec<_>>();
+        let manifest = repo_manifest_text("EIPs", &missing_upstream, &siblings);
+
+        write_file(&workspace_root, config::LOCAL_CONFIG_FILE, "");
+        std::fs::create_dir_all(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+        let _active_repo = init_repo(
+            &active_path,
+            &[
+                (config::REPO_MANIFEST_FILE, manifest.as_str()),
+                ("content/00001.md", "active proposal\n"),
+            ],
+        );
+
+        if with_sibling {
+            let _sibling_repo = init_repo(&sibling_path, &[("content/00002.md", "sibling\n")]);
+        }
+
+        RuntimeWorkspace {
+            _temp: temp,
+            active_path,
+        }
+    }
+
+    fn resolved_runtime(workspace: &RuntimeWorkspace, command: &[&str]) -> ResolvedExecution {
+        let active_path = workspace.active_path.to_str().unwrap();
+        let mut arguments = vec!["build-eips", "-C", active_path];
+        arguments.extend_from_slice(command);
+        let args = Args::try_parse_from(arguments).unwrap();
+
+        resolve_execution(&args).unwrap()
+    }
+
+    fn prepare_resolved_source(resolved: &ResolvedExecution) -> Result<(), snafu::Whatever> {
+        std::fs::create_dir_all(&resolved.build_path).unwrap();
+        let repo_path = resolved.build_path.join(REPO_DIR);
+        prepare_runtime_source(
+            &resolved.root_path,
+            &repo_path,
+            &resolved.repository_use,
+            resolved.source_materialization,
+        )
+    }
+
+    fn prepared_path(resolved: &ResolvedExecution, relative: impl AsRef<Path>) -> PathBuf {
+        resolved.build_path.join(REPO_DIR).join(relative)
+    }
+
     #[test]
     fn workspace_local_theme_is_materialized_as_mounted_theme_for_zola() {
         let temp = TempDir::new().unwrap();
@@ -260,5 +365,108 @@ mod tests {
         assert_eq!(sync.theme_source_root, theme_root);
         assert_eq!(sync.mounted_theme_dir, mounted_theme_dir);
         assert!(sync.theme_index_path.ends_with(".git/index"));
+    }
+
+    #[test]
+    fn prepared_runtime_source_succeeds_with_unreachable_active_upstream() {
+        for command in [&["build"][..], &["check"][..], &["serve"][..]] {
+            let workspace = runtime_workspace(false);
+            let resolved = resolved_runtime(&workspace, command);
+
+            prepare_resolved_source(&resolved).unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(prepared_path(&resolved, "content/00001.md")).unwrap(),
+                "active proposal\n"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_runtime_source_uses_remote_siblings_without_active_upstream_fetch() {
+        let workspace = runtime_workspace(true);
+        let resolved = resolved_runtime(&workspace, &["--remote-siblings", "build"]);
+
+        prepare_resolved_source(&resolved).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(prepared_path(&resolved, "content/00001.md")).unwrap(),
+            "active proposal\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(prepared_path(&resolved, "content/00002.md")).unwrap(),
+            "sibling\n"
+        );
+    }
+
+    #[test]
+    fn remote_environment_runtime_source_prep_keeps_local_active_checkout() {
+        for command in [
+            &["--staging", "build"][..],
+            &["--production", "check"][..],
+            &["parity", "serve"][..],
+        ] {
+            let workspace = runtime_workspace(false);
+            let resolved = resolved_runtime(&workspace, command);
+
+            assert_eq!(
+                resolved.source_materialization,
+                SourceMaterialization::Clean
+            );
+            prepare_resolved_source(&resolved).unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(prepared_path(&resolved, "content/00001.md")).unwrap(),
+                "active proposal\n"
+            );
+        }
+    }
+
+    #[test]
+    fn changed_still_requires_active_upstream() {
+        let workspace = runtime_workspace(false);
+        let resolved = resolved_runtime(&workspace, &["changed"]);
+        std::fs::create_dir_all(&resolved.build_path).unwrap();
+
+        let error = changed::run(
+            &resolved,
+            &resolved.build_path,
+            false,
+            &ChangedFormat::Newline,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("fetching upstream repo"));
+    }
+
+    #[test]
+    fn editorial_check_site_phase_source_prep_does_not_fetch_active_upstream() {
+        let workspace = runtime_workspace(false);
+        let active_path = workspace.active_path.to_str().unwrap();
+        let args = Args::try_parse_from([
+            "build-eips",
+            "-C",
+            active_path,
+            "editorial",
+            "check",
+            "--against-upstream",
+        ])
+        .unwrap();
+        let resolved = resolve_execution(&args).unwrap();
+        let RuntimeOperation::Editorial {
+            command: EditorialCommand::Check { selectors, .. },
+        } = args.operation.runtime_operation().unwrap()
+        else {
+            panic!("expected editorial check runtime operation");
+        };
+        let resolved = editorial_runtime_execution(resolved, &selectors);
+
+        prepare_resolved_source(&resolved).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(prepared_path(&resolved, "content/00001.md")).unwrap(),
+            "active proposal\n"
+        );
     }
 }
