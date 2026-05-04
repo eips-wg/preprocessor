@@ -17,6 +17,7 @@ mod layout;
 mod lint;
 mod markdown;
 mod pipeline;
+mod preview;
 mod print;
 mod progress;
 mod serve;
@@ -33,6 +34,7 @@ use snafu::{Report, ResultExt, Whatever};
 use crate::{
     cli::{Args, Operation, RuntimeOperation},
     execution::{resolve_execution, validate_non_execution_command_flags},
+    layout::output_path,
     pipeline::Prepared,
     workspace::{doctor_workspace, init_workspace},
 };
@@ -87,6 +89,13 @@ fn run() -> Result<(), Whatever> {
         .runtime_operation()
         .expect("non-execution commands should have returned earlier");
     let resolved = resolve_execution(&args)?;
+
+    if matches!(runtime_operation, RuntimeOperation::Preview) {
+        preview::serve(&output_path(&resolved.build_path), &resolved.server_binding)
+            .whatever_context("preview server failed")?;
+        return Ok(());
+    }
+
     let build_path = make_build_dir(&resolved.build_path)?;
 
     let mut lock_file = lock(&build_path)?;
@@ -111,6 +120,7 @@ fn run() -> Result<(), Whatever> {
         RuntimeOperation::Serve { eipw } => {
             Prepared::prepare(eipw, resolved)?.serve()?;
         }
+        RuntimeOperation::Preview => unreachable!(),
         RuntimeOperation::Changed { all, format } => {
             changed::run(&resolved, &build_path, all, &format)?;
         }

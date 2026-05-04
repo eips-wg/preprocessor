@@ -86,7 +86,13 @@ pub(crate) enum Operation {
         clean: CleanCliArgs,
     },
 
-    /// Build the project and launch a web server to preview it
+    /// Serve the existing built output without rebuilding it
+    Preview {
+        #[command(flatten)]
+        server: ServerCliArgs,
+    },
+
+    /// Build a fresh temporary site, serve it locally, and watch tracked edits
     Serve {
         #[command(flatten)]
         eipw: lint::CmdArgs,
@@ -184,6 +190,7 @@ pub(crate) enum ChangedFormat {
 pub(crate) enum RuntimeOperation {
     Build { eipw: lint::CmdArgs },
     Serve { eipw: lint::CmdArgs },
+    Preview,
     Clean,
     Check { eipw: lint::CmdArgs },
     Changed { all: bool, format: ChangedFormat },
@@ -192,7 +199,7 @@ pub(crate) enum RuntimeOperation {
 impl Operation {
     pub(crate) fn server_cli_args(&self) -> ServerCliArgs {
         match self {
-            Self::Serve { server, .. } => server.clone(),
+            Self::Serve { server, .. } | Self::Preview { server } => server.clone(),
             Self::Parity { command } => command.server_cli_args(),
             Self::Print { .. }
             | Self::Build { .. }
@@ -209,6 +216,7 @@ impl Operation {
             Self::Build { base_url, .. } | Self::Serve { base_url, .. } => base_url.clone(),
             Self::Parity { command } => command.base_url_cli_args(),
             Self::Print { .. }
+            | Self::Preview { .. }
             | Self::Clean
             | Self::Check { .. }
             | Self::Changed { .. }
@@ -223,6 +231,7 @@ impl Operation {
                 clean.clone()
             }
             Self::Print { .. }
+            | Self::Preview { .. }
             | Self::Clean
             | Self::Changed { .. }
             | Self::Init { .. }
@@ -243,6 +252,7 @@ impl Operation {
             Self::Print { .. } | Self::Init { .. } | Self::Doctor => None,
             Self::Build { eipw, .. } => Some(RuntimeOperation::Build { eipw: eipw.clone() }),
             Self::Serve { eipw, .. } => Some(RuntimeOperation::Serve { eipw: eipw.clone() }),
+            Self::Preview { .. } => Some(RuntimeOperation::Preview),
             Self::Clean => Some(RuntimeOperation::Clean),
             Self::Check { eipw, .. } => Some(RuntimeOperation::Check { eipw: eipw.clone() }),
             Self::Changed { all, format } => Some(RuntimeOperation::Changed {
@@ -433,6 +443,7 @@ mod tests {
             &["build-eips", "parity", "build", "--clean"][..],
             &["build-eips", "parity", "serve", "--clean"][..],
             &["build-eips", "parity", "check", "--clean"][..],
+            &["build-eips", "preview", "--clean"][..],
             &["build-eips", "changed", "--clean"][..],
             &["build-eips", "clean", "--clean"][..],
         ] {
@@ -441,26 +452,45 @@ mod tests {
     }
 
     #[test]
-    fn server_flags_parse_on_serve_forms() {
-        let cases: &[&[&str]] = &[
-            &["build-eips", "serve", "--host", "0.0.0.0", "--port", "8080"],
-            &[
-                "build-eips",
-                "parity",
-                "serve",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                "8080",
-            ],
+    fn server_flags_parse_on_serve_and_preview_forms() {
+        let cases: &[(&[&str], bool)] = &[
+            (
+                &["build-eips", "serve", "--host", "0.0.0.0", "--port", "8080"],
+                true,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "preview",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8080",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "parity",
+                    "serve",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8080",
+                ],
+                true,
+            ),
         ];
 
-        for arguments in cases {
+        for (arguments, expect_serve) in cases {
             let args = parse_args(arguments);
-            assert!(matches!(
-                args.operation.runtime_operation(),
-                Some(RuntimeOperation::Serve { .. })
-            ));
+            let runtime_operation = args.operation.runtime_operation().unwrap();
+            match runtime_operation {
+                RuntimeOperation::Serve { .. } if *expect_serve => {}
+                RuntimeOperation::Preview if !*expect_serve => {}
+                other => panic!("unexpected runtime operation: {other:?}"),
+            }
             let server = args.operation.server_cli_args();
 
             assert_eq!(server.host.as_deref(), Some("0.0.0.0"));
@@ -478,6 +508,7 @@ mod tests {
             &["build-eips", "--remote-sibling-repo", "build"][..],
             &["build-eips", "workspace", "init", "/tmp/workspace"][..],
             &["build-eips", "workspace", "doctor"][..],
+            &["build-eips", "parity", "preview"][..],
             &["build-eips", "parity", "clean"][..],
             &["build-eips", "parity", "changed"][..],
         ] {
@@ -488,6 +519,19 @@ mod tests {
     #[test]
     fn base_url_flag_is_rejected_on_non_rendering_forms() {
         let cases: &[&[&str]] = &[
+            &[
+                "build-eips",
+                "preview",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &[
+                "build-eips",
+                "parity",
+                "preview",
+                "--base-url",
+                "http://localhost:4000",
+            ],
             &["build-eips", "check", "--base-url", "http://localhost:4000"],
             &[
                 "build-eips",
