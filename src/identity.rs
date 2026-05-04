@@ -31,11 +31,9 @@ impl ActiveRepoIdentity {
 
         match Config::production()
             .locations
-            .identify_repository(root_path)
+            .identify_repository_title(root_path)
         {
-            Ok(repository_use) => Ok(Self::Legacy {
-                repo_id: repository_use.title,
-            }),
+            Ok(repo_id) => Ok(Self::Legacy { repo_id }),
             Err(git::Error::NoIdentify { .. }) => {
                 snafu::whatever!(
                     "active repository `{}` does not carry `{}` and does not match the legacy EIPs/ERCs identity fallback",

@@ -360,7 +360,7 @@ pub struct Theme {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Location {
+pub struct LegacyLocation {
     /// Git repository to fetch proposals from.
     pub repository: Url,
 
@@ -374,14 +374,23 @@ pub struct Location {
     pub identifying_commit: String,
 }
 
+impl LegacyLocation {
+    pub fn endpoint(&self) -> RepositoryEndpoint {
+        RepositoryEndpoint {
+            repository: self.repository.clone(),
+            base_url: self.base_url.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Locations(pub HashMap<String, Location>);
+pub struct LegacyLocations(pub HashMap<String, LegacyLocation>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub theme: Theme,
-    pub locations: Locations,
+    pub locations: LegacyLocations,
 }
 
 impl Config {
@@ -390,7 +399,7 @@ impl Config {
 
         locations.insert(
             "EIPs".into(),
-            Location {
+            LegacyLocation {
                 repository: "https://github.com/ethereum/EIPs.git".try_into().unwrap(),
                 base_url: "https://eips.ethereum.org/".try_into().unwrap(),
                 identifying_commit: "0f44e2b94df4e504bb7b912f56ebd712db2ad396".into(),
@@ -399,7 +408,7 @@ impl Config {
 
         locations.insert(
             "ERCs".into(),
-            Location {
+            LegacyLocation {
                 repository: "https://github.com/ethereum/ERCs.git".try_into().unwrap(),
                 base_url: "https://ercs.ethereum.org/".try_into().unwrap(),
                 identifying_commit: "8dd085d159cb123f545c272c0d871a5339550e79".into(),
@@ -413,7 +422,7 @@ impl Config {
                     .unwrap(),
                 commit: "0ddac35da36d311a8401c6cfb79c9991f78b647d".into(),
             },
-            locations: Locations(locations),
+            locations: LegacyLocations(locations),
         }
     }
 
@@ -422,7 +431,7 @@ impl Config {
 
         locations.insert(
             "EIPs".into(),
-            Location {
+            LegacyLocation {
                 repository: "https://github.com/eips-wg/EIPs.git".try_into().unwrap(),
                 base_url: "https://eips-wg.github.io/EIPs/".try_into().unwrap(),
                 identifying_commit: "0f44e2b94df4e504bb7b912f56ebd712db2ad396".into(),
@@ -431,7 +440,7 @@ impl Config {
 
         locations.insert(
             "ERCs".into(),
-            Location {
+            LegacyLocation {
                 repository: "https://github.com/eips-wg/ERCs.git".try_into().unwrap(),
                 base_url: "https://eips-wg.github.io/ERCs/".try_into().unwrap(),
                 identifying_commit: "8dd085d159cb123f545c272c0d871a5339550e79".into(),
@@ -443,7 +452,7 @@ impl Config {
                 repository: "https://github.com/eips-wg/theme.git".try_into().unwrap(),
                 commit: "0ddac35da36d311a8401c6cfb79c9991f78b647d".into(),
             },
-            locations: Locations(locations),
+            locations: LegacyLocations(locations),
         }
     }
 }
