@@ -32,7 +32,7 @@ use crate::{
     cli::{Args, Operation},
     config::Config,
     layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
-    workspace::init_workspace,
+    workspace::{doctor_workspace, init_workspace},
 };
 
 fn repository_use(config: &Config, root_path: &Path) -> Result<git::RepositoryUse, Whatever> {
@@ -193,6 +193,11 @@ fn run() -> Result<(), Whatever> {
         return Ok(());
     }
 
+    if let Operation::Doctor = &args.operation {
+        doctor_workspace(&args)?;
+        return Ok(());
+    }
+
     let config = if args.staging {
         Config::staging()
     } else {
@@ -207,6 +212,7 @@ fn run() -> Result<(), Whatever> {
     match args.operation {
         Operation::Print { .. } => unreachable!(),
         Operation::Init { .. } => unreachable!(),
+        Operation::Doctor => unreachable!(),
         Operation::Clean => {
             // TODO: There's a race condition here. Maybe we move the lockfile to the repository
             //       root?
