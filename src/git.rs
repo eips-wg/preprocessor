@@ -25,6 +25,7 @@ use snafu::{ensure, Backtrace, IntoError, OptionExt, ResultExt, Snafu};
 use url::Url;
 
 const DIRTY_PATH_DISPLAY_LIMIT: usize = 10;
+const CONTENT_INDEX_PATH: &str = "content/_index.md";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -757,7 +758,7 @@ impl Fresh {
         let master = fetch(
             &self.working_repo,
             self.src_repo_url.as_str(),
-            "HEAD:refs/build-eips/source-head",
+            "+HEAD:refs/build-eips/source-head",
         )?;
         self.working_repo
             .set_head_detached(master.id())
@@ -817,7 +818,7 @@ impl SourceOnly {
         let latest_master = fetch(
             &self.working_repo,
             self.src_repo_use.location.repository.as_str(),
-            "master:refs/build-eips/upstream-head",
+            "+master:refs/build-eips/upstream-head",
         )?;
         let upstream_head = latest_master.id();
         drop(latest_master);
@@ -1006,6 +1007,11 @@ impl SourceWithUpstream {
                     }
                 }
 
+                if path == CONTENT_INDEX_PATH {
+                    debug!("skip sibling homepage `{path}`");
+                    return TreeWalkResult::Ok;
+                }
+
                 if let Err(e) = check_conflict(&local_tree, Path::new(&path), b) {
                     walk_error = Some(e);
                     return TreeWalkResult::Abort;
@@ -1148,7 +1154,15 @@ mod tests {
     use git2::{IndexAddOption, Repository, Signature};
     use tempfile::TempDir;
 
-    use super::{materialize_working_tree, sync_working_tree_paths, tracked_working_tree_paths};
+    use super::{
+        materialize_working_tree, sync_working_tree_paths, tracked_working_tree_paths, Fresh,
+        RepositoryUse, SourceMaterialization,
+    };
+    use crate::config::RepositoryEndpoint;
+
+    fn file_url(path: &Path) -> url::Url {
+        url::Url::from_directory_path(path).unwrap()
+    }
 
     fn write_file(root: &Path, relative: impl AsRef<Path>, contents: &str) {
         let path = root.join(relative);
@@ -1202,6 +1216,61 @@ mod tests {
         let mut index = repo.index().unwrap();
         index.add_path(Path::new(relative)).unwrap();
         index.write().unwrap();
+    }
+
+    #[test]
+    fn merge_skips_sibling_homepage_and_keeps_sibling_proposals() {
+        let temp = TempDir::new().unwrap();
+        let active = temp.path().join("active");
+        let sibling = temp.path().join("sibling");
+        let prepared = temp.path().join("prepared");
+
+        init_repo(
+            &active,
+            &[
+                ("content/_index.md", "active homepage\n"),
+                ("content/00555.md", "# Active proposal\n"),
+            ],
+        );
+        init_repo(
+            &sibling,
+            &[
+                ("content/_index.md", "sibling homepage\n"),
+                ("content/00678.md", "# Sibling proposal\n"),
+            ],
+        );
+
+        let mut other_repos = std::collections::BTreeMap::new();
+        other_repos.insert("ERCs".to_owned(), file_url(&sibling));
+        let active_url = file_url(&active);
+        let repository_use = RepositoryUse {
+            title: "EIPs".to_owned(),
+            location: RepositoryEndpoint {
+                repository: active_url,
+                base_url: "https://eips.example.test/".parse().unwrap(),
+            },
+            other_repos,
+        };
+
+        Fresh::new(
+            &active,
+            &prepared,
+            repository_use,
+            SourceMaterialization::Clean,
+        )
+        .unwrap()
+        .clone_src()
+        .unwrap()
+        .fetch_upstream()
+        .unwrap()
+        .merge()
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(prepared.join("content/_index.md")).unwrap(),
+            "active homepage\n"
+        );
+        assert!(prepared.join("content/00678.md").is_file());
     }
 
     #[test]

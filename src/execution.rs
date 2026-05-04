@@ -411,8 +411,9 @@ mod tests {
         let error = resolve_execution_settings(&args, &sibling_ids, None).unwrap_err();
         let message = error.to_string();
 
-        assert!(message
-            .contains("the selected command requires a workspace config with local theme and sibling sources"));
+        assert!(message.contains(
+            "the selected command requires a workspace config with local theme and sibling sources"
+        ));
         assert!(message.contains("no `.build-eips.toml` was found"));
         assert!(message.contains("build-eips init <workspace-root>"));
         assert!(message.contains(

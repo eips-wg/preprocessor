@@ -16,6 +16,7 @@ mod identity;
 mod layout;
 mod lint;
 mod markdown;
+mod pipeline;
 mod print;
 mod progress;
 mod workspace;
@@ -30,8 +31,8 @@ use snafu::{Report, ResultExt, Whatever};
 
 use crate::{
     cli::{Args, Operation, RuntimeOperation},
-    execution::{resolve_execution, validate_non_execution_command_flags, ResolvedExecution},
-    layout::{output_path, CONTENT_DIR, REPO_DIR},
+    execution::{resolve_execution, validate_non_execution_command_flags},
+    pipeline::Prepared,
     workspace::{doctor_workspace, init_workspace},
 };
 
@@ -59,97 +60,6 @@ fn make_build_dir(build_path: &Path) -> Result<PathBuf, Whatever> {
         );
     }
     Ok(build_path.to_path_buf())
-}
-
-#[derive(Debug)]
-struct Prepared {
-    repo_path: PathBuf,
-    output_path: PathBuf,
-    repository_use: git::RepositoryUse,
-    theme_path: PathBuf,
-    base_url_override: Option<url::Url>,
-}
-
-impl Prepared {
-    fn prepare(eipw: lint::CmdArgs, resolved: ResolvedExecution) -> Result<Self, Whatever> {
-        zola::find_zola().whatever_context("unable to find suitable zola binary")?;
-        let theme_path = resolved.theme_path()?.to_path_buf();
-
-        let ResolvedExecution {
-            root_path,
-            build_path,
-            repository_use,
-            theme_path: _,
-            source_materialization,
-            base_url_override,
-        } = resolved;
-
-        let repo_path = build_path.join(REPO_DIR);
-        let content_path = repo_path.join(CONTENT_DIR);
-        let output_path = output_path(&build_path);
-
-        let both = git::Fresh::new(
-            &root_path,
-            &repo_path,
-            repository_use.clone(),
-            source_materialization,
-        )
-        .whatever_context("initializing build repo")?
-        .clone_src()
-        .whatever_context("cloning source repo")?
-        .fetch_upstream()
-        .whatever_context("fetching upstream repo")?;
-
-        let changed_files: Vec<_> = both
-            .changed_files()
-            .whatever_context("unable to list changed files")?
-            .into_iter()
-            .filter(|p| changed::is_proposal_path(p.into()))
-            .map(|p| repo_path.join(p))
-            .collect();
-
-        both.merge()
-            .whatever_context("unable to merge ERC/EIP repositories")?;
-
-        lint::eipw(&theme_path, &root_path, &repo_path, changed_files, eipw)
-            .whatever_context("linting failed")?;
-
-        markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
-
-        Ok(Prepared {
-            repo_path,
-            output_path,
-            repository_use,
-            theme_path,
-            base_url_override,
-        })
-    }
-
-    fn build(self) -> Result<(), Whatever> {
-        let base_url = self
-            .base_url_override
-            .as_ref()
-            .unwrap_or(&self.repository_use.location.base_url);
-        zola::build(
-            &self.theme_path,
-            &self.repo_path,
-            &self.output_path,
-            base_url.as_str(),
-        )
-        .whatever_context("zola build failed")?;
-        Ok(())
-    }
-
-    fn serve(self) -> Result<(), Whatever> {
-        zola::serve(&self.theme_path, &self.repo_path, &self.output_path)
-            .whatever_context("zola serve failed")?;
-        Ok(())
-    }
-
-    fn check(self) -> Result<(), Whatever> {
-        zola::check(&self.theme_path, &self.repo_path).whatever_context("zola check failed")?;
-        Ok(())
-    }
 }
 
 fn run() -> Result<(), Whatever> {
