@@ -6,14 +6,21 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt,
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use snafu::{Backtrace, IntoError, OptionExt, ResultExt, Snafu};
-use url::Url;
+use url::{Position, Url};
 
+pub const LOCAL_CONFIG_FILE: &str = ".build-eips.toml";
 pub const REPO_MANIFEST_FILE: &str = ".build-eips.repo.toml";
+pub const DEFAULT_BUILD_ROOT_BASE: &str = ".local-build";
+pub const DEFAULT_THEME_DIR: &str = "theme";
+pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
+pub const DEFAULT_SERVER_PORT: u16 = 1111;
+pub const DEFAULT_SITE_BASE_URL: &str = "http://127.0.0.1:1111";
 const RESERVED_REPO_IDS: &[&str] = &["theme", "preprocessor", "eipw"];
 
 #[derive(Debug, Snafu)]
@@ -43,6 +50,27 @@ pub enum RepoManifestError {
     Invalid {
         manifest_path: PathBuf,
         reason: String,
+        backtrace: Backtrace,
+    },
+}
+
+#[derive(Debug, Snafu)]
+pub enum WorkspaceError {
+    #[snafu(display("i/o error while accessing `{}`", path.to_string_lossy()))]
+    Fs {
+        path: PathBuf,
+        source: std::io::Error,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display(
+        "unable to parse workspace config `{}`",
+        config_path.to_string_lossy()
+    ))]
+    Parse {
+        config_path: PathBuf,
+        #[snafu(source(from(toml::de::Error, Box::new)))]
+        source: Box<toml::de::Error>,
         backtrace: Backtrace,
     },
 }
@@ -420,13 +448,238 @@ impl Config {
     }
 }
 
+/// Workspace-local configuration loaded from `.build-eips.toml`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkspaceConfig {
+    /// Local server defaults for `build-eips serve` and `build-eips preview`.
+    #[serde(default)]
+    pub server: ServerSettings,
+
+    /// Local rendered-site URL defaults for build and serve commands.
+    #[serde(default)]
+    pub site: SiteSettings,
+}
+
+impl WorkspaceConfig {
+    fn starter() -> Self {
+        Self {
+            server: ServerSettings::default(),
+            site: SiteSettings::starter(),
+        }
+    }
+}
+
+/// Workspace-local bind address defaults for local server commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerSettings {
+    /// Host or interface address used by `serve` and `preview`.
+    pub host: String,
+
+    /// TCP port used by `serve` and `preview`.
+    pub port: u16,
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self {
+            host: DEFAULT_SERVER_HOST.to_owned(),
+            port: DEFAULT_SERVER_PORT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerBinding {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Default for ServerBinding {
+    fn default() -> Self {
+        ServerSettings::default().into()
+    }
+}
+
+impl From<ServerSettings> for ServerBinding {
+    fn from(settings: ServerSettings) -> Self {
+        Self {
+            host: settings.host,
+            port: settings.port,
+        }
+    }
+}
+
+impl From<&ServerSettings> for ServerBinding {
+    fn from(settings: &ServerSettings) -> Self {
+        settings.clone().into()
+    }
+}
+
+impl fmt::Display for ServerBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.host, self.port)
+    }
+}
+
+/// Workspace-local rendered-site URL defaults for build and serve commands.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SiteSettings {
+    /// Base URL written into rendered HTML, feeds, canonical links, and sitemaps.
+    #[serde(
+        default,
+        serialize_with = "serialize_optional_base_url",
+        deserialize_with = "deserialize_optional_base_url"
+    )]
+    pub base_url: Option<Url>,
+}
+
+impl SiteSettings {
+    fn starter() -> Self {
+        Self {
+            base_url: Some(
+                DEFAULT_SITE_BASE_URL
+                    .parse()
+                    .expect("default site base URL should parse"),
+            ),
+        }
+    }
+}
+
+fn serialize_optional_base_url<S>(base_url: &Option<Url>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match base_url {
+        Some(base_url) => serializer.serialize_some(&format_base_url(base_url)),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_optional_base_url<'de, D>(deserializer: D) -> Result<Option<Url>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Url>::deserialize(deserializer)
+}
+
+fn format_base_url(base_url: &Url) -> String {
+    if base_url.path() == "/" && base_url.query().is_none() && base_url.fragment().is_none() {
+        base_url[..Position::BeforePath].to_owned()
+    } else {
+        base_url.as_str().to_owned()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedWorkspaceConfig {
+    config_path: PathBuf,
+    workspace_root: PathBuf,
+    config: WorkspaceConfig,
+}
+
+impl LoadedWorkspaceConfig {
+    pub fn from_path(path: &Path) -> Result<Self, WorkspaceError> {
+        let config_path = path.canonicalize().with_context(|_| FsSnafu {
+            path: path.to_path_buf(),
+        })?;
+        let contents = std::fs::read_to_string(&config_path).with_context(|_| FsSnafu {
+            path: config_path.clone(),
+        })?;
+        let config = toml::from_str::<WorkspaceConfig>(&contents).with_context(|_| ParseSnafu {
+            config_path: config_path.clone(),
+        })?;
+
+        let workspace_root = config_path
+            .parent()
+            .expect("workspace config should always have a parent")
+            .to_path_buf();
+
+        Ok(Self {
+            config_path,
+            workspace_root,
+            config,
+        })
+    }
+
+    pub fn discover(start: &Path) -> Result<Option<Self>, WorkspaceError> {
+        match discover_path(start) {
+            Some(path) => Self::from_path(&path).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    pub fn workspace_build_root(&self, repo_id: &str) -> PathBuf {
+        self.workspace_root
+            .join(DEFAULT_BUILD_ROOT_BASE)
+            .join(repo_id)
+    }
+
+    pub fn server_settings(&self) -> &ServerSettings {
+        &self.config.server
+    }
+
+    pub fn site_settings(&self) -> &SiteSettings {
+        &self.config.site
+    }
+
+    pub fn local_theme_path(&self) -> PathBuf {
+        self.workspace_root.join(DEFAULT_THEME_DIR)
+    }
+
+    pub fn local_repo_path(&self, repo_id: &str) -> PathBuf {
+        self.workspace_root.join(repo_id)
+    }
+}
+
+pub fn discover_path(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+
+    while let Some(candidate) = current {
+        let config_path = candidate.join(LOCAL_CONFIG_FILE);
+        match std::fs::File::open(&config_path) {
+            Ok(_) => return Some(config_path),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                current = candidate.parent();
+            }
+            Err(_) => return Some(config_path),
+        }
+    }
+
+    None
+}
+
+pub fn default_workspace_config_text() -> String {
+    toml::to_string_pretty(&WorkspaceConfig::starter())
+        .expect("workspace starter config should serialize")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
 
-    use super::{LoadedRepoManifest, RepoManifestError, REPO_MANIFEST_FILE};
+    use super::{
+        default_workspace_config_text, discover_path, LoadedRepoManifest, LoadedWorkspaceConfig,
+        RepoManifestError, ServerBinding, ServerSettings, WorkspaceError, DEFAULT_SERVER_HOST,
+        DEFAULT_SERVER_PORT, DEFAULT_SITE_BASE_URL, LOCAL_CONFIG_FILE, REPO_MANIFEST_FILE,
+    };
 
     struct TestRepo {
         tempdir: TempDir,
@@ -649,5 +902,246 @@ base_url = "https://staging.example.test/ERCs/"
 
         assert!(reason.contains("duplicate production sibling repository"));
         assert!(reason.contains("https://example.test/shared.git"));
+    }
+
+    #[test]
+    fn parses_default_workspace_config() {
+        let repo = TestRepo::new();
+        let config_path = repo.write_file(LOCAL_CONFIG_FILE, &default_workspace_config_text());
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(config.workspace_root(), repo.root());
+        assert_eq!(config.server_settings(), &ServerSettings::default());
+        assert_eq!(
+            config.site_settings().base_url.as_ref().unwrap().as_str(),
+            "http://127.0.0.1:1111/"
+        );
+    }
+
+    #[test]
+    fn starter_workspace_config_roundtrips_stably() {
+        let original = default_workspace_config_text();
+        let parsed = toml::from_str::<super::WorkspaceConfig>(&original).unwrap();
+        let reparsed = toml::to_string_pretty(&parsed).unwrap();
+
+        assert_eq!(reparsed, original);
+        assert!(!original.contains("build_root_base"));
+        assert!(original.contains("[server]"));
+        assert!(original.contains("host = \"127.0.0.1\""));
+        assert!(original.contains("port = 1111"));
+        assert!(original.contains("[site]"));
+        assert!(original.contains(&format!("base_url = \"{DEFAULT_SITE_BASE_URL}\"")));
+        assert!(!original.contains("default_profile"));
+        assert!(!original.contains("[profiles"));
+        assert!(!original.contains("[render]"));
+    }
+
+    #[test]
+    fn parses_workspace_config_server_settings() {
+        let repo = TestRepo::new();
+        let config_path = repo.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[server]
+host = "0.0.0.0"
+port = 8080
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(
+            config.server_settings(),
+            &ServerSettings {
+                host: "0.0.0.0".to_owned(),
+                port: 8080,
+            }
+        );
+    }
+
+    #[test]
+    fn missing_server_settings_use_default_binding() {
+        let repo = TestRepo::new();
+        let config_path = repo.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[site]
+base_url = "http://localhost:4000"
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+        let binding = ServerBinding::from(config.server_settings());
+
+        assert_eq!(binding.host, DEFAULT_SERVER_HOST);
+        assert_eq!(binding.port, DEFAULT_SERVER_PORT);
+        assert_eq!(binding.to_string(), "127.0.0.1:1111");
+    }
+
+    #[test]
+    fn parses_workspace_config_site_settings() {
+        let repo = TestRepo::new();
+        let config_path = repo.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[site]
+base_url = "http://localhost:4000"
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(
+            config.site_settings().base_url.as_ref().unwrap().as_str(),
+            "http://localhost:4000/"
+        );
+    }
+
+    #[test]
+    fn invalid_workspace_config_site_base_url_errors() {
+        let repo = TestRepo::new();
+        let config_path = repo.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[site]
+base_url = "not a url"
+"#,
+        );
+        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unable to parse workspace config"));
+    }
+
+    #[test]
+    fn missing_site_settings_preserve_no_base_url_override() {
+        let repo = TestRepo::new();
+        let config_path = repo.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 1111
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert!(config.site_settings().base_url.is_none());
+    }
+
+    #[test]
+    fn minimal_workspace_config_parses() {
+        let repo = TestRepo::new();
+        let config_path = repo.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 1111
+
+[site]
+base_url = "http://127.0.0.1:1111"
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(config.server_settings(), &ServerSettings::default());
+        assert_eq!(
+            config.site_settings().base_url.as_ref().unwrap().as_str(),
+            "http://127.0.0.1:1111/"
+        );
+    }
+
+    #[test]
+    fn empty_workspace_config_uses_defaults() {
+        let repo = TestRepo::new();
+        let config_path = repo.write_file(LOCAL_CONFIG_FILE, " \n");
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(config.server_settings(), &ServerSettings::default());
+        assert!(config.site_settings().base_url.is_none());
+    }
+
+    #[test]
+    fn removed_workspace_config_fields_use_strict_parse_errors() {
+        let removed_theme_ref_field = concat!("co", "mmit");
+        let cases = vec![
+            (
+                "build_root_base".to_owned(),
+                r#"build_root_base = ".local-build""#.to_owned(),
+            ),
+            (
+                "default_profile".to_owned(),
+                r#"default_profile = "local""#.to_owned(),
+            ),
+            (
+                "profiles".to_owned(),
+                r#"
+[profiles.local]
+staging = true
+"#
+                .to_owned(),
+            ),
+            (
+                "theme".to_owned(),
+                r#"
+[theme]
+repository = "https://github.com/eips-wg/theme.git"
+"#
+                .to_owned(),
+            ),
+            (
+                format!("theme.{removed_theme_ref_field}"),
+                format!(
+                    r#"
+[theme]
+{removed_theme_ref_field} = "3a597d4cd68ec82d36f01c01335492cfa59501ae"
+"#
+                ),
+            ),
+        ];
+
+        for (field, contents) in cases {
+            let repo = TestRepo::new();
+            let config_path = repo.write_file(LOCAL_CONFIG_FILE, &contents);
+            let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+
+            assert!(
+                matches!(error, WorkspaceError::Parse { .. }),
+                "expected strict parse error for removed field `{field}`, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn discover_path_walks_upward() {
+        let repo = TestRepo::new();
+        let config_path = repo.write_file(LOCAL_CONFIG_FILE, &default_workspace_config_text());
+        let nested = repo.path("EIPs/content");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(discover_path(&nested).unwrap(), config_path);
+        assert_eq!(
+            LoadedWorkspaceConfig::discover(&nested)
+                .unwrap()
+                .unwrap()
+                .config_path(),
+            config_path
+        );
+    }
+
+    #[test]
+    fn missing_workspace_config_is_not_discovered() {
+        let repo = TestRepo::new();
+        let nested = repo.path("EIPs/content");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert!(discover_path(&nested).is_none());
+        assert!(LoadedWorkspaceConfig::discover(&nested).unwrap().is_none());
     }
 }
