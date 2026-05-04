@@ -38,7 +38,10 @@ use walkdir::WalkDir;
 
 use iref::IriRefBuf;
 
-use crate::progress::ProgressIteratorExt;
+use crate::{
+    progress::ProgressIteratorExt,
+    proposal::{OnlyRenderPlan, ProposalNumber, ProposalReference},
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Author {
@@ -232,7 +235,7 @@ fn extract_authors(value: &str) -> Result<Vec<Author>, Whatever> {
     Ok(authors)
 }
 
-pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
+pub fn preprocess(root_path: &Path, only_plan: Option<&OnlyRenderPlan>) -> Result<(), Whatever> {
     let dir = std::fs::read_dir(root_path).with_whatever_context(|_| {
         format!("could not read directory `{}`", root_path.to_string_lossy())
     })?;
@@ -268,10 +271,46 @@ pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
         }
 
         if file_type.is_dir() {
-            process_eip(root_path, &entry_path.join("index.md"))?;
-            process_assets(root_path, &entry_path)?;
+            let relative_path = entry_path
+                .strip_prefix(root_path)
+                .with_whatever_context(|_| {
+                    format!(
+                        "content directory entry `{}` is outside `{}`",
+                        entry_path.to_string_lossy(),
+                        root_path.to_string_lossy()
+                    )
+                })?;
+            if only_plan
+                .map(|plan| plan.should_process_proposal_dir(relative_path))
+                .unwrap_or(true)
+            {
+                let index_path = entry_path.join("index.md");
+                if let Some(plan) = only_plan {
+                    let index_relative_path = relative_path.join("index.md");
+                    if plan.should_preprocess_markdown(&index_relative_path) {
+                        process_eip(root_path, &index_path, only_plan)?;
+                    }
+                } else {
+                    process_eip(root_path, &index_path, only_plan)?;
+                }
+                process_assets(root_path, &entry_path, only_plan)?;
+            }
         } else if entry_path.extension().and_then(OsStr::to_str) == Some("md") {
-            process_eip(root_path, &entry_path)?;
+            let relative_path = entry_path
+                .strip_prefix(root_path)
+                .with_whatever_context(|_| {
+                    format!(
+                        "content file `{}` is outside `{}`",
+                        entry_path.to_string_lossy(),
+                        root_path.to_string_lossy()
+                    )
+                })?;
+            if only_plan
+                .map(|plan| plan.should_preprocess_markdown(relative_path))
+                .unwrap_or(true)
+            {
+                process_eip(root_path, &entry_path, only_plan)?;
+            }
         }
     }
 
@@ -336,6 +375,7 @@ fn canonicalize_md(path: &Path) -> Result<PathBuf, Whatever> {
 fn fix_links<'a, 'b>(
     root: &'a Path,
     parent: &'a Path,
+    only_plan: Option<&'a OnlyRenderPlan>,
     mut e: Event<'b>,
 ) -> Result<Event<'b>, Whatever> {
     match &mut e {
@@ -351,6 +391,31 @@ fn fix_links<'a, 'b>(
 
             if !iri_ref.path().ends_with(".md") {
                 // Only markdown files need the `@` syntax.
+                return Ok(e);
+            }
+
+            let iri_path: &str = iri_ref.path().as_ref();
+            let child = if iri_path.starts_with("/") {
+                let mut path = Path::new(iri_path);
+                path = path.strip_prefix("/").unwrap();
+                root.join(path)
+            } else {
+                parent.join(Path::new(iri_path))
+            };
+            let canonicalized = canonicalize_md(&child)?;
+            if let Some(public_url) =
+                only_plan.and_then(|plan| plan.external_url_for_canonical_target(&canonicalized))
+            {
+                let mut external_url = public_url.to_owned();
+                if let Some(query) = iri_ref.query() {
+                    external_url.push('?');
+                    external_url.push_str(query.as_str());
+                }
+                if let Some(fragment) = iri_ref.fragment() {
+                    external_url.push('#');
+                    external_url.push_str(fragment.as_str());
+                }
+                *dest_url = CowStr::from(external_url);
                 return Ok(e);
             }
 
@@ -429,7 +494,12 @@ impl RenderCsl {
     }
 }
 
-fn transform_markdown(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
+fn transform_markdown(
+    root: &Path,
+    path: &Path,
+    body: &str,
+    only_plan: Option<&OnlyRenderPlan>,
+) -> Result<String, Whatever> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_FOOTNOTES);
@@ -441,7 +511,7 @@ fn transform_markdown(root: &Path, path: &Path, body: &str) -> Result<String, Wh
     let mut csl = RenderCsl { contents: None };
 
     let events = Parser::new_ext(body, opts)
-        .map(|e| fix_links(root, parent, e))
+        .map(|e| fix_links(root, parent, only_plan, e))
         .filter_map(|r| match r {
             Ok(e) => csl.render_csl(e).transpose(),
             err => Some(err),
@@ -456,7 +526,11 @@ fn transform_markdown(root: &Path, path: &Path, body: &str) -> Result<String, Wh
     Ok(output)
 }
 
-fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
+fn process_assets(
+    root: &Path,
+    path: &Path,
+    only_plan: Option<&OnlyRenderPlan>,
+) -> Result<(), Whatever> {
     let canon_root = std::fs::canonicalize(root).whatever_context("could not canonicalize root")?;
     let number_txt = path
         .file_name()
@@ -516,12 +590,13 @@ fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
             format!("could not read file `{}`", path.to_string_lossy())
         })?;
 
-        let contents = transform_markdown(root, path, &contents).with_whatever_context(|_| {
-            format!(
-                "unable to transform markdown for `{}`",
-                path.to_string_lossy()
-            )
-        })?;
+        let contents =
+            transform_markdown(root, path, &contents, only_plan).with_whatever_context(|_| {
+                format!(
+                    "unable to transform markdown for `{}`",
+                    path.to_string_lossy()
+                )
+            })?;
 
         let relative_path = path.strip_prefix(&assets_dir).unwrap();
         let relative_path = relative_path.with_file_name(relative_path.file_stem().unwrap());
@@ -556,7 +631,11 @@ fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
     Ok(())
 }
 
-fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
+fn process_eip(
+    root: &Path,
+    path: &Path,
+    only_plan: Option<&OnlyRenderPlan>,
+) -> Result<(), Whatever> {
     let path_lossy = path.to_string_lossy();
     let contents = read_to_string(path)
         .with_whatever_context(|_| format!("could not read file `{}`", path_lossy))?;
@@ -564,7 +643,7 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
     let (preamble, body) = Preamble::split(&contents)
         .with_whatever_context(|_| format!("couldn't split preamble for `{}`", path_lossy))?;
 
-    let body = transform_markdown(root, path, body)
+    let body = transform_markdown(root, path, body, only_plan)
         .with_whatever_context(|_| format!("unable to transform markdown for `{path_lossy}`"))?;
 
     let preamble = Preamble::parse(Some(&path_lossy), preamble)
@@ -654,8 +733,24 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
                     .whatever_context("could not parse requires")?
                     .into_iter()
                     .map(|eip| {
-                        let path = format!("/{eip:0>5}.md");
-                        path_to_at(root, root, &path)
+                        let proposal_number = match ProposalNumber::from_u32(eip) {
+                            Ok(proposal_number) => proposal_number,
+                            Err(()) => snafu::whatever!("could not parse requires"),
+                        };
+                        match only_plan {
+                            Some(plan) => {
+                                match plan.reference_for_required_number(proposal_number)? {
+                                    ProposalReference::Internal(path) => Ok(path),
+                                    ProposalReference::External(public_url) => {
+                                        Ok(public_url.to_owned())
+                                    }
+                                }
+                            }
+                            None => {
+                                let path = format!("/{eip:0>5}.md");
+                                path_to_at(root, root, &path)
+                            }
+                        }
                     })
                     .collect::<Result<_, _>>()?;
                 front_matter
@@ -672,4 +767,223 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
     write_file(Path::new(&path), front_matter, &body).whatever_context("couldn't write file")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    use git2::{IndexAddOption, Repository, Signature};
+    use snafu::Report;
+    use tempfile::TempDir;
+    use toml::Value as TomlValue;
+
+    use super::preprocess;
+    use crate::proposal::{OnlyRenderPlan, ProposalNumber};
+
+    fn number(value: u32) -> ProposalNumber {
+        ProposalNumber::from_u32(value).unwrap()
+    }
+
+    fn write_file(root: &Path, relative: &str, contents: impl AsRef<str>) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents.as_ref()).unwrap();
+    }
+
+    fn commit_all(repo: &Repository) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["content"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("build-eips test", "build-eips@example.test").unwrap();
+
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+    }
+
+    fn content_repo(files: &[(&str, String)]) -> (TempDir, PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path().join("repo");
+        let content_root = repo_root.join("content");
+        std::fs::create_dir_all(&content_root).unwrap();
+        let repo = Repository::init(&repo_root).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+
+        for (relative, contents) in files {
+            write_file(&content_root, relative, contents);
+        }
+
+        commit_all(&repo);
+        (temp, content_root)
+    }
+
+    fn proposal_markdown(
+        proposal_number: u32,
+        category: Option<&str>,
+        extra_preamble: &str,
+        body: &str,
+    ) -> String {
+        let category = category
+            .map(|category| format!("category: {category}\n"))
+            .unwrap_or_default();
+        format!(
+            "---\neip: {proposal_number}\ntitle: Proposal {proposal_number}\n{category}{extra_preamble}---\n{body}\n"
+        )
+    }
+
+    fn only_plan(content_root: &Path, selected: &[u32]) -> OnlyRenderPlan {
+        let selected = selected
+            .iter()
+            .copied()
+            .map(number)
+            .collect::<BTreeSet<_>>();
+        OnlyRenderPlan::build(content_root, selected).unwrap()
+    }
+
+    fn rendered_body(path: &Path) -> String {
+        let contents = std::fs::read_to_string(path).unwrap();
+        contents.split_once("\n+++\n").unwrap().1.to_owned()
+    }
+
+    fn rendered_front_matter(path: &Path) -> TomlValue {
+        let contents = std::fs::read_to_string(path).unwrap();
+        let front_matter = contents
+            .strip_prefix("+++\n")
+            .unwrap()
+            .split_once("\n+++\n")
+            .unwrap()
+            .0;
+        toml::from_str(front_matter).unwrap()
+    }
+
+    #[test]
+    fn targeted_preprocess_rewrites_selected_body_links_to_unselected_public_urls() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "See [ERC-678](/00678.md)."),
+            ),
+            (
+                "00678.md",
+                proposal_markdown(678, Some("ERC"), "", "Target."),
+            ),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("https://ercs.ethereum.org/ERCS/erc-678"));
+        assert!(!body.contains("@/00678.md"));
+    }
+
+    #[test]
+    fn targeted_preprocess_rewrites_retained_non_proposal_links_to_public_urls() {
+        let (_temp, content) = content_repo(&[
+            (
+                "_index.md",
+                "---\ntitle: Home\n---\nSee [EIP-678](/00678.md).\n".to_owned(),
+            ),
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            ("00678.md", proposal_markdown(678, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("_index.md"));
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-678"));
+        assert!(!body.contains("@/00678.md"));
+    }
+
+    #[test]
+    fn targeted_preprocess_preserves_query_and_fragment_on_external_links() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(
+                    555,
+                    None,
+                    "",
+                    "See [Fragment](./00155.md#list-of-chain-id-s).\nSee [Query](./00155.md?foo=bar#list-of-chain-id-s).",
+                ),
+            ),
+            ("00155.md", proposal_markdown(155, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-155#list-of-chain-id-s"));
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-155?foo=bar#list-of-chain-id-s"));
+    }
+
+    #[test]
+    fn targeted_preprocess_rewrites_requires_to_unselected_public_urls() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "requires: 678\n", "Selected."),
+            ),
+            (
+                "00678.md",
+                proposal_markdown(678, Some("ERC"), "", "Target."),
+            ),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        let requires = front_matter["extra"]["requires"].as_array().unwrap();
+        assert_eq!(
+            requires[0].as_str().unwrap(),
+            "https://ercs.ethereum.org/ERCS/erc-678"
+        );
+    }
+
+    #[test]
+    fn targeted_preprocess_keeps_internal_references_between_selected_proposals() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "requires: 678\n", "See [EIP-678](/00678.md)."),
+            ),
+            (
+                "00678.md",
+                proposal_markdown(678, Some("ERC"), "", "Target."),
+            ),
+        ]);
+        let plan = only_plan(&content, &[555, 678]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        let requires = front_matter["extra"]["requires"].as_array().unwrap();
+        assert!(body.contains("@/00678.md"));
+        assert_eq!(requires[0].as_str().unwrap(), "@/00678.md");
+    }
+
+    #[test]
+    fn targeted_preprocess_does_not_mask_missing_body_link_targets() {
+        let (_temp, content) = content_repo(&[(
+            "00555.md",
+            proposal_markdown(555, None, "", "See [Missing](/00678.md)."),
+        )]);
+        let plan = only_plan(&content, &[555]);
+
+        let error = Report::from_error(preprocess(&content, Some(&plan)).unwrap_err()).to_string();
+
+        assert!(error.contains("could not canonicalize"));
+        assert!(error.contains("00678.md"));
+    }
 }
