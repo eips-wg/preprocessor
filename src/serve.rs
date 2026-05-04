@@ -140,7 +140,7 @@ fn sync_dirty_serve_state(
 
     git::sync_materialized_paths(source_root, build_repo_path, &affected_paths)
         .whatever_context("unable to synchronize tracked paths into the materialized repo")?;
-    markdown::preprocess(&build_repo_path.join(CONTENT_DIR))
+    markdown::preprocess(&build_repo_path.join(CONTENT_DIR), None)
         .whatever_context("unable to preprocess synchronized markdown during dirty serve")?;
 
     info!(

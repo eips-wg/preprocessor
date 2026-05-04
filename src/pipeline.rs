@@ -17,6 +17,7 @@ use crate::{
     git,
     layout::{mounted_theme_path, output_path, CONTENT_DIR, REPO_DIR},
     markdown,
+    proposal::OnlyRenderPlan,
     serve::{serve_sync_config, DirtyServeWatcher, LocalThemeServeSync},
     zola,
 };
@@ -71,6 +72,7 @@ pub(crate) struct Prepared {
     repository_use: git::RepositoryUse,
     theme_path: PathBuf,
     local_theme_sync: Option<LocalThemeServeSync>,
+    only_plan: Option<OnlyRenderPlan>,
     source_root: PathBuf,
     source_materialization: git::SourceMaterialization,
     server_binding: ServerBinding,
@@ -86,6 +88,7 @@ impl Prepared {
             build_path,
             repository_use,
             theme_path,
+            only,
             source_materialization,
             server_binding,
             base_url_override,
@@ -104,7 +107,17 @@ impl Prepared {
             source_materialization,
         )?;
 
-        markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
+        let only_plan = only
+            .map(|selected_numbers| OnlyRenderPlan::build(&content_path, selected_numbers))
+            .transpose()
+            .whatever_context("unable to build targeted render plan")?;
+        markdown::preprocess(&content_path, only_plan.as_ref())
+            .whatever_context("unable to preprocess markdown")?;
+        if let Some(only_plan) = &only_plan {
+            only_plan
+                .prune_content(&content_path)
+                .whatever_context("unable to prune unselected proposals")?;
+        }
         let (theme_path, local_theme_sync) = prepare_theme_for_zola(theme_path, &repo_path)?;
 
         Ok(Prepared {
@@ -113,6 +126,7 @@ impl Prepared {
             local_theme_sync: Some(local_theme_sync),
             repo_path,
             output_path,
+            only_plan,
             source_root: root_path,
             source_materialization,
             server_binding,

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use url::Url;
 
-use crate::{lint, print};
+use crate::{lint, print, proposal::ProposalNumber};
 
 /// Build script for Ethereum EIPs and ERCs.
 #[derive(Parser, Debug)]
@@ -66,6 +66,13 @@ pub(crate) struct CleanCliArgs {
     pub(crate) clean: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+pub(crate) struct OnlyCliArgs {
+    /// Render only the selected proposal number(s)
+    #[arg(long, value_name = "NUMBER", value_parser = ProposalNumber::parse_cli_selector, num_args = 1..)]
+    pub(crate) only: Vec<ProposalNumber>,
+}
+
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum Operation {
     /// Print linter schema metadata and lint configuration
@@ -81,6 +88,9 @@ pub(crate) enum Operation {
 
         #[command(flatten)]
         clean: CleanCliArgs,
+
+        #[command(flatten)]
+        only: OnlyCliArgs,
     },
 
     /// Serve the existing built output without rebuilding it
@@ -153,7 +163,7 @@ pub(crate) enum ProfiledOperation {
         base_url: BaseUrlCliArgs,
     },
 
-    /// Build the project and launch a web server to preview it
+    /// Build a fresh temporary site, serve it locally, and watch tracked edits
     Serve {
         #[command(flatten)]
         server: ServerCliArgs,
@@ -272,6 +282,22 @@ impl Operation {
         }
     }
 
+    pub(crate) fn only_cli_args(&self) -> Option<&OnlyCliArgs> {
+        match self {
+            Self::Build { only, .. } => Some(only),
+            Self::Print { .. }
+            | Self::Preview { .. }
+            | Self::Serve { .. }
+            | Self::Clean
+            | Self::Check { .. }
+            | Self::Changed { .. }
+            | Self::Editorial { .. }
+            | Self::Init { .. }
+            | Self::Doctor
+            | Self::Parity { .. } => None,
+        }
+    }
+
     pub(crate) fn is_plain_site_command(&self) -> bool {
         matches!(
             self,
@@ -315,14 +341,14 @@ impl ProfiledOperation {
     fn server_cli_args(&self) -> ServerCliArgs {
         match self {
             Self::Serve { server, .. } => server.clone(),
-            Self::Build { .. } | Self::Check { .. } => ServerCliArgs::default(),
+            Self::Build { .. } | Self::Check => ServerCliArgs::default(),
         }
     }
 
     fn base_url_cli_args(&self) -> BaseUrlCliArgs {
         match self {
             Self::Build { base_url, .. } | Self::Serve { base_url, .. } => base_url.clone(),
-            Self::Check { .. } => BaseUrlCliArgs::default(),
+            Self::Check => BaseUrlCliArgs::default(),
         }
     }
 
@@ -382,6 +408,8 @@ impl EditorialSelectorArgs {
 mod tests {
     use clap::Parser;
 
+    use crate::proposal::ProposalNumber;
+
     use super::{Args, EditorialCommand, Operation, ProfiledOperation, RuntimeOperation};
 
     fn parse_args(arguments: &[&str]) -> Args {
@@ -418,6 +446,54 @@ mod tests {
         assert!(error
             .to_string()
             .contains(&format!("unexpected argument '{removed_flag}'")));
+    }
+
+    #[test]
+    fn only_flag_parses_one_or_more_proposal_numbers_on_build() {
+        let one = parse_args(&["build-eips", "build", "--only", "00555"]);
+        let many = parse_args(&["build-eips", "build", "--only", "555", "678", "897"]);
+
+        match one.operation {
+            Operation::Build { only, .. } => {
+                assert_eq!(only.only, vec![ProposalNumber::from_u32(555).unwrap()]);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        match many.operation {
+            Operation::Build { only, .. } => {
+                assert_eq!(
+                    only.only,
+                    vec![
+                        ProposalNumber::from_u32(555).unwrap(),
+                        ProposalNumber::from_u32(678).unwrap(),
+                        ProposalNumber::from_u32(897).unwrap(),
+                    ]
+                );
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_flag_rejects_invalid_selectors_and_non_build_commands() {
+        for selector in [
+            "+555",
+            "0",
+            "-555",
+            "abc",
+            "555,678",
+            "content/00555.md",
+            "4294967296",
+        ] {
+            assert!(
+                Args::try_parse_from(["build-eips", "build", "--only", selector]).is_err(),
+                "expected `{selector}` to be rejected"
+            );
+        }
+
+        assert!(Args::try_parse_from(["build-eips", "serve", "--only", "555"]).is_err());
+        assert!(Args::try_parse_from(["build-eips", "check", "--only", "555"]).is_err());
+        assert!(Args::try_parse_from(["build-eips", "parity", "build", "--only", "555"]).is_err());
     }
 
     #[test]
