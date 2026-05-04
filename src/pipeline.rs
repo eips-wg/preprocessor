@@ -13,18 +13,33 @@ use url::Url;
 
 use crate::{
     changed,
+    config::ServerBinding,
     execution::ResolvedExecution,
     git,
     layout::{mounted_theme_path, output_path, CONTENT_DIR, REPO_DIR},
-    lint, markdown, zola,
+    lint, markdown,
+    serve::{serve_sync_config, DirtyServeWatcher, LocalThemeServeSync},
+    zola,
 };
 
-fn prepare_theme_for_zola(theme_path: PathBuf, repo_path: &Path) -> Result<PathBuf, Whatever> {
+fn prepare_theme_for_zola(
+    theme_path: PathBuf,
+    repo_path: &Path,
+) -> Result<(PathBuf, LocalThemeServeSync), Whatever> {
     let mounted_theme_dir = mounted_theme_path(repo_path);
     git::materialize_working_tree(&theme_path, &mounted_theme_dir)
         .whatever_context("unable to materialize workspace-local theme")?;
+    let theme_index_path = git::index_path(&theme_path)
+        .whatever_context("unable to resolve workspace-local theme Git index path")?;
 
-    Ok(mounted_theme_dir)
+    Ok((
+        mounted_theme_dir.clone(),
+        LocalThemeServeSync {
+            theme_source_root: theme_path,
+            mounted_theme_dir,
+            theme_index_path,
+        },
+    ))
 }
 
 #[derive(Debug)]
@@ -33,6 +48,10 @@ pub(crate) struct Prepared {
     output_path: PathBuf,
     repository_use: git::RepositoryUse,
     theme_path: PathBuf,
+    local_theme_sync: Option<LocalThemeServeSync>,
+    source_root: PathBuf,
+    source_materialization: git::SourceMaterialization,
+    server_binding: ServerBinding,
     base_url_override: Option<Url>,
 }
 
@@ -49,6 +68,7 @@ impl Prepared {
             repository_use,
             theme_path,
             source_materialization,
+            server_binding,
             base_url_override,
         } = resolved;
         let theme_path =
@@ -85,13 +105,17 @@ impl Prepared {
             .whatever_context("linting failed")?;
 
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
-        let theme_path = prepare_theme_for_zola(theme_path, &repo_path)?;
+        let (theme_path, local_theme_sync) = prepare_theme_for_zola(theme_path, &repo_path)?;
 
         Ok(Prepared {
             repository_use,
             theme_path,
+            local_theme_sync: Some(local_theme_sync),
             repo_path,
             output_path,
+            source_root: root_path,
+            source_materialization,
+            server_binding,
             base_url_override,
         })
     }
@@ -112,9 +136,35 @@ impl Prepared {
     }
 
     pub(crate) fn serve(self) -> Result<(), Whatever> {
-        zola::serve(&self.theme_path, &self.repo_path, &self.output_path)
-            .whatever_context("zola serve failed")?;
-        Ok(())
+        let sync_config = serve_sync_config(
+            self.source_materialization,
+            &self.source_root,
+            &self.repo_path,
+            self.local_theme_sync.clone(),
+        );
+        let dirty_watcher = if sync_config.has_targets() {
+            Some(
+                DirtyServeWatcher::start(sync_config)
+                    .whatever_context("unable to start dirty serve watcher")?,
+            )
+        } else {
+            None
+        };
+
+        let result = zola::serve(
+            &self.theme_path,
+            &self.repo_path,
+            &self.output_path,
+            &self.server_binding,
+            self.base_url_override.as_ref(),
+        )
+        .whatever_context("zola serve failed");
+
+        if let Some(dirty_watcher) = dirty_watcher {
+            dirty_watcher.stop();
+        }
+
+        result
     }
 
     pub(crate) fn check(self) -> Result<(), Whatever> {
@@ -195,7 +245,7 @@ mod tests {
         );
         let repo_path = temp.path().join("workspace/.local-build/Core/repo");
 
-        let theme_path = prepare_theme_for_zola(theme_root, &repo_path).unwrap();
+        let (theme_path, sync) = prepare_theme_for_zola(theme_root.clone(), &repo_path).unwrap();
 
         let mounted_theme_dir = mounted_theme_path(&repo_path);
         assert_eq!(theme_path, mounted_theme_dir);
@@ -207,5 +257,8 @@ mod tests {
             std::fs::read_to_string(mounted_theme_dir.join("templates/index.html")).unwrap(),
             "local theme\n"
         );
+        assert_eq!(sync.theme_source_root, theme_root);
+        assert_eq!(sync.mounted_theme_dir, mounted_theme_dir);
+        assert!(sync.theme_index_path.ends_with(".git/index"));
     }
 }

@@ -19,6 +19,7 @@ mod markdown;
 mod pipeline;
 mod print;
 mod progress;
+mod serve;
 mod workspace;
 mod zola;
 

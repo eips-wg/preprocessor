@@ -42,6 +42,17 @@ pub(crate) struct Args {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+pub(crate) struct ServerCliArgs {
+    /// Host/interface for the local server to bind
+    #[arg(long)]
+    pub(crate) host: Option<String>,
+
+    /// Port for the local server to bind
+    #[arg(long)]
+    pub(crate) port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
 pub(crate) struct BaseUrlCliArgs {
     /// Override the rendered-site base URL for this command
     #[arg(long, value_parser = clap::value_parser!(Url))]
@@ -79,6 +90,9 @@ pub(crate) enum Operation {
     Serve {
         #[command(flatten)]
         eipw: lint::CmdArgs,
+
+        #[command(flatten)]
+        server: ServerCliArgs,
 
         #[command(flatten)]
         base_url: BaseUrlCliArgs,
@@ -145,6 +159,9 @@ pub(crate) enum ProfiledOperation {
         eipw: lint::CmdArgs,
 
         #[command(flatten)]
+        server: ServerCliArgs,
+
+        #[command(flatten)]
         base_url: BaseUrlCliArgs,
     },
 
@@ -173,6 +190,20 @@ pub(crate) enum RuntimeOperation {
 }
 
 impl Operation {
+    pub(crate) fn server_cli_args(&self) -> ServerCliArgs {
+        match self {
+            Self::Serve { server, .. } => server.clone(),
+            Self::Parity { command } => command.server_cli_args(),
+            Self::Print { .. }
+            | Self::Build { .. }
+            | Self::Clean
+            | Self::Check { .. }
+            | Self::Changed { .. }
+            | Self::Init { .. }
+            | Self::Doctor => ServerCliArgs::default(),
+        }
+    }
+
     pub(crate) fn base_url_cli_args(&self) -> BaseUrlCliArgs {
         match self {
             Self::Build { base_url, .. } | Self::Serve { base_url, .. } => base_url.clone(),
@@ -232,6 +263,13 @@ impl Operation {
 }
 
 impl ProfiledOperation {
+    fn server_cli_args(&self) -> ServerCliArgs {
+        match self {
+            Self::Serve { server, .. } => server.clone(),
+            Self::Build { .. } | Self::Check { .. } => ServerCliArgs::default(),
+        }
+    }
+
     fn base_url_cli_args(&self) -> BaseUrlCliArgs {
         match self {
             Self::Build { base_url, .. } | Self::Serve { base_url, .. } => base_url.clone(),
@@ -399,6 +437,34 @@ mod tests {
             &["build-eips", "clean", "--clean"][..],
         ] {
             assert!(Args::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn server_flags_parse_on_serve_forms() {
+        let cases: &[&[&str]] = &[
+            &["build-eips", "serve", "--host", "0.0.0.0", "--port", "8080"],
+            &[
+                "build-eips",
+                "parity",
+                "serve",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8080",
+            ],
+        ];
+
+        for arguments in cases {
+            let args = parse_args(arguments);
+            assert!(matches!(
+                args.operation.runtime_operation(),
+                Some(RuntimeOperation::Serve { .. })
+            ));
+            let server = args.operation.server_cli_args();
+
+            assert_eq!(server.host.as_deref(), Some("0.0.0.0"));
+            assert_eq!(server.port, Some(8080));
         }
     }
 

@@ -16,8 +16,8 @@ use snafu::{OptionExt, ResultExt, Whatever};
 use url::Url;
 
 use crate::{
-    cli::{Args, Operation},
-    config::{self, LoadedWorkspaceConfig},
+    cli::{Args, Operation, ServerCliArgs},
+    config::{self, LoadedWorkspaceConfig, ServerBinding},
     context::{resolve_input_path, root},
     git,
     identity::ActiveRepoIdentity,
@@ -31,6 +31,7 @@ pub(crate) struct ResolvedExecution {
     pub(crate) repository_use: git::RepositoryUse,
     pub(crate) theme_path: Option<PathBuf>,
     pub(crate) source_materialization: git::SourceMaterialization,
+    pub(crate) server_binding: ServerBinding,
     pub(crate) base_url_override: Option<Url>,
 }
 
@@ -275,6 +276,25 @@ fn resolve_theme_path(
     }
 }
 
+fn resolve_server_binding(
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+    server_cli: &ServerCliArgs,
+) -> ServerBinding {
+    let mut binding = workspace_config
+        .map(|workspace_config| ServerBinding::from(workspace_config.server_settings()))
+        .unwrap_or_default();
+
+    if let Some(host) = &server_cli.host {
+        binding.host = host.clone();
+    }
+
+    if let Some(port) = server_cli.port {
+        binding.port = port;
+    }
+
+    binding
+}
+
 fn resolve_base_url_override(
     args: &Args,
     workspace_config: Option<&LoadedWorkspaceConfig>,
@@ -336,6 +356,10 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
         repository_use,
         theme_path,
         source_materialization,
+        server_binding: resolve_server_binding(
+            workspace_config.as_ref(),
+            &args.operation.server_cli_args(),
+        ),
         base_url_override,
     })
 }
@@ -346,13 +370,14 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        cli::Args,
-        config::{self, LoadedWorkspaceConfig},
+        cli::{Args, ServerCliArgs},
+        config::{self, LoadedWorkspaceConfig, ServerBinding},
     };
 
     use super::{
         explicit_environment_or_parity, resolve_base_url_override, resolve_execution_settings,
-        validate_non_execution_command_flags, ExecutionSettings, SelectedSource,
+        resolve_server_binding, validate_non_execution_command_flags, ExecutionSettings,
+        SelectedSource,
     };
 
     fn parse_args(arguments: &[&str]) -> Args {
@@ -441,6 +466,59 @@ mod tests {
             let args = parse_args(arguments);
             assert_eq!(explicit_environment_or_parity(&args).unwrap(), *expected);
         }
+    }
+
+    #[test]
+    fn server_binding_resolution_uses_cli_config_then_defaults() {
+        assert_eq!(
+            resolve_server_binding(None, &Default::default()),
+            ServerBinding {
+                host: "127.0.0.1".to_owned(),
+                port: 1111,
+            }
+        );
+
+        let workspace_config = load_workspace_config(
+            r#"
+[server]
+host = "0.0.0.0"
+port = 8080
+"#,
+        );
+
+        assert_eq!(
+            resolve_server_binding(Some(&workspace_config), &Default::default()),
+            ServerBinding {
+                host: "0.0.0.0".to_owned(),
+                port: 8080,
+            }
+        );
+        assert_eq!(
+            resolve_server_binding(
+                Some(&workspace_config),
+                &ServerCliArgs {
+                    host: Some("127.0.0.1".to_owned()),
+                    port: Some(4000),
+                },
+            ),
+            ServerBinding {
+                host: "127.0.0.1".to_owned(),
+                port: 4000,
+            }
+        );
+        assert_eq!(
+            resolve_server_binding(
+                Some(&workspace_config),
+                &ServerCliArgs {
+                    host: None,
+                    port: Some(4000),
+                },
+            ),
+            ServerBinding {
+                host: "0.0.0.0".to_owned(),
+                port: 4000,
+            }
+        );
     }
 
     #[test]
