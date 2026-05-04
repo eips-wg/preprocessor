@@ -18,6 +18,7 @@ mod lint;
 mod markdown;
 mod print;
 mod progress;
+mod workspace;
 mod zola;
 
 use std::path::{Path, PathBuf};
@@ -31,6 +32,7 @@ use crate::{
     cli::{Args, Operation},
     config::Config,
     layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
+    workspace::init_workspace,
 };
 
 fn repository_use(config: &Config, root_path: &Path) -> Result<git::RepositoryUse, Whatever> {
@@ -186,6 +188,11 @@ fn run() -> Result<(), Whatever> {
         return Ok(());
     }
 
+    if let Operation::Init { path, template } = &args.operation {
+        init_workspace(&args, path.clone(), *template)?;
+        return Ok(());
+    }
+
     let config = if args.staging {
         Config::staging()
     } else {
@@ -199,6 +206,7 @@ fn run() -> Result<(), Whatever> {
 
     match args.operation {
         Operation::Print { .. } => unreachable!(),
+        Operation::Init { .. } => unreachable!(),
         Operation::Clean => {
             // TODO: There's a race condition here. Maybe we move the lockfile to the repository
             //       root?
