@@ -4,22 +4,23 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! Local workspace setup.
+//! Local workspace setup and diagnostics.
 
 use std::{
+    fmt,
     fs::OpenOptions,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
 };
 
 use log::info;
-use snafu::{ResultExt, Whatever};
+use snafu::{Report, ResultExt, Whatever};
 use url::Url;
 
 use crate::{
     cli::Args,
-    config,
-    context::{resolve_input_path, root},
+    config::{self, LoadedRepoManifest, LoadedWorkspaceConfig},
+    context::{load_workspace_command_context, resolve_input_path, root},
     git,
     identity::ActiveRepoIdentity,
 };
@@ -31,6 +32,384 @@ const WORKSPACE_DOC_FILE: &str = "WORKSPACE.md";
 struct WorkspaceInitRepositories<'a> {
     theme: &'a Url,
     template: &'a Url,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DoctorStatus {
+    Ok,
+    Warn,
+    Fail,
+}
+
+#[derive(Debug, Default)]
+struct DoctorReport {
+    warnings: usize,
+    failures: usize,
+}
+
+impl fmt::Display for DoctorStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        };
+
+        f.write_str(label)
+    }
+}
+
+impl DoctorReport {
+    fn record(&mut self, status: DoctorStatus, message: impl AsRef<str>) {
+        match status {
+            DoctorStatus::Ok => (),
+            DoctorStatus::Warn => self.warnings += 1,
+            DoctorStatus::Fail => self.failures += 1,
+        }
+
+        println!("[{status}] {}", message.as_ref());
+    }
+}
+
+fn command_path(command: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+
+    #[cfg(not(windows))]
+    let candidates = [command.to_owned()];
+
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+
+        let mut candidates = vec![command.to_owned()];
+        let command = OsString::from(command);
+        let path_exts = std::env::var_os("PATHEXT")
+            .unwrap_or_default()
+            .to_string_lossy()
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| format!("{}{}", command.to_string_lossy(), ext))
+            .collect::<Vec<_>>();
+        candidates.extend(path_exts);
+        std::env::split_paths(&path).find_map(|entry| {
+            candidates
+                .iter()
+                .map(|candidate| entry.join(candidate))
+                .find(|candidate| candidate.is_file())
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::env::split_paths(&path).find_map(|entry| {
+            candidates
+                .iter()
+                .map(|candidate| entry.join(candidate))
+                .find(|candidate| candidate.is_file())
+        })
+    }
+}
+
+fn check_workspace_repo(
+    report: &mut DoctorReport,
+    workspace_root: &Path,
+    name: &str,
+) -> Option<PathBuf> {
+    let path = workspace_root.join(name);
+    match git2::Repository::open(&path) {
+        Ok(_) => {
+            report.record(
+                DoctorStatus::Ok,
+                format!(
+                    "found workspace repo `{}` at `{}`",
+                    name,
+                    path.to_string_lossy()
+                ),
+            );
+            Some(path)
+        }
+        Err(_) if !path.exists() => {
+            report.record(
+                DoctorStatus::Fail,
+                format!(
+                    "expected workspace repo `{}` at `{}`",
+                    name,
+                    path.to_string_lossy()
+                ),
+            );
+            None
+        }
+        Err(_) => {
+            report.record(
+                DoctorStatus::Fail,
+                format!(
+                    "expected `{}` to be a git repository at `{}`",
+                    name,
+                    path.to_string_lossy()
+                ),
+            );
+            None
+        }
+    }
+}
+
+fn check_sibling_manifest_id(
+    report: &mut DoctorReport,
+    sibling_path: &Path,
+    expected_repo_id: &str,
+) {
+    match LoadedRepoManifest::load(sibling_path) {
+        Ok(Some(manifest)) if manifest.manifest().repo_id == expected_repo_id => report.record(
+            DoctorStatus::Ok,
+            format!("sibling `{expected_repo_id}` manifest repo_id matches workspace key"),
+        ),
+        Ok(Some(manifest)) => report.record(
+            DoctorStatus::Fail,
+            format!(
+                "sibling `{expected_repo_id}` manifest declares repo_id `{}`",
+                manifest.manifest().repo_id
+            ),
+        ),
+        Ok(None) => (),
+        Err(error) => report.record(
+            DoctorStatus::Fail,
+            format!(
+                "sibling `{expected_repo_id}` repo manifest could not be loaded: {}",
+                Report::from_error(error)
+            ),
+        ),
+    }
+}
+
+fn check_tool(report: &mut DoctorReport, command: &str, why: &str) -> bool {
+    match command_path(command) {
+        Some(path) => {
+            report.record(
+                DoctorStatus::Ok,
+                format!(
+                    "found required tool `{}` at `{}`",
+                    command,
+                    path.to_string_lossy()
+                ),
+            );
+            true
+        }
+        None => {
+            report.record(
+                DoctorStatus::Fail,
+                format!("missing required tool `{}`: {}", command, why),
+            );
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+fn check_default_windows_build_eips_path(report: &mut DoctorReport) {
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+
+    let install_dir = PathBuf::from(local_app_data).join("build-eips").join("bin");
+    let build_eips_path = install_dir.join("build-eips.exe");
+
+    if build_eips_path.is_file() {
+        report.record(
+            DoctorStatus::Warn,
+            format!(
+                "found build-eips at the default user-local install path `{}`, but `{}` is not on PATH",
+                build_eips_path.to_string_lossy(),
+                install_dir.to_string_lossy()
+            ),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn check_default_windows_build_eips_path(_report: &mut DoctorReport) {}
+
+fn collect_doctor_report(args: &Args, check_tools: bool) -> Result<DoctorReport, Whatever> {
+    let context = load_workspace_command_context(args)?;
+    let mut report = DoctorReport::default();
+    let (root_path, active_repo) = match root(args) {
+        Ok(root_path) => match ActiveRepoIdentity::load(&root_path) {
+            Ok(active_repo) => {
+                report.record(
+                    DoctorStatus::Ok,
+                    format!(
+                        "identified active repo `{}` from {}",
+                        active_repo.repo_id(),
+                        active_repo.source_description()
+                    ),
+                );
+                if let Some(manifest) = active_repo.manifest() {
+                    report.record(
+                        DoctorStatus::Ok,
+                        format!(
+                            "repo manifest parses at `{}`",
+                            manifest.manifest_path().to_string_lossy()
+                        ),
+                    );
+                }
+                (Some(root_path), Some(active_repo))
+            }
+            Err(error) => {
+                report.record(
+                    DoctorStatus::Fail,
+                    format!("active repo identity could not be resolved: {error}"),
+                );
+                (Some(root_path), None)
+            }
+        },
+        Err(error) => {
+            report.record(
+                DoctorStatus::Fail,
+                format!(
+                    "active repo root could not be resolved: {}",
+                    Report::from_error(error)
+                ),
+            );
+            (None, None)
+        }
+    };
+
+    match context.config_path.as_ref() {
+        Some(path) => report.record(
+            DoctorStatus::Ok,
+            format!(
+                "found workspace config candidate `{}`",
+                path.to_string_lossy()
+            ),
+        ),
+        None => report.record(
+            DoctorStatus::Fail,
+            format!(
+                "could not find `{}` while searching upward from `{}`",
+                config::LOCAL_CONFIG_FILE,
+                context.search_from.to_string_lossy()
+            ),
+        ),
+    }
+
+    let parsed_config = context
+        .config_path
+        .as_deref()
+        .map(LoadedWorkspaceConfig::from_path)
+        .transpose();
+
+    match parsed_config {
+        Ok(Some(config)) => {
+            report.record(
+                DoctorStatus::Ok,
+                format!(
+                    "workspace config parses at `{}`",
+                    config.config_path().to_string_lossy()
+                ),
+            );
+
+            let workspace_root = config.workspace_root();
+            if workspace_root.is_dir() {
+                report.record(
+                    DoctorStatus::Ok,
+                    format!(
+                        "workspace root exists at `{}`",
+                        workspace_root.to_string_lossy()
+                    ),
+                );
+            } else {
+                report.record(
+                    DoctorStatus::Fail,
+                    format!(
+                        "workspace root is missing at `{}`",
+                        workspace_root.to_string_lossy()
+                    ),
+                );
+            }
+
+            if let (Some(root_path), Some(active_repo)) = (root_path.as_ref(), active_repo.as_ref())
+            {
+                let expected_root = workspace_root.join(active_repo.repo_id());
+                if root_path == &expected_root {
+                    report.record(
+                        DoctorStatus::Ok,
+                        format!(
+                            "active repo `{}` is checked out at `{}`",
+                            active_repo.repo_id(),
+                            expected_root.to_string_lossy()
+                        ),
+                    );
+                } else {
+                    report.record(
+                        DoctorStatus::Fail,
+                        format!(
+                            "active repo `{}` should be checked out at `{}`, found `{}`",
+                            active_repo.repo_id(),
+                            expected_root.to_string_lossy(),
+                            root_path.to_string_lossy()
+                        ),
+                    );
+                }
+
+                check_workspace_repo(&mut report, workspace_root, active_repo.repo_id());
+                for sibling_id in active_repo.sibling_ids() {
+                    if let Some(sibling_path) =
+                        check_workspace_repo(&mut report, workspace_root, &sibling_id)
+                    {
+                        check_sibling_manifest_id(&mut report, &sibling_path, &sibling_id);
+                    }
+                }
+            } else {
+                report.record(
+                    DoctorStatus::Warn,
+                    "workspace repo layout checks were skipped because active repo identity was unavailable",
+                );
+            }
+
+            check_workspace_repo(&mut report, workspace_root, config::DEFAULT_THEME_DIR);
+        }
+        Err(error) => {
+            report.record(
+                DoctorStatus::Fail,
+                format!(
+                    "workspace config could not be parsed: {}",
+                    Report::from_error(error)
+                ),
+            );
+        }
+        Ok(None) => (),
+    }
+
+    if check_tools {
+        if !check_tool(
+            &mut report,
+            "build-eips",
+            "workspace bootstrap and build-eips commands expect `build-eips` on PATH",
+        ) {
+            check_default_windows_build_eips_path(&mut report);
+        }
+        check_tool(
+            &mut report,
+            "git",
+            "workspace bootstrap and build-eips commands expect git to be available",
+        );
+        check_tool(
+            &mut report,
+            "zola",
+            "build, check, and serve commands need a working zola binary",
+        );
+    }
+
+    Ok(report)
+}
+
+pub(crate) fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
+    let report = collect_doctor_report(args, true)?;
+
+    if report.failures > 0 {
+        snafu::whatever!("doctor found {} failing check(s)", report.failures);
+    }
+
+    Ok(())
 }
 
 pub(crate) fn init_workspace(
@@ -159,8 +538,8 @@ mod tests {
     };
 
     use super::{
-        init_workspace_with_repositories, workspace_doc_text, WorkspaceInitRepositories,
-        WORKSPACE_DOC_FILE, WORKSPACE_THEME_URL,
+        collect_doctor_report, init_workspace_with_repositories, workspace_doc_text,
+        WorkspaceInitRepositories, WORKSPACE_DOC_FILE, WORKSPACE_THEME_URL,
     };
 
     fn parse_args(arguments: &[&str]) -> Args {
@@ -280,6 +659,58 @@ base_url = "https://staging.example.test/{sibling_id}/"
         )
     }
 
+    fn assert_workspace_init_and_doctor_for_siblings(sibling_ids: &[&str]) {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, template_url) = workspace_init_test_repository_urls(&remotes_root);
+        let repositories = WorkspaceInitRepositories {
+            theme: &theme_url,
+            template: &template_url,
+        };
+
+        let sibling_repositories = sibling_ids
+            .iter()
+            .map(|sibling_id| {
+                let sibling_path = remotes_root.join(sibling_id);
+                let sibling_url = file_url(&sibling_path);
+                write_manifest_repo(&sibling_path, sibling_id, &sibling_url, &[]);
+                ((*sibling_id).to_owned(), sibling_url)
+            })
+            .collect::<Vec<_>>();
+        let sibling_manifest_entries = sibling_repositories
+            .iter()
+            .map(|(repo_id, url)| (repo_id.as_str(), url.clone()))
+            .collect::<Vec<_>>();
+
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &sibling_manifest_entries);
+        let init_args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "init",
+            workspace_root.to_str().unwrap(),
+        ]);
+
+        init_workspace_with_repositories(&init_args, workspace_root.clone(), false, &repositories)
+            .unwrap();
+
+        assert!(workspace_root.join(config::LOCAL_CONFIG_FILE).is_file());
+        assert!(Repository::open(workspace_root.join(config::DEFAULT_THEME_DIR)).is_ok());
+        for sibling_id in sibling_ids {
+            assert!(Repository::open(workspace_root.join(sibling_id)).is_ok());
+        }
+
+        let doctor_args =
+            parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
+        let report = collect_doctor_report(&doctor_args, false).unwrap();
+
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.warnings, 0);
+    }
+
     #[test]
     fn init_command_parses_with_optional_template_flag() {
         let plain = parse_args(&["build-eips", "init", "/tmp/workspace"]);
@@ -296,6 +727,13 @@ base_url = "https://staging.example.test/{sibling_id}/"
             template.operation,
             Operation::Init { template: true, .. }
         ));
+    }
+
+    #[test]
+    fn doctor_command_parses() {
+        let args = parse_args(&["build-eips", "doctor"]);
+
+        assert!(matches!(args.operation, Operation::Doctor));
     }
 
     #[test]
@@ -375,6 +813,13 @@ base_url = "https://staging.example.test/{sibling_id}/"
     }
 
     #[test]
+    fn workspace_init_and_doctor_cover_zero_one_and_many_siblings() {
+        assert_workspace_init_and_doctor_for_siblings(&[]);
+        assert_workspace_init_and_doctor_for_siblings(&["ERCs"]);
+        assert_workspace_init_and_doctor_for_siblings(&["EIPs", "ERCs"]);
+    }
+
+    #[test]
     fn workspace_init_leaves_existing_config_unchanged() {
         let temp = TempDir::new().unwrap();
         let workspace_root = temp.path().join("workspace");
@@ -404,5 +849,62 @@ base_url = "https://staging.example.test/{sibling_id}/"
             std::fs::read_to_string(workspace_root.join(config::LOCAL_CONFIG_FILE)).unwrap(),
             existing_config
         );
+    }
+
+    #[test]
+    fn workspace_doctor_missing_config_reports_one_failure_without_skip_warning() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_parse_failed_config_reports_one_failure_without_skip_warning() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        std::fs::write(workspace.path().join(config::LOCAL_CONFIG_FILE), "[").unwrap();
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_removed_config_fields_report_parse_failure_check() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
+        std::fs::write(
+            &config_path,
+            r#"
+build_root_base = ".local-build"
+default_profile = "local"
+
+[profiles.local]
+staging = true
+"#,
+        )
+        .unwrap();
+        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+        assert!(matches!(error, config::WorkspaceError::Parse { .. }));
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
     }
 }

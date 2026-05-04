@@ -66,6 +66,20 @@ impl ActiveRepoIdentity {
         }
     }
 
+    pub(crate) fn sibling_ids(&self) -> Vec<String> {
+        match self {
+            Self::Manifest(manifest) => manifest.manifest().siblings.keys().cloned().collect(),
+            Self::Legacy { repo_id } => Config::production()
+                .locations
+                .repository_use_for_title(repo_id)
+                .expect("legacy repository id should have metadata")
+                .other_repos
+                .keys()
+                .cloned()
+                .collect(),
+        }
+    }
+
     pub(crate) fn repository_use(&self, staging: bool) -> Result<git::RepositoryUse, Whatever> {
         match self {
             Self::Manifest(manifest) => {
