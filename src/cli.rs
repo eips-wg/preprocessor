@@ -20,10 +20,6 @@ pub(crate) struct Args {
     #[clap(short = 'C')]
     pub(crate) root: Option<PathBuf>,
 
-    /// Use the staging repositories (for testing)
-    #[clap(long = "staging")]
-    pub(crate) staging: bool,
-
     #[clap(subcommand)]
     pub(crate) operation: Operation,
 }

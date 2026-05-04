@@ -12,7 +12,7 @@ use std::{
 
 use crate::{
     cache::Cache,
-    config::{Location, Locations},
+    config::{LocName, Location, Manifest},
     progress::{Git, ProgressIteratorExt},
 };
 use git2::{
@@ -40,13 +40,8 @@ pub enum Error {
         source: git2::Error,
         backtrace: Backtrace,
     },
-    #[snafu(display("unable to determine which repository is being built (could be: {})", titles.join(", ")))]
-    AmbiguousIdentify {
-        titles: Vec<String>,
-        backtrace: Backtrace,
-    },
     #[snafu(display("unable to determine which repository is being built (none match)"))]
-    NoIdentify { backtrace: Backtrace },
+    NoIdentify { name: LocName, backtrace: Backtrace },
     #[snafu(display("working tree or index has uncommitted modifications"))]
     Dirty { backtrace: Backtrace },
     #[snafu(display("unable to update tree ({msg})"))]
@@ -65,54 +60,22 @@ pub struct RepositoryUse {
     pub other_repos: HashMap<String, Url>,
 }
 
-impl Locations {
-    pub fn identify_repository(&self, path: &Path) -> Result<RepositoryUse, Error> {
-        let repo =
-            git2::Repository::open_ext(path, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr])
-                .context(GitSnafu {
-                    what: "identify open",
-                })?;
+impl TryFrom<Manifest> for RepositoryUse {
+    type Error = Error;
 
-        let containing_locations: Vec<_> = self
-            .0
-            .iter()
-            .filter_map(|(k, v)| match repo.revparse_single(&v.identifying_commit) {
-                Ok(_) => Some((k, v)),
-                _ => None,
-            })
-            .collect();
+    fn try_from(mut value: Manifest) -> Result<Self, Self::Error> {
+        let Some(location) = value.locations.remove(&value.name) else {
+            return NoIdentifySnafu { name: value.name }.fail();
+        };
 
-        ensure!(
-            containing_locations.len() < 2,
-            AmbiguousIdentifySnafu {
-                titles: containing_locations
-                    .into_iter()
-                    .map(|x| x.0)
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            }
-        );
-        ensure!(containing_locations.len() == 1, NoIdentifySnafu);
-
-        let (title, location) = containing_locations[0];
-
-        // TODO: this is a bit weird, and is a leftover from the previous architecture.
-        let other_repos = self
-            .0
-            .iter()
-            .filter_map(|(k, v)| {
-                if k == title || v.repository == location.repository {
-                    None
-                } else {
-                    Some((k.clone(), v.repository.clone()))
-                }
-            })
-            .collect();
-
-        Ok(RepositoryUse {
-            title: title.clone(),
-            location: location.clone(),
-            other_repos,
+        Ok(Self {
+            title: value.name.into(),
+            location,
+            other_repos: value
+                .locations
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.repository))
+                .collect(),
         })
     }
 }
@@ -176,10 +139,10 @@ pub struct Fresh {
 }
 
 impl Fresh {
-    pub fn new(root_path: &Path, build_path: &Path, locations: &Locations) -> Result<Self, Error> {
+    pub fn new(root_path: &Path, build_path: &Path, manifest: Manifest) -> Result<Self, Error> {
         let root_path = absolute(root_path).context(IoSnafu { path: root_path })?;
         check_dirty(&root_path)?;
-        let src_repo_use = locations.identify_repository(&root_path)?;
+        let src_repo_use = RepositoryUse::try_from(manifest)?;
         let src_repo_url = Url::from_directory_path(&root_path)
             .ok()
             .context(PathUrlSnafu { path: root_path })?;
