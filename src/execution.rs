@@ -732,7 +732,11 @@ base_url = "http://localhost:4000"
 
     #[test]
     fn non_site_commands_do_not_require_workspace_local_sources() {
-        for arguments in [&["build-eips", "changed"][..], &["build-eips", "clean"][..]] {
+        for arguments in [
+            &["build-eips", "changed"][..],
+            &["build-eips", "clean"][..],
+            &["build-eips", "preview"][..],
+        ] {
             assert_settings(
                 arguments,
                 &["ERCs"],
@@ -858,6 +862,7 @@ base_url = "http://localhost:4000"
         for arguments in [
             &["build-eips", "changed"][..],
             &["build-eips", "clean"][..],
+            &["build-eips", "preview"][..],
             &["build-eips", "doctor"][..],
             &["build-eips", "print", "schema-version"][..],
         ] {
