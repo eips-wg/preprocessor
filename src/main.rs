@@ -9,6 +9,7 @@ mod changed;
 mod cli;
 mod config;
 mod context;
+mod execution;
 mod find_root;
 mod git;
 mod github;
@@ -29,22 +30,12 @@ use log::{debug, info};
 use snafu::{Report, ResultExt, Whatever};
 
 use crate::{
-    cli::{Args, Operation},
+    cli::{Args, Operation, RuntimeOperation},
     config::Config,
-    layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
+    execution::{resolve_execution, validate_non_execution_command_flags, ResolvedExecution},
+    layout::{CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
     workspace::{doctor_workspace, init_workspace},
 };
-
-fn repository_use(config: &Config, root_path: &Path) -> Result<git::RepositoryUse, Whatever> {
-    let repo_id = config
-        .locations
-        .identify_repository_title(root_path)
-        .whatever_context("cannot identify repository use")?;
-    let Some(repository_use) = config.locations.repository_use_for_title(&repo_id) else {
-        snafu::whatever!("repository metadata for `{repo_id}` is unavailable");
-    };
-    Ok(repository_use)
-}
 
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
     let lock_path = build_path.join(".lock");
@@ -62,23 +53,23 @@ fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
     Ok(lock_file)
 }
 
-fn make_build_dir(root: &Path) -> Result<PathBuf, Whatever> {
-    let build_path = root.join(BUILD_DIR);
-    if let Err(e) = std::fs::create_dir_all(&build_path) {
+fn make_build_dir(build_path: &Path) -> Result<PathBuf, Whatever> {
+    if let Err(e) = std::fs::create_dir_all(build_path) {
         debug!(
             "got while creating build directory: {}",
             Report::from_error(e)
         );
     }
-    Ok(build_path)
+    Ok(build_path.to_path_buf())
 }
 
 #[derive(Debug)]
 struct Prepared {
     cache: cache::Cache,
-    root_path: PathBuf,
     repo_path: PathBuf,
     output_path: PathBuf,
+    repository_use: git::RepositoryUse,
+    base_url_override: Option<url::Url>,
     config: Config,
 }
 
@@ -86,21 +77,28 @@ impl Prepared {
     fn prepare(
         eipw: lint::CmdArgs,
         config: Config,
-        root_path: PathBuf,
-        build_path: PathBuf,
+        resolved: ResolvedExecution,
     ) -> Result<Self, Whatever> {
         zola::find_zola().whatever_context("unable to find suitable zola binary")?;
+
+        let ResolvedExecution {
+            root_path,
+            build_path,
+            repository_use,
+            source_materialization,
+            base_url_override,
+            staging: _,
+        } = resolved;
 
         let repo_path = build_path.join(REPO_DIR);
         let content_path = repo_path.join(CONTENT_DIR);
         let output_path = build_path.join(OUTPUT_DIR);
 
-        let repository_use = repository_use(&config, &root_path)?;
         let both = git::Fresh::new(
             &root_path,
             &repo_path,
-            repository_use,
-            git::SourceMaterialization::Clean,
+            repository_use.clone(),
+            source_materialization,
         )
         .whatever_context("initializing build repo")?
         .clone_src()
@@ -136,22 +134,26 @@ impl Prepared {
 
         Ok(Prepared {
             config,
-            root_path,
             cache,
             repo_path,
             output_path,
+            repository_use,
+            base_url_override,
         })
     }
 
     fn build(self) -> Result<(), Whatever> {
-        let repository_use = repository_use(&self.config, &self.root_path)?;
+        let base_url = self
+            .base_url_override
+            .as_ref()
+            .unwrap_or(&self.repository_use.location.base_url);
         zola::build(
             self.config.theme.repository.as_str(),
             &self.config.theme.commit,
             &self.cache,
             &self.repo_path,
             &self.output_path,
-            repository_use.location.base_url.as_str(),
+            base_url.as_str(),
         )
         .whatever_context("zola build failed")?;
         Ok(())
@@ -183,8 +185,10 @@ impl Prepared {
 
 fn run() -> Result<(), Whatever> {
     let args = Args::parse();
-    if let Operation::Print { print } = args.operation {
-        print::print(print);
+    validate_non_execution_command_flags(&args)?;
+
+    if let Operation::Print { print } = &args.operation {
+        print::print(print.clone());
         return Ok(());
     }
 
@@ -198,22 +202,17 @@ fn run() -> Result<(), Whatever> {
         return Ok(());
     }
 
-    let config = if args.staging {
-        Config::staging()
-    } else {
-        Config::production()
-    };
-
-    let root_path = context::root(&args)?;
-    let build_path = make_build_dir(&root_path)?;
+    let runtime_operation = args
+        .operation
+        .runtime_operation()
+        .expect("non-execution commands should have returned earlier");
+    let resolved = resolve_execution(&args)?;
+    let build_path = make_build_dir(&resolved.build_path)?;
 
     let mut lock_file = lock(&build_path)?;
 
-    match args.operation {
-        Operation::Print { .. } => unreachable!(),
-        Operation::Init { .. } => unreachable!(),
-        Operation::Doctor => unreachable!(),
-        Operation::Clean => {
+    match runtime_operation {
+        RuntimeOperation::Clean => {
             // TODO: There's a race condition here. Maybe we move the lockfile to the repository
             //       root?
             lock_file
@@ -223,17 +222,32 @@ fn run() -> Result<(), Whatever> {
                 .whatever_context("unable to remove build directory")?;
             return Ok(());
         }
-        Operation::Check { eipw } => {
-            Prepared::prepare(eipw, config, root_path, build_path)?.check()?;
+        RuntimeOperation::Check { eipw } => {
+            let config = if resolved.staging {
+                Config::staging()
+            } else {
+                Config::production()
+            };
+            Prepared::prepare(eipw, config, resolved)?.check()?;
         }
-        Operation::Build { eipw } => {
-            Prepared::prepare(eipw, config, root_path, build_path)?.build()?;
+        RuntimeOperation::Build { eipw } => {
+            let config = if resolved.staging {
+                Config::staging()
+            } else {
+                Config::production()
+            };
+            Prepared::prepare(eipw, config, resolved)?.build()?;
         }
-        Operation::Serve { eipw } => {
-            Prepared::prepare(eipw, config, root_path, build_path)?.serve()?;
+        RuntimeOperation::Serve { eipw } => {
+            let config = if resolved.staging {
+                Config::staging()
+            } else {
+                Config::production()
+            };
+            Prepared::prepare(eipw, config, resolved)?.serve()?;
         }
-        Operation::Changed { all, format } => {
-            changed::run(&root_path, &build_path, &config, all, &format)?;
+        RuntimeOperation::Changed { all, format } => {
+            changed::run(&resolved, &build_path, all, &format)?;
         }
     }
 
