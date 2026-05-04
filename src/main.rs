@@ -5,129 +5,32 @@
  */
 
 mod cache;
+mod changed;
+mod cli;
 mod config;
+mod context;
 mod find_root;
 mod git;
 mod github;
+mod layout;
 mod lint;
 mod markdown;
 mod print;
 mod progress;
 mod zola;
 
-use std::{
-    ffi::OsStr,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use fslock::LockFile;
 use log::{debug, info};
 use snafu::{Report, ResultExt, Whatever};
 
-use crate::config::Config;
-
-const CONTENT_DIR: &str = "content";
-const BUILD_DIR: &str = "build";
-const REPO_DIR: &str = "repo";
-const OUTPUT_DIR: &str = "output";
-
-/// Build script for Ethereum EIPs and ERCs.
-#[derive(Parser, Debug)]
-#[command(version, about)]
-struct Args {
-    /// Use ROOT as the base directory (instead of finding it automatically)
-    #[clap(short = 'C')]
-    root: Option<PathBuf>,
-
-    /// Use the staging repositories (for testing)
-    #[clap(long = "staging")]
-    staging: bool,
-
-    #[clap(subcommand)]
-    operation: Operation,
-}
-
-#[derive(Debug, Subcommand)]
-enum Operation {
-    /// Print various useful things, like available lints
-    Print {
-        #[command(flatten)]
-        print: print::CmdArgs,
-    },
-
-    /// Build the project and output HTML
-    Build {
-        #[command(flatten)]
-        eipw: lint::CmdArgs,
-    },
-
-    /// Build the project and launch a web server to preview it
-    Serve {
-        #[command(flatten)]
-        eipw: lint::CmdArgs,
-    },
-
-    /// Remove temporary and output files
-    Clean,
-
-    /// Analyze the repository and report errors, but don't build HTML files
-    Check {
-        #[command(flatten)]
-        eipw: lint::CmdArgs,
-    },
-
-    /// List files changed since the last commit common to both the local and upstream repositories
-    Changed {
-        /// List all changed files, not just proposals
-        #[arg(long, short)]
-        all: bool,
-        #[clap(long, value_enum, default_value_t)]
-        format: ChangedFormat,
-    },
-}
-
-#[derive(Debug, clap::ValueEnum, Clone, Default)]
-enum ChangedFormat {
-    #[default]
-    Newline,
-    Nul,
-    Json,
-}
-
-impl ChangedFormat {
-    fn print_sep(files: &[&Path], sep: &str) {
-        let files: Vec<_> = files
-            .iter()
-            .map(|f| f.to_str().expect("path not UTF-8"))
-            .collect();
-        if files.iter().any(|f| f.contains(sep)) {
-            panic!("changed file path contains separator");
-        }
-        println!("{}", files.join(sep));
-    }
-
-    fn print_json(files: &[&Path]) {
-        let stdout = std::io::stdout();
-        serde_json::to_writer_pretty(stdout, files).unwrap();
-    }
-
-    fn print(&self, files: &[PathBuf], repo_path: &Path) {
-        let files: Vec<_> = files
-            .iter()
-            .map(|f| match f.strip_prefix(repo_path) {
-                Ok(p) => p,
-                _ => f,
-            })
-            .collect();
-
-        match self {
-            Self::Newline => Self::print_sep(&files, "\n"),
-            Self::Nul => Self::print_sep(&files, "\0"),
-            Self::Json => Self::print_json(&files),
-        }
-    }
-}
+use crate::{
+    cli::{Args, Operation},
+    config::Config,
+    layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
+};
 
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
     let lock_path = build_path.join(".lock");
@@ -143,15 +46,6 @@ fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
             .whatever_context("unable to lock build directory")?;
     }
     Ok(lock_file)
-}
-
-fn root(args: &Args) -> Result<PathBuf, Whatever> {
-    let dir = match &args.root {
-        None => find_root::find_root().whatever_context("cannot find repository root")?,
-        Some(p) => p.to_path_buf(),
-    };
-    find_root::is_root(&dir).whatever_context("invalid root directory")?;
-    Ok(dir)
 }
 
 fn make_build_dir(root: &Path) -> Result<PathBuf, Whatever> {
@@ -175,44 +69,6 @@ struct Prepared {
 }
 
 impl Prepared {
-    fn is_proposal_path(p: PathBuf) -> bool {
-        // Only lint `content/00001.md` and `content/00001/index.md` files.
-        let mut p = p.to_path_buf();
-
-        // content/00000.md  |  content/00000/index.md
-        //         ^^^^^^^^  |                ^^^^^^^^
-        match p.file_name() {
-            Some(n) if n == "index.md" => {
-                p.pop();
-            }
-            Some(_) if p.extension().map(|x| x == "md").unwrap_or(false) => {
-                p.set_extension("");
-            }
-            None | Some(_) => return false,
-        }
-
-        // content/00000
-        //         ^^^^^
-        match p.file_name().and_then(OsStr::to_str) {
-            None => return false,
-            Some(f) if f.parse::<u64>().is_err() => return false,
-            Some(_) => {
-                p.pop();
-            }
-        }
-
-        // content
-        // ^^^^^^^
-        match p.file_name() {
-            Some(f) if f == "content" => {
-                p.pop();
-            }
-            _ => return false,
-        }
-
-        p == OsStr::new("")
-    }
-
     fn prepare(
         eipw: lint::CmdArgs,
         config: Config,
@@ -236,7 +92,7 @@ impl Prepared {
             .changed_files()
             .whatever_context("unable to list changed files")?
             .into_iter()
-            .filter(|p| Self::is_proposal_path(p.into()))
+            .filter(|p| changed::is_proposal_path(p.into()))
             .map(|p| repo_path.join(p))
             .collect();
 
@@ -322,7 +178,7 @@ fn run() -> Result<(), Whatever> {
         Config::production()
     };
 
-    let root_path = root(&args)?;
+    let root_path = context::root(&args)?;
     let build_path = make_build_dir(&root_path)?;
 
     let mut lock_file = lock(&build_path)?;
@@ -349,24 +205,7 @@ fn run() -> Result<(), Whatever> {
             Prepared::prepare(eipw, config, root_path, build_path)?.serve()?;
         }
         Operation::Changed { all, format } => {
-            let repo_path = build_path.join(REPO_DIR);
-
-            let both = git::Fresh::new(&root_path, &repo_path, &config.locations)
-                .whatever_context("initializing build repo")?
-                .clone_src()
-                .whatever_context("cloning source repo")?
-                .fetch_upstream()
-                .whatever_context("fetching upstream repo")?;
-
-            let changed_files: Vec<_> = both
-                .changed_files()
-                .whatever_context("unable to list changed files")?
-                .into_iter()
-                .filter(|p| all || Prepared::is_proposal_path(p.into()))
-                .map(|p| repo_path.join(p))
-                .collect();
-
-            format.print(&changed_files, &repo_path);
+            changed::run(&root_path, &build_path, &config, all, &format)?;
         }
     }
 
