@@ -23,7 +23,7 @@ pub const DEFAULT_THEME_DIR: &str = "theme";
 pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
 pub const DEFAULT_SERVER_PORT: u16 = 1111;
 pub const DEFAULT_SITE_BASE_URL: &str = "http://127.0.0.1:1111";
-const RESERVED_REPO_IDS: &[&str] = &["theme", "preprocessor", "eipw"];
+const RESERVED_WORKSPACE_NAMES: &[&str] = &[DEFAULT_THEME_DIR, "preprocessor", "eipw"];
 
 #[derive(Debug, Snafu)]
 pub enum RepoManifestError {
@@ -314,7 +314,7 @@ fn validate_repo_key(
         Some("must not be `.` or `..`")
     } else if key.contains('/') || key.contains('\\') {
         Some("must be a single safe path component")
-    } else if RESERVED_REPO_IDS.contains(&key) {
+    } else if RESERVED_WORKSPACE_NAMES.contains(&key) {
         Some("collides with a reserved workspace/platform directory name")
     } else {
         None
