@@ -12,7 +12,7 @@ use crate::{cli::Args, find_root};
 
 pub(crate) fn root(args: &Args) -> Result<PathBuf, Whatever> {
     let dir = match &args.root {
-        None => find_root::find_root().whatever_context("cannot find repository root")?,
+        None => find_root::find_root().whatever_context("cannot find root")?,
         Some(p) => p.to_path_buf(),
     };
     find_root::is_root(&dir).whatever_context("invalid root directory")?;

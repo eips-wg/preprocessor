@@ -5,6 +5,8 @@
  */
 
 use super::CONTENT_DIR;
+use crate::config::MANIFEST_FILE;
+
 use snafu::{ResultExt, Snafu};
 use std::{
     backtrace::Backtrace,
@@ -27,17 +29,23 @@ pub enum Error {
         backtrace: Backtrace,
     },
 
-    #[snafu(display("could not find root directory (containing `.git` and `{CONTENT_DIR}`)"))]
+    #[snafu(display(
+        "could not find root directory (containing `{MANIFEST_FILE}` and `{CONTENT_DIR}`)"
+    ))]
     NoRoot { backtrace: Backtrace },
 }
 
-pub fn is_root(path: &Path) -> Result<(), Error> {
-    let git = path.join(".git");
-    let contents = path.join(CONTENT_DIR);
-    if git.is_dir() && contents.is_dir() {
-        Ok(())
-    } else {
+pub fn is_root(path: &Path) -> Result<bool, Error> {
+    let manifest_path = path.join(MANIFEST_FILE);
+    let content_path = path.join(CONTENT_DIR);
+    let git_path = path.join(".git");
+
+    if manifest_path.is_file() && content_path.is_dir() {
+        Ok(true)
+    } else if git_path.is_dir() {
         NoRootSnafu.fail()
+    } else {
+        Ok(false)
     }
 }
 
@@ -50,8 +58,8 @@ pub fn find_root() -> Result<PathBuf, Error> {
 
     while let Some(candidate) = current {
         match is_root(candidate) {
-            Ok(()) => return Ok(candidate.to_path_buf()),
-            Err(Error::NoRoot { .. }) => (),
+            Ok(true) => return Ok(candidate.to_path_buf()),
+            Ok(false) => (),
             Err(e) => return Err(e),
         }
         current = candidate.parent();

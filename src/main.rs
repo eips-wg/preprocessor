@@ -28,7 +28,8 @@ use snafu::{Report, ResultExt, Whatever};
 
 use crate::{
     cli::{Args, Operation},
-    config::Config,
+    config::Manifest,
+    git::RepositoryUse,
     layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
 };
 
@@ -62,16 +63,15 @@ fn make_build_dir(root: &Path) -> Result<PathBuf, Whatever> {
 #[derive(Debug)]
 struct Prepared {
     cache: cache::Cache,
-    root_path: PathBuf,
     repo_path: PathBuf,
     output_path: PathBuf,
-    config: Config,
+    manifest: Manifest,
 }
 
 impl Prepared {
     fn prepare(
         eipw: lint::CmdArgs,
-        config: Config,
+        manifest: Manifest,
         root_path: PathBuf,
         build_path: PathBuf,
     ) -> Result<Self, Whatever> {
@@ -81,7 +81,7 @@ impl Prepared {
         let content_path = repo_path.join(CONTENT_DIR);
         let output_path = build_path.join(OUTPUT_DIR);
 
-        let both = git::Fresh::new(&root_path, &repo_path, &config.locations)
+        let both = git::Fresh::new(&root_path, &repo_path, manifest.clone())
             .whatever_context("initializing build repo")?
             .clone_src()
             .whatever_context("cloning source repo")?
@@ -102,8 +102,8 @@ impl Prepared {
         let cache = cache::Cache::open().whatever_context("unable to open cache")?;
 
         lint::eipw(
-            config.theme.repository.as_str(),
-            &config.theme.commit,
+            manifest.theme.repository.as_str(),
+            &manifest.theme.commit,
             &cache,
             &root_path,
             &repo_path,
@@ -115,8 +115,7 @@ impl Prepared {
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
 
         Ok(Prepared {
-            config,
-            root_path,
+            manifest,
             cache,
             repo_path,
             output_path,
@@ -124,14 +123,11 @@ impl Prepared {
     }
 
     fn build(self) -> Result<(), Whatever> {
-        let repository_use = self
-            .config
-            .locations
-            .identify_repository(&self.root_path)
+        let repository_use = RepositoryUse::try_from(self.manifest.clone())
             .whatever_context("cannot identify repository use")?;
         zola::build(
-            self.config.theme.repository.as_str(),
-            &self.config.theme.commit,
+            self.manifest.theme.repository.as_str(),
+            &self.manifest.theme.commit,
             &self.cache,
             &self.repo_path,
             &self.output_path,
@@ -143,8 +139,8 @@ impl Prepared {
 
     fn serve(self) -> Result<(), Whatever> {
         zola::serve(
-            self.config.theme.repository.as_str(),
-            &self.config.theme.commit,
+            self.manifest.theme.repository.as_str(),
+            &self.manifest.theme.commit,
             &self.cache,
             &self.repo_path,
             &self.output_path,
@@ -155,8 +151,8 @@ impl Prepared {
 
     fn check(self) -> Result<(), Whatever> {
         zola::check(
-            self.config.theme.repository.as_str(),
-            &self.config.theme.commit,
+            self.manifest.theme.repository.as_str(),
+            &self.manifest.theme.commit,
             &self.cache,
             &self.repo_path,
         )
@@ -172,13 +168,11 @@ fn run() -> Result<(), Whatever> {
         return Ok(());
     }
 
-    let config = if args.staging {
-        Config::staging()
-    } else {
-        Config::production()
-    };
-
     let root_path = context::root(&args)?;
+
+    let manifest_path = root_path.join(config::MANIFEST_FILE);
+    let manifest = Manifest::load(&manifest_path).whatever_context("unable to read manifest")?;
+
     let build_path = make_build_dir(&root_path)?;
 
     let mut lock_file = lock(&build_path)?;
@@ -196,16 +190,16 @@ fn run() -> Result<(), Whatever> {
             return Ok(());
         }
         Operation::Check { eipw } => {
-            Prepared::prepare(eipw, config, root_path, build_path)?.check()?;
+            Prepared::prepare(eipw, manifest, root_path, build_path)?.check()?;
         }
         Operation::Build { eipw } => {
-            Prepared::prepare(eipw, config, root_path, build_path)?.build()?;
+            Prepared::prepare(eipw, manifest, root_path, build_path)?.build()?;
         }
         Operation::Serve { eipw } => {
-            Prepared::prepare(eipw, config, root_path, build_path)?.serve()?;
+            Prepared::prepare(eipw, manifest, root_path, build_path)?.serve()?;
         }
         Operation::Changed { all, format } => {
-            changed::run(&root_path, &build_path, &config, all, &format)?;
+            changed::run(&root_path, &build_path, manifest, all, &format)?;
         }
     }
 
