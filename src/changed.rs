@@ -13,7 +13,7 @@ use std::{
 
 use snafu::{ResultExt, Whatever};
 
-use crate::{cli::ChangedFormat, config::Config, git, layout::REPO_DIR};
+use crate::{cli::ChangedFormat, execution::ResolvedExecution, git, layout::REPO_DIR};
 
 pub(crate) fn is_proposal_path(mut p: PathBuf) -> bool {
     // Only lint `content/00001.md` and `content/00001/index.md` files.
@@ -53,27 +53,18 @@ pub(crate) fn is_proposal_path(mut p: PathBuf) -> bool {
 }
 
 pub(crate) fn run(
-    root_path: &Path,
+    resolved: &ResolvedExecution,
     build_path: &Path,
-    config: &Config,
     all: bool,
     format: &ChangedFormat,
 ) -> Result<(), Whatever> {
     let repo_path = build_path.join(REPO_DIR);
 
-    let repo_id = config
-        .locations
-        .identify_repository_title(root_path)
-        .whatever_context("cannot identify repository use")?;
-    let Some(repository_use) = config.locations.repository_use_for_title(&repo_id) else {
-        snafu::whatever!("repository metadata for `{repo_id}` is unavailable");
-    };
-
     let both = git::Fresh::new(
-        root_path,
+        &resolved.root_path,
         &repo_path,
-        repository_use,
-        git::SourceMaterialization::Clean,
+        resolved.repository_use.clone(),
+        resolved.source_materialization,
     )
     .whatever_context("initializing build repo")?
     .clone_src()
