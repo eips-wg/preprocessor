@@ -26,6 +26,9 @@ mod serve;
 mod workspace;
 mod zola;
 
+#[cfg(test)]
+mod tests;
+
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -105,7 +108,6 @@ fn run() -> Result<(), Whatever> {
     }
 
     let build_path = make_build_dir(&resolved.build_path)?;
-
     let mut lock_file = lock(&build_path)?;
 
     match runtime_operation {
@@ -115,7 +117,7 @@ fn run() -> Result<(), Whatever> {
             lock_file
                 .unlock()
                 .whatever_context("unable to unlock build directory")?;
-            std::fs::remove_dir_all(build_path)
+            std::fs::remove_dir_all(&build_path)
                 .whatever_context("unable to remove build directory")?;
             return Ok(());
         }
@@ -137,7 +139,7 @@ fn run() -> Result<(), Whatever> {
                 run_editorial_lint(&resolved, &selectors, eipw)?;
             }
             EditorialCommand::Check { selectors, eipw } => {
-                run_editorial_lint(&resolved, &selectors, eipw.clone())?;
+                run_editorial_lint(&resolved, &selectors, eipw)?;
                 Prepared::prepare(editorial_runtime_execution(resolved, &selectors))?.check()?;
             }
         },

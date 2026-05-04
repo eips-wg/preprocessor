@@ -94,17 +94,44 @@ If `theme/` or `preprocessor/` setup cannot create the default `EIPs/` checkout,
 
 If `build-eips doctor` reports that Zola is missing or too old, rerun the setup script to install the supported Zola version.
 
-## Local Commands
+### Build And Serve Locally
 
-Use the active proposal repo for local build commands:
+Build the full static site, then preview that built output:
 
-```sh
-build-eips check
+```bash
 build-eips build
+build-eips preview
+```
+
+`preview` serves the last output written by `build`. Run `build` again before `preview` when you want to inspect fresh output.
+
+Use `serve` when you want a live development server that livereloads changes instead of a reusable build output:
+
+```bash
 build-eips serve
 ```
 
-The workspace config starts with local server and site defaults:
+`serve` runs a fresh temporary site build each time it is invoked (without using `build`), starts a local development server, and watches tracked local edits. Its output cannot be reused by `preview`.
+
+Use `check` to quickly validate whether the site will build cleanly without producing the full built site:
+
+```bash
+build-eips check
+```
+
+By default, `check`, `build`, and `serve` use the local workspace in dirty mode, which includes tracked working-tree edits from this repo. `preview` serves the last output written by `build`. Use `--clean` when you want to ignore tracked local proposal edits for one command:
+
+```bash
+build-eips check --clean
+build-eips build --clean
+build-eips serve --clean
+```
+
+For staging, production, parity, and remote-sibling modes, see `../WORKSPACE.md`.
+
+### Local Settings
+
+Local build settings live in `../.build-eips.toml`, which the setup script generates. Use that workspace file to change the local server address or local site URL:
 
 ```toml
 [server]
@@ -115,29 +142,128 @@ port = 1111
 base_url = "http://127.0.0.1:1111"
 ```
 
-## Render Specific Proposals Only
+`serve` and `preview` use `[server]` for the local bind address. `build` and `serve` use `[site].base_url` when generating links.
 
-Full local `build` and `serve` runs can take time because they process every
-proposal file. When you want to quickly test a single proposal or a specific
-batch, add a list of desired proposal numbers to the workspace
-`.build-eips.toml`:
+CLI flags such as `--host`, `--port`, and `--base-url` override the workspace config for one run:
+
+```bash
+build-eips serve --host 0.0.0.0 --port 3000 --base-url http://127.0.0.1:3000
+```
+
+### Render Specific Proposals Only
+
+Full local `build` and `serve` runs can take time because they process every proposal file. When you want to quickly test a single proposal or a specific batch, add a list of desired proposal numbers to the workspace `.build-eips.toml`:
 
 ```toml
 [render]
 only = [555, 678]
 ```
 
-Whenever `[render].only` is populated, regular local dirty `build` and `serve`
-commands render only those proposal pages. Links and references to excluded
-proposals are rewritten to the canonical public site.
+Add one or more proposal numbers in `[render].only`, separated by commas. It's empty by default, but whenever it is populated, the regular `build` and `serve` commands render only those proposal pages. Links and references to excluded proposals are rewritten to the canonical public site.
 
-Use CLI `--only` when you want a one-run target list; it overrides any
-proposals in `[render].only` for that run:
+Use CLI `--only` when you want a one-run target list; it also overrides any proposals in `[render].only` for that run:
 
-```sh
+```bash
 build-eips serve --only 555
 build-eips build --only 555
 build-eips build --only 555 678
 ```
 
 Multiple proposal numbers in the CLI are space-separated; no commas.
+
+### Editorial Validation
+
+Use editorial commands to validate proposal files before opening or updating a pull request.
+
+- `editorial lint` runs targeted `eipw` proposal-rule checks.
+- `editorial check` runs `editorial lint`, then checks that the selected proposal changes will not prevent the full site from building cleanly.
+
+Check one or more specific proposals by number:
+
+```bash
+build-eips editorial check 1
+build-eips editorial check 1 123
+```
+
+For the closest match to PR CI, use `editorial check` against the proposal files changed versus upstream:
+
+```bash
+build-eips --staging editorial check --against-upstream --format github
+```
+
+Both commands accept the same selector modes:
+
+* proposal numbers or repo-relative proposal paths for explicit targets
+* `--working-tree` for tracked dirty proposal files
+* `--against-upstream` for proposal files changed versus the upstream merge-base
+* `--batch <path>` for a repeatable target list
+
+They also accept `eipw` options such as `--format github`.
+
+Use a batch file when you want to lint or check the same proposal set repeatedly. A batch file is a plain text file with one proposal number per line:
+
+```txt
+1
+7949
+```
+
+```bash
+build-eips editorial lint --batch ../editor-batch.txt
+build-eips editorial check --batch ../editor-batch.txt
+```
+
+### Source And Output Overrides
+
+Workspace-local sources come from the standard workspace layout. The local theme is `workspace/theme`, and local sibling repos are `workspace/<sibling_repo_id>` from the active repo manifest.
+
+Use `--remote-siblings` when you need to force remote sibling proposal sources for a single command.
+
+Use global `--build-root <path>` when you want a separate prepared repo and output directory, for example to compare two builds side by side. The path replaces the default `.local-build/<repo_id>` location for each command where you pass it, so use the same `--build-root` value when serving or previewing builds.
+
+Example:
+
+```bash
+build-eips -C /work/EIPs-project/EIPs --build-root /tmp/eips-local build --base-url http://127.0.0.1:1111
+build-eips -C /work/EIPs-project/EIPs --build-root /tmp/eips-staging --staging build --base-url http://127.0.0.1:1112
+
+build-eips -C /work/EIPs-project/EIPs --build-root /tmp/eips-local preview --port 1111
+build-eips -C /work/EIPs-project/EIPs --build-root /tmp/eips-staging preview --port 1112
+
+# Or using serve
+build-eips -C /work/EIPs-project/EIPs --build-root /tmp/eips-local serve --port 1111
+build-eips -C /work/EIPs-project/EIPs --build-root /tmp/eips-staging --staging serve --port 1112
+```
+
+### Remote And Parity Modes
+
+Use remote modes when you want a clean render of the local active checkout with staging or production environment metadata and remote sibling proposal sources.
+
+`--staging` and `--production` use the local active checkout, reject dirty active-repo edits, and select remote sibling sources plus staging or production environment metadata:
+
+```sh
+build-eips --staging check
+build-eips --staging build
+build-eips --staging serve
+
+build-eips --production check
+build-eips --production build
+build-eips --production serve
+```
+
+`parity` is the built-in clean staging path for checking whether the local active checkout behaves like the staging environment:
+
+```sh
+build-eips parity check
+build-eips parity build
+build-eips parity serve
+```
+
+Use `--remote-siblings` when you want to keep the active proposal repo local, but resolve sibling proposal repos from the configured remote environment:
+
+```sh
+build-eips --remote-siblings check
+build-eips --remote-siblings build
+build-eips --remote-siblings serve
+```
+
+Remote environment commands and `parity` use the local active checkout, but do not use local dirty proposal edits. They still use the workspace-local `theme/`, so check out the theme commit or branch you want before running them.

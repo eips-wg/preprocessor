@@ -230,7 +230,7 @@ fn validate_raw_editorial_targets(
     validate_editorial_targets(&resolved.root_path, targets, strict)
 }
 
-fn editorial_targets_from_source(
+pub(crate) fn editorial_targets_from_source(
     selectors: &EditorialSelectorArgs,
     resolved: &ResolvedExecution,
     upstream_source: Option<&git::SourceWithUpstream>,

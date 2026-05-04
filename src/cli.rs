@@ -21,11 +21,11 @@ pub(crate) struct Args {
     #[clap(short = 'C')]
     pub(crate) root: Option<PathBuf>,
 
-    /// Force the staging repositories and base URLs
+    /// Use staging sibling repositories and environment metadata
     #[clap(long)]
     pub(crate) staging: bool,
 
-    /// Force the production repositories and base URLs
+    /// Use production sibling repositories and environment metadata
     #[clap(long)]
     pub(crate) production: bool,
 
@@ -155,7 +155,7 @@ pub(crate) enum Operation {
     /// Check workspace layout, local repos, and required tools
     Doctor,
 
-    /// Run build, serve, or check with staging remote proposal sources
+    /// Run build, serve, or check with clean staging settings and remote siblings
     Parity {
         #[command(subcommand)]
         command: ProfiledOperation,
@@ -275,7 +275,7 @@ impl Operation {
 
     pub(crate) fn clean_cli_args(&self) -> CleanCliArgs {
         match self {
-            Self::Build { clean, .. } | Self::Serve { clean, .. } | Self::Check { clean, .. } => {
+            Self::Build { clean, .. } | Self::Serve { clean, .. } | Self::Check { clean } => {
                 clean.clone()
             }
             Self::Print { .. }
@@ -353,7 +353,7 @@ impl ProfiledOperation {
 
     fn base_url_cli_args(&self) -> BaseUrlCliArgs {
         match self {
-            Self::Build { base_url, .. } | Self::Serve { base_url, .. } => base_url.clone(),
+            Self::Build { base_url } | Self::Serve { base_url, .. } => base_url.clone(),
             Self::Check => BaseUrlCliArgs::default(),
         }
     }
@@ -455,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn only_flag_parses_one_or_more_proposal_numbers_on_build_and_serve() {
+    fn only_flag_parses_one_or_more_proposal_numbers_on_build() {
         let one = parse_args(&["build-eips", "build", "--only", "00555"]);
         let many = parse_args(&["build-eips", "build", "--only", "555", "678", "897"]);
         let serve = parse_args(&["build-eips", "serve", "--only", "555", "678"]);
@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn only_flag_rejects_invalid_selectors_and_non_targeted_commands() {
+    fn only_flag_rejects_invalid_selectors_and_non_build_commands() {
         for selector in [
             "+555",
             "0",
@@ -513,84 +513,6 @@ mod tests {
         assert!(Args::try_parse_from(["build-eips", "check", "--only", "555"]).is_err());
         assert!(Args::try_parse_from(["build-eips", "parity", "build", "--only", "555"]).is_err());
         assert!(Args::try_parse_from(["build-eips", "parity", "serve", "--only", "555"]).is_err());
-    }
-
-    #[test]
-    fn base_url_flags_parse_on_build_and_serve_forms() {
-        let cases: &[(&[&str], &str)] = &[
-            (
-                &["build-eips", "build", "--base-url", "http://localhost:4000"],
-                "build",
-            ),
-            (
-                &["build-eips", "serve", "--base-url", "http://localhost:4000"],
-                "serve",
-            ),
-            (
-                &[
-                    "build-eips",
-                    "parity",
-                    "build",
-                    "--base-url",
-                    "http://localhost:4000",
-                ],
-                "build",
-            ),
-            (
-                &[
-                    "build-eips",
-                    "parity",
-                    "serve",
-                    "--base-url",
-                    "http://localhost:4000",
-                ],
-                "serve",
-            ),
-        ];
-
-        for (arguments, expected_runtime_operation) in cases {
-            let args = parse_args(arguments);
-
-            assert!(matches!(
-                (
-                    args.operation.runtime_operation().unwrap(),
-                    *expected_runtime_operation
-                ),
-                (RuntimeOperation::Build, "build") | (RuntimeOperation::Serve, "serve")
-            ));
-            assert_eq!(
-                args.operation
-                    .base_url_cli_args()
-                    .base_url
-                    .as_ref()
-                    .unwrap()
-                    .as_str(),
-                "http://localhost:4000/"
-            );
-        }
-    }
-
-    #[test]
-    fn clean_flags_parse_only_on_plain_site_commands() {
-        for arguments in [
-            &["build-eips", "build", "--clean"][..],
-            &["build-eips", "serve", "--clean"][..],
-            &["build-eips", "check", "--clean"][..],
-        ] {
-            let args = parse_args(arguments);
-            assert!(args.operation.clean_cli_args().clean);
-        }
-
-        for arguments in [
-            &["build-eips", "parity", "build", "--clean"][..],
-            &["build-eips", "parity", "serve", "--clean"][..],
-            &["build-eips", "parity", "check", "--clean"][..],
-            &["build-eips", "preview", "--clean"][..],
-            &["build-eips", "changed", "--clean"][..],
-            &["build-eips", "clean", "--clean"][..],
-        ] {
-            assert!(Args::try_parse_from(arguments).is_err());
-        }
     }
 
     #[test]
@@ -637,6 +559,85 @@ mod tests {
 
             assert_eq!(server.host.as_deref(), Some("0.0.0.0"));
             assert_eq!(server.port, Some(8080));
+        }
+    }
+
+    #[test]
+    fn base_url_flags_parse_on_build_and_serve_forms() {
+        let cases: &[(&[&str], RuntimeOperation)] = &[
+            (
+                &["build-eips", "build", "--base-url", "http://localhost:4000"],
+                RuntimeOperation::Build,
+            ),
+            (
+                &["build-eips", "serve", "--base-url", "http://localhost:4000"],
+                RuntimeOperation::Serve,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "parity",
+                    "build",
+                    "--base-url",
+                    "http://localhost:4000",
+                ],
+                RuntimeOperation::Build,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "parity",
+                    "serve",
+                    "--base-url",
+                    "http://localhost:4000",
+                ],
+                RuntimeOperation::Serve,
+            ),
+        ];
+
+        for (arguments, expected_runtime_operation) in cases {
+            let args = parse_args(arguments);
+
+            assert!(matches!(
+                (
+                    args.operation.runtime_operation().unwrap(),
+                    (*expected_runtime_operation).clone()
+                ),
+                (RuntimeOperation::Build, RuntimeOperation::Build)
+                    | (RuntimeOperation::Serve, RuntimeOperation::Serve)
+            ));
+            assert_eq!(
+                args.operation
+                    .base_url_cli_args()
+                    .base_url
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+                "http://localhost:4000/"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_flags_parse_only_on_plain_site_commands() {
+        for arguments in [
+            &["build-eips", "build", "--clean"][..],
+            &["build-eips", "serve", "--clean"][..],
+            &["build-eips", "check", "--clean"][..],
+        ] {
+            let args = parse_args(arguments);
+            assert!(args.operation.clean_cli_args().clean);
+        }
+
+        for arguments in [
+            &["build-eips", "parity", "build", "--clean"][..],
+            &["build-eips", "parity", "serve", "--clean"][..],
+            &["build-eips", "parity", "check", "--clean"][..],
+            &["build-eips", "preview", "--clean"][..],
+            &["build-eips", "changed", "--clean"][..],
+            &["build-eips", "clean", "--clean"][..],
+        ] {
+            assert!(Args::try_parse_from(arguments).is_err());
         }
     }
 

@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use snafu::{ResultExt, Whatever};
+use snafu::{OptionExt, ResultExt, Whatever};
 
 use crate::{
     config::{self, Config, LoadedRepoManifest},
@@ -96,11 +96,12 @@ impl ActiveRepoIdentity {
                 } else {
                     Config::production()
                 };
-                let Some(repository_use) = baseline.locations.repository_use_for_title(repo_id)
-                else {
-                    snafu::whatever!("legacy repository metadata for `{repo_id}` is unavailable");
-                };
-                Ok(repository_use)
+                baseline
+                    .locations
+                    .repository_use_for_title(repo_id)
+                    .with_whatever_context(|| {
+                        format!("legacy repository metadata for `{repo_id}` is unavailable")
+                    })
             }
         }
     }
