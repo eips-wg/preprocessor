@@ -20,6 +20,7 @@ mod pipeline;
 mod preview;
 mod print;
 mod progress;
+mod proposal;
 mod serve;
 mod workspace;
 mod zola;
