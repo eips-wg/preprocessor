@@ -6,7 +6,10 @@
 
 //! Execution source and path resolution.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 use log::{debug, info};
 use snafu::{OptionExt, ResultExt, Whatever};
@@ -26,9 +29,17 @@ pub(crate) struct ResolvedExecution {
     pub(crate) root_path: PathBuf,
     pub(crate) build_path: PathBuf,
     pub(crate) repository_use: git::RepositoryUse,
+    pub(crate) theme_path: Option<PathBuf>,
     pub(crate) source_materialization: git::SourceMaterialization,
     pub(crate) base_url_override: Option<Url>,
-    pub(crate) staging: bool,
+}
+
+impl ResolvedExecution {
+    pub(crate) fn theme_path(&self) -> Result<&Path, Whatever> {
+        self.theme_path
+            .as_deref()
+            .whatever_context("the selected command requires a resolved workspace-local theme")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,15 +134,26 @@ pub(crate) fn resolve_execution_settings(
         (false, false, SelectedSource::Remote)
     };
 
-    if sibling_override.is_none()
+    let missing_theme = operation_requires_theme(&args.operation) && workspace_config.is_none();
+    let missing_sibling = sibling_override.is_none()
         && default_sibling == SelectedSource::WorkspaceLocal
         && !sibling_ids.is_empty()
-        && workspace_config.is_none()
-    {
-        snafu::whatever!(
-            "the selected command requires workspace-local sibling sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--remote-siblings` for remote sibling source overrides\n3. use `parity <command>`, `--staging <command>`, or `--production <command>` for remote clean environment behavior",
-            config::LOCAL_CONFIG_FILE
-        );
+        && workspace_config.is_none();
+
+    match (missing_theme, missing_sibling) {
+        (true, true) => {
+            snafu::whatever!(
+                "the selected command requires a workspace config with local theme and sibling sources, but no `{}` was found.\n\nRun:\n  build-eips init <workspace-root>\n\nThen retry from that workspace, or pass `--remote-siblings` if you intentionally want remote sibling proposal sources.",
+                config::LOCAL_CONFIG_FILE
+            );
+        }
+        (false, true) => {
+            snafu::whatever!(
+                "the selected command requires workspace-local sibling sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--remote-siblings` for remote sibling source overrides\n3. use `parity <command>`, `--staging <command>`, or `--production <command>` for remote clean environment behavior",
+                config::LOCAL_CONFIG_FILE
+            );
+        }
+        _ => {}
     }
 
     let sibling = sibling_override.unwrap_or(default_sibling);
@@ -210,6 +232,49 @@ fn build_path(
         .unwrap_or_else(|| root_path.join(BUILD_DIR))
 }
 
+fn operation_requires_theme(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Build { .. }
+            | Operation::Serve { .. }
+            | Operation::Check { .. }
+            | Operation::Parity { .. }
+    )
+}
+
+fn resolve_theme_path(
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+    operation: &Operation,
+) -> Result<Option<PathBuf>, Whatever> {
+    if !operation_requires_theme(operation) {
+        return Ok(None);
+    }
+
+    let workspace_config = workspace_config.with_whatever_context(|| {
+        format!(
+            "the selected command requires a workspace config with a local theme, but no `{}` was found.\n\nRun:\n  build-eips init <workspace-root>\n\nThen retry from that workspace.",
+            config::LOCAL_CONFIG_FILE
+        )
+    })?;
+    let theme_path = workspace_config.local_theme_path();
+
+    match std::fs::metadata(&theme_path) {
+        Ok(_) => Ok(Some(theme_path)),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            snafu::whatever!(
+                "workspace-local theme path `{}` does not exist.\n\nRun `build-eips init <workspace-root>` to bootstrap the workspace, or\nclone/update the theme repository at the configured path.",
+                theme_path.to_string_lossy()
+            );
+        }
+        Err(error) => {
+            snafu::whatever!(
+                "unable to access workspace-local theme path `{}`: {error}",
+                theme_path.to_string_lossy()
+            );
+        }
+    }
+}
+
 fn resolve_base_url_override(
     args: &Args,
     workspace_config: Option<&LoadedWorkspaceConfig>,
@@ -240,6 +305,7 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
     }
 
     let settings = resolve_execution_settings(args, &sibling_ids, workspace_config.as_ref())?;
+    let theme_path = resolve_theme_path(workspace_config.as_ref(), &args.operation)?;
     let mut repository_use = active_repo.repository_use(settings.staging)?;
     apply_sibling_sources(
         &mut repository_use,
@@ -268,9 +334,9 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
         root_path,
         build_path,
         repository_use,
+        theme_path,
         source_materialization,
         base_url_override,
-        staging: settings.staging,
     })
 }
 
@@ -324,6 +390,39 @@ mod tests {
             settings_for(arguments, sibling_ids, workspace_config),
             expected
         );
+    }
+
+    fn assert_theme_only_missing_workspace_error(arguments: &[&str]) {
+        let args = parse_args(arguments);
+        let error = super::resolve_theme_path(None, &args.operation).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains(
+            "the selected command requires a workspace config with a local theme, but no `.build-eips.toml` was found"
+        ));
+        assert!(message.contains("build-eips init <workspace-root>"));
+        assert!(!message.contains("theme and sibling"));
+        assert!(!message.contains(concat!("--remote", "-theme")));
+    }
+
+    fn assert_combined_missing_workspace_error(arguments: &[&str]) {
+        let args = parse_args(arguments);
+        let sibling_ids = vec!["ERCs".to_owned()];
+        let error = resolve_execution_settings(&args, &sibling_ids, None).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message
+            .contains("the selected command requires a workspace config with local theme and sibling sources"));
+        assert!(message.contains("no `.build-eips.toml` was found"));
+        assert!(message.contains("build-eips init <workspace-root>"));
+        assert!(message.contains(
+            "pass `--remote-siblings` if you intentionally want remote sibling proposal sources"
+        ));
+        assert!(!message.contains(concat!("--remote", "-theme")));
+        assert!(!message.contains("--profile"));
+        assert!(!message.contains("--allow-dirty"));
+        assert!(!message.contains("--theme <path>"));
+        assert!(!message.contains("--sibling-repo <path>"));
     }
 
     #[test]
@@ -651,20 +750,54 @@ base_url = "http://localhost:4000"
     }
 
     #[test]
-    fn local_first_commands_without_workspace_config_report_sibling_setup_error() {
+    fn zola_runtime_commands_require_workspace_local_theme() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
+        std::fs::write(&config_path, "").unwrap();
+        std::fs::create_dir(workspace.path().join(config::DEFAULT_THEME_DIR)).unwrap();
+        let workspace_config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        for arguments in [
+            &["build-eips", "build"][..],
+            &["build-eips", "check"][..],
+            &["build-eips", "serve"][..],
+            &["build-eips", "--staging", "build"][..],
+            &["build-eips", "--production", "check"][..],
+            &["build-eips", "parity", "build"][..],
+        ] {
+            let args = parse_args(arguments);
+            let theme_path = super::resolve_theme_path(Some(&workspace_config), &args.operation)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(theme_path, workspace.path().join(config::DEFAULT_THEME_DIR));
+        }
+    }
+
+    #[test]
+    fn non_theme_commands_do_not_require_workspace_local_theme() {
+        for arguments in [
+            &["build-eips", "changed"][..],
+            &["build-eips", "clean"][..],
+            &["build-eips", "doctor"][..],
+            &["build-eips", "print", "schema-version"][..],
+        ] {
+            let args = parse_args(arguments);
+
+            assert!(super::resolve_theme_path(None, &args.operation)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn local_first_theme_commands_without_workspace_config_report_combined_setup_error() {
         for arguments in [
             &["build-eips", "build"][..],
             &["build-eips", "serve"][..],
             &["build-eips", "check"][..],
         ] {
-            let args = parse_args(arguments);
-            let sibling_ids = vec!["ERCs".to_owned()];
-            let error = resolve_execution_settings(&args, &sibling_ids, None).unwrap_err();
-            let message = error.to_string();
-
-            assert!(message.contains("workspace-local sibling sources"));
-            assert!(message.contains("build-eips init <workspace-root>"));
-            assert!(message.contains("--remote-siblings"));
+            assert_combined_missing_workspace_error(arguments);
         }
     }
 
@@ -711,5 +844,54 @@ base_url = "http://localhost:4000"
         let settings = resolve_execution_settings(&args, &[], None).unwrap();
 
         assert_eq!(settings.sibling, SelectedSource::WorkspaceLocal);
+        assert_theme_only_missing_workspace_error(&["build-eips", "build"]);
+    }
+
+    #[test]
+    fn remote_sibling_override_without_workspace_config_only_requires_theme_resolution() {
+        let args = parse_args(&["build-eips", "--remote-siblings", "build"]);
+        let sibling_ids = vec!["ERCs".to_owned()];
+        let settings = resolve_execution_settings(&args, &sibling_ids, None).unwrap();
+
+        assert_eq!(settings.sibling, SelectedSource::Remote);
+        assert_theme_only_missing_workspace_error(&["build-eips", "--remote-siblings", "build"]);
+    }
+
+    #[test]
+    fn environment_and_parity_zola_commands_without_workspace_config_only_require_theme() {
+        for arguments in [
+            &["build-eips", "--staging", "build"][..],
+            &["build-eips", "--production", "serve"][..],
+            &["build-eips", "parity", "check"][..],
+        ] {
+            let args = parse_args(arguments);
+            let sibling_ids = vec!["ERCs".to_owned()];
+            let settings = resolve_execution_settings(&args, &sibling_ids, None).unwrap();
+
+            assert_eq!(settings.sibling, SelectedSource::Remote);
+            assert_theme_only_missing_workspace_error(arguments);
+        }
+    }
+
+    #[test]
+    fn missing_workspace_theme_path_reports_clear_error() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
+        std::fs::write(&config_path, "").unwrap();
+        let workspace_config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+        let args = parse_args(&["build-eips", "build"]);
+
+        let error =
+            super::resolve_theme_path(Some(&workspace_config), &args.operation).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains(&format!(
+            "workspace-local theme path `{}` does not exist",
+            workspace
+                .path()
+                .join(config::DEFAULT_THEME_DIR)
+                .to_string_lossy()
+        )));
+        assert!(message.contains("build-eips init <workspace-root>"));
     }
 }

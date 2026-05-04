@@ -4,7 +4,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-mod cache;
 mod changed;
 mod cli;
 mod config;
@@ -31,9 +30,8 @@ use snafu::{Report, ResultExt, Whatever};
 
 use crate::{
     cli::{Args, Operation, RuntimeOperation},
-    config::Config,
     execution::{resolve_execution, validate_non_execution_command_flags, ResolvedExecution},
-    layout::{CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
+    layout::{output_path, CONTENT_DIR, REPO_DIR},
     workspace::{doctor_workspace, init_workspace},
 };
 
@@ -65,34 +63,30 @@ fn make_build_dir(build_path: &Path) -> Result<PathBuf, Whatever> {
 
 #[derive(Debug)]
 struct Prepared {
-    cache: cache::Cache,
     repo_path: PathBuf,
     output_path: PathBuf,
     repository_use: git::RepositoryUse,
+    theme_path: PathBuf,
     base_url_override: Option<url::Url>,
-    config: Config,
 }
 
 impl Prepared {
-    fn prepare(
-        eipw: lint::CmdArgs,
-        config: Config,
-        resolved: ResolvedExecution,
-    ) -> Result<Self, Whatever> {
+    fn prepare(eipw: lint::CmdArgs, resolved: ResolvedExecution) -> Result<Self, Whatever> {
         zola::find_zola().whatever_context("unable to find suitable zola binary")?;
+        let theme_path = resolved.theme_path()?.to_path_buf();
 
         let ResolvedExecution {
             root_path,
             build_path,
             repository_use,
+            theme_path: _,
             source_materialization,
             base_url_override,
-            staging: _,
         } = resolved;
 
         let repo_path = build_path.join(REPO_DIR);
         let content_path = repo_path.join(CONTENT_DIR);
-        let output_path = build_path.join(OUTPUT_DIR);
+        let output_path = output_path(&build_path);
 
         let both = git::Fresh::new(
             &root_path,
@@ -117,27 +111,16 @@ impl Prepared {
         both.merge()
             .whatever_context("unable to merge ERC/EIP repositories")?;
 
-        let cache = cache::Cache::open().whatever_context("unable to open cache")?;
-
-        lint::eipw(
-            config.theme.repository.as_str(),
-            &config.theme.commit,
-            &cache,
-            &root_path,
-            &repo_path,
-            changed_files,
-            eipw,
-        )
-        .whatever_context("linting failed")?;
+        lint::eipw(&theme_path, &root_path, &repo_path, changed_files, eipw)
+            .whatever_context("linting failed")?;
 
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
 
         Ok(Prepared {
-            config,
-            cache,
             repo_path,
             output_path,
             repository_use,
+            theme_path,
             base_url_override,
         })
     }
@@ -148,9 +131,7 @@ impl Prepared {
             .as_ref()
             .unwrap_or(&self.repository_use.location.base_url);
         zola::build(
-            self.config.theme.repository.as_str(),
-            &self.config.theme.commit,
-            &self.cache,
+            &self.theme_path,
             &self.repo_path,
             &self.output_path,
             base_url.as_str(),
@@ -160,25 +141,13 @@ impl Prepared {
     }
 
     fn serve(self) -> Result<(), Whatever> {
-        zola::serve(
-            self.config.theme.repository.as_str(),
-            &self.config.theme.commit,
-            &self.cache,
-            &self.repo_path,
-            &self.output_path,
-        )
-        .whatever_context("zola serve failed")?;
+        zola::serve(&self.theme_path, &self.repo_path, &self.output_path)
+            .whatever_context("zola serve failed")?;
         Ok(())
     }
 
     fn check(self) -> Result<(), Whatever> {
-        zola::check(
-            self.config.theme.repository.as_str(),
-            &self.config.theme.commit,
-            &self.cache,
-            &self.repo_path,
-        )
-        .whatever_context("zola check failed")?;
+        zola::check(&self.theme_path, &self.repo_path).whatever_context("zola check failed")?;
         Ok(())
     }
 }
@@ -223,28 +192,13 @@ fn run() -> Result<(), Whatever> {
             return Ok(());
         }
         RuntimeOperation::Check { eipw } => {
-            let config = if resolved.staging {
-                Config::staging()
-            } else {
-                Config::production()
-            };
-            Prepared::prepare(eipw, config, resolved)?.check()?;
+            Prepared::prepare(eipw, resolved)?.check()?;
         }
         RuntimeOperation::Build { eipw } => {
-            let config = if resolved.staging {
-                Config::staging()
-            } else {
-                Config::production()
-            };
-            Prepared::prepare(eipw, config, resolved)?.build()?;
+            Prepared::prepare(eipw, resolved)?.build()?;
         }
         RuntimeOperation::Serve { eipw } => {
-            let config = if resolved.staging {
-                Config::staging()
-            } else {
-                Config::production()
-            };
-            Prepared::prepare(eipw, config, resolved)?.serve()?;
+            Prepared::prepare(eipw, resolved)?.serve()?;
         }
         RuntimeOperation::Changed { all, format } => {
             changed::run(&resolved, &build_path, all, &format)?;
