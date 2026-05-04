@@ -11,7 +11,6 @@ use std::{
 };
 
 use crate::{
-    cache::Cache,
     config::{LegacyLocations, RepositoryEndpoint},
     layout::{BUILD_DIR, CONTENT_DIR},
     progress::{Git, ProgressIteratorExt},
@@ -67,11 +66,6 @@ pub enum Error {
     DirtyUnsupportedPath { path: PathBuf, backtrace: Backtrace },
     #[snafu(display("unable to update tree ({msg})"))]
     UpdateTree { msg: String, backtrace: Backtrace },
-    #[snafu(context(false))]
-    Cache {
-        #[snafu(backtrace)]
-        source: crate::cache::Error,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1145,40 +1139,6 @@ fn open_or_init(dir: &Path) -> Result<git2::Repository, Error> {
             Err(e) => return Err(GitSnafu { what: "open repo" }.into_error(e)),
         };
     Ok(repo)
-}
-
-impl Cache {
-    pub fn repo(&self, url: &str, commit: &str) -> Result<PathBuf, Error> {
-        let key = format!("git\0{url}");
-        let dir = self.dir(&key)?;
-
-        let repo = open_or_init(&dir)?;
-        let object = match repo.revparse_single(commit) {
-            Ok(c) => c,
-            Err(e) if e.code() == git2::ErrorCode::NotFound => {
-                fetch(&repo, url, "master")?;
-                repo.revparse_single(commit).context(GitSnafu {
-                    what: "revparse cached commit",
-                })?
-            }
-            Err(e) => {
-                return Err(GitSnafu {
-                    what: "revparse cached commit",
-                }
-                .into_error(e))
-            }
-        };
-
-        repo.checkout_tree(&object, Some(CheckoutBuilder::new().force()))
-            .context(GitSnafu {
-                what: "checkout cached commit",
-            })?;
-        repo.set_head_detached(object.id()).context(GitSnafu {
-            what: "set detached head",
-        })?;
-
-        Ok(dir)
-    }
 }
 
 #[cfg(test)]
