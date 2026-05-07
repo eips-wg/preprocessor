@@ -233,6 +233,10 @@ fn write_file(path: &Path, front_matter: FrontMatter, body: &str) -> std::io::Re
     Ok(())
 }
 
+fn is_section_index_path(path: &Path) -> bool {
+    path.file_name() == Some(OsStr::new("_index.md"))
+}
+
 lazy_static! {
     // Matches GitHub usernames.
     static ref RE_GITHUB: Regex = Regex::new(r"^([^()<>,@]+) \(@([a-zA-Z\d-]+)\)$").unwrap();
@@ -1353,14 +1357,26 @@ fn process_eip(
     let body = transform_markdown(root, path, body, only_plan)
         .with_whatever_context(|_| format!("unable to transform markdown for `{path_lossy}`"))?;
 
+    if is_section_index_path(path) {
+        let front_matter =
+            serde_yaml::from_str::<FrontMatter>(preamble).with_whatever_context(|_| {
+                format!("couldn't parse section front matter in `{}`", path_lossy)
+            })?;
+
+        match write_file(path, front_matter, &body) {
+            Ok(()) => {}
+            Err(error) if missing_path_mode.should_ignore_io_error(&error) => return Ok(()),
+            Err(error) => return Err(error).whatever_context("couldn't write file"),
+        }
+
+        return Ok(());
+    }
+
     let preamble = Preamble::parse(Some(&path_lossy), preamble)
         .ok()
         .with_whatever_context(|| format!("couldn't parse preamble in `{}`", path_lossy))?;
 
-    let updated = match path.file_name() {
-        Some(x) if x == "_index.md" => None,
-        _ => Some(last_modified(path)?),
-    };
+    let updated = Some(last_modified(path)?);
 
     let mut front_matter = FrontMatter {
         updated,
@@ -2337,6 +2353,41 @@ mod tests {
 
         preprocess(&content, Some(&plan)).unwrap();
 
+        let body = rendered_body(&content.join("_index.md"));
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-678"));
+        assert!(!body.contains("@/00678.md"));
+    }
+
+    #[test]
+    fn preprocess_preserves_section_extra_front_matter_and_rewrites_body_links() {
+        let (_temp, content) = content_repo(&[
+            (
+                "_index.md",
+                r#"---
+title: Home
+extra:
+  homepage_badges:
+    - href: https://discord.gg/9FxN6CfaQR
+      image: https://dcbadge.limes.pink/api/server/9FxN6CfaQR?style=flat
+      alt: Badge for ERCRef Discord channel
+---
+See [EIP-678](/00678.md).
+"#
+                .to_owned(),
+            ),
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            ("00678.md", proposal_markdown(678, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let front_matter = rendered_front_matter(&content.join("_index.md"));
+        let badges = front_matter["extra"]["homepage_badges"].as_array().unwrap();
+        assert_eq!(
+            badges[0]["href"].as_str().unwrap(),
+            "https://discord.gg/9FxN6CfaQR"
+        );
         let body = rendered_body(&content.join("_index.md"));
         assert!(body.contains("https://eips.ethereum.org/EIPS/eip-678"));
         assert!(!body.contains("@/00678.md"));
