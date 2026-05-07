@@ -270,6 +270,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_yaml",
  "snafu",
  "tempfile",
  "tiny_http",
