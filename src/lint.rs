@@ -11,7 +11,6 @@ use clap::ValueEnum;
 use log::debug;
 use semver::{Comparator, Op, VersionReq};
 
-use crate::cache::Cache;
 use crate::progress::ProgressIteratorExt;
 
 use eipw_lint::reporters::{AdditionalHelp, Count, Json, Reporter, Text};
@@ -51,11 +50,6 @@ pub enum Error {
         source: std::io::Error,
     },
     #[snafu(transparent)]
-    Git {
-        #[snafu(backtrace)]
-        source: crate::git::Error,
-    },
-    #[snafu(transparent)]
     SchemaVersion {
         #[snafu(backtrace)]
         source: SchemaVersionError,
@@ -92,7 +86,7 @@ struct Config {
     eipw: eipw_lint::config::DefaultOptions,
 }
 
-#[derive(Debug, clap::Args, Serialize, Deserialize)]
+#[derive(Debug, Clone, clap::Args, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CmdArgs {
     /// Disable linting entirely
@@ -257,9 +251,7 @@ fn version_cmp(
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn eipw(
-    theme_repo: &str,
-    theme_rev: &str,
-    cache: &Cache,
+    theme_path: &Path,
     root_dir: &Path,
     repo_dir: &Path,
     changed_paths: Vec<PathBuf>,
@@ -271,10 +263,7 @@ pub async fn eipw(
 
     let mut stdout = std::io::stdout();
 
-    let mut config_path = cache.repo(theme_repo, theme_rev)?;
-
-    config_path.push("config");
-    config_path.push("eipw.toml");
+    let config_path = theme_path.join("config").join("eipw.toml");
 
     let toml_file = Toml::file_exact(&config_path);
 

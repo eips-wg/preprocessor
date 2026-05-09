@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use super::CONTENT_DIR;
+use crate::layout::CONTENT_DIR;
 use snafu::{ResultExt, Snafu};
 use std::{
     backtrace::Backtrace,
