@@ -4,19 +4,25 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-mod cache;
 mod changed;
 mod cli;
 mod config;
 mod context;
+mod execution;
 mod find_root;
 mod git;
 mod github;
+mod identity;
 mod layout;
 mod lint;
 mod markdown;
+mod pipeline;
+mod preview;
 mod print;
 mod progress;
+mod proposal;
+mod serve;
+mod workspace;
 mod zola;
 
 use std::path::{Path, PathBuf};
@@ -27,9 +33,11 @@ use log::{debug, info};
 use snafu::{Report, ResultExt, Whatever};
 
 use crate::{
-    cli::{Args, Operation},
-    config::Config,
-    layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
+    cli::{Args, Operation, RuntimeOperation},
+    execution::{resolve_execution, validate_non_execution_command_flags},
+    layout::output_path,
+    pipeline::Prepared,
+    workspace::{doctor_workspace, init_workspace},
 };
 
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
@@ -48,144 +56,53 @@ fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
     Ok(lock_file)
 }
 
-fn make_build_dir(root: &Path) -> Result<PathBuf, Whatever> {
-    let build_path = root.join(BUILD_DIR);
-    if let Err(e) = std::fs::create_dir_all(&build_path) {
+fn make_build_dir(build_path: &Path) -> Result<PathBuf, Whatever> {
+    if let Err(e) = std::fs::create_dir_all(build_path) {
         debug!(
             "got while creating build directory: {}",
             Report::from_error(e)
         );
     }
-    Ok(build_path)
-}
-
-#[derive(Debug)]
-struct Prepared {
-    cache: cache::Cache,
-    root_path: PathBuf,
-    repo_path: PathBuf,
-    output_path: PathBuf,
-    config: Config,
-}
-
-impl Prepared {
-    fn prepare(
-        eipw: lint::CmdArgs,
-        config: Config,
-        root_path: PathBuf,
-        build_path: PathBuf,
-    ) -> Result<Self, Whatever> {
-        zola::find_zola().whatever_context("unable to find suitable zola binary")?;
-
-        let repo_path = build_path.join(REPO_DIR);
-        let content_path = repo_path.join(CONTENT_DIR);
-        let output_path = build_path.join(OUTPUT_DIR);
-
-        let both = git::Fresh::new(&root_path, &repo_path, &config.locations)
-            .whatever_context("initializing build repo")?
-            .clone_src()
-            .whatever_context("cloning source repo")?
-            .fetch_upstream()
-            .whatever_context("fetching upstream repo")?;
-
-        let changed_files: Vec<_> = both
-            .changed_files()
-            .whatever_context("unable to list changed files")?
-            .into_iter()
-            .filter(|p| changed::is_proposal_path(p.into()))
-            .map(|p| repo_path.join(p))
-            .collect();
-
-        both.merge()
-            .whatever_context("unable to merge ERC/EIP repositories")?;
-
-        let cache = cache::Cache::open().whatever_context("unable to open cache")?;
-
-        lint::eipw(
-            config.theme.repository.as_str(),
-            &config.theme.commit,
-            &cache,
-            &root_path,
-            &repo_path,
-            changed_files,
-            eipw,
-        )
-        .whatever_context("linting failed")?;
-
-        markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
-
-        Ok(Prepared {
-            config,
-            root_path,
-            cache,
-            repo_path,
-            output_path,
-        })
-    }
-
-    fn build(self) -> Result<(), Whatever> {
-        let repository_use = self
-            .config
-            .locations
-            .identify_repository(&self.root_path)
-            .whatever_context("cannot identify repository use")?;
-        zola::build(
-            self.config.theme.repository.as_str(),
-            &self.config.theme.commit,
-            &self.cache,
-            &self.repo_path,
-            &self.output_path,
-            repository_use.location.base_url.as_str(),
-        )
-        .whatever_context("zola build failed")?;
-        Ok(())
-    }
-
-    fn serve(self) -> Result<(), Whatever> {
-        zola::serve(
-            self.config.theme.repository.as_str(),
-            &self.config.theme.commit,
-            &self.cache,
-            &self.repo_path,
-            &self.output_path,
-        )
-        .whatever_context("zola serve failed")?;
-        Ok(())
-    }
-
-    fn check(self) -> Result<(), Whatever> {
-        zola::check(
-            self.config.theme.repository.as_str(),
-            &self.config.theme.commit,
-            &self.cache,
-            &self.repo_path,
-        )
-        .whatever_context("zola check failed")?;
-        Ok(())
-    }
+    Ok(build_path.to_path_buf())
 }
 
 fn run() -> Result<(), Whatever> {
     let args = Args::parse();
-    if let Operation::Print { print } = args.operation {
-        print::print(print);
+    validate_non_execution_command_flags(&args)?;
+
+    if let Operation::Print { print } = &args.operation {
+        print::print(print.clone());
         return Ok(());
     }
 
-    let config = if args.staging {
-        Config::staging()
-    } else {
-        Config::production()
-    };
+    if let Operation::Init { path, template } = &args.operation {
+        init_workspace(&args, path.clone(), *template)?;
+        return Ok(());
+    }
 
-    let root_path = context::root(&args)?;
-    let build_path = make_build_dir(&root_path)?;
+    if let Operation::Doctor = &args.operation {
+        doctor_workspace(&args)?;
+        return Ok(());
+    }
+
+    let runtime_operation = args
+        .operation
+        .runtime_operation()
+        .expect("non-execution commands should have returned earlier");
+    let resolved = resolve_execution(&args)?;
+
+    if matches!(runtime_operation, RuntimeOperation::Preview) {
+        preview::serve(&output_path(&resolved.build_path), &resolved.server_binding)
+            .whatever_context("preview server failed")?;
+        return Ok(());
+    }
+
+    let build_path = make_build_dir(&resolved.build_path)?;
 
     let mut lock_file = lock(&build_path)?;
 
-    match args.operation {
-        Operation::Print { .. } => unreachable!(),
-        Operation::Clean => {
+    match runtime_operation {
+        RuntimeOperation::Clean => {
             // TODO: There's a race condition here. Maybe we move the lockfile to the repository
             //       root?
             lock_file
@@ -195,17 +112,18 @@ fn run() -> Result<(), Whatever> {
                 .whatever_context("unable to remove build directory")?;
             return Ok(());
         }
-        Operation::Check { eipw } => {
-            Prepared::prepare(eipw, config, root_path, build_path)?.check()?;
+        RuntimeOperation::Check { eipw } => {
+            Prepared::prepare(eipw, resolved)?.check()?;
         }
-        Operation::Build { eipw } => {
-            Prepared::prepare(eipw, config, root_path, build_path)?.build()?;
+        RuntimeOperation::Build { eipw } => {
+            Prepared::prepare(eipw, resolved)?.build()?;
         }
-        Operation::Serve { eipw } => {
-            Prepared::prepare(eipw, config, root_path, build_path)?.serve()?;
+        RuntimeOperation::Serve { eipw } => {
+            Prepared::prepare(eipw, resolved)?.serve()?;
         }
-        Operation::Changed { all, format } => {
-            changed::run(&root_path, &build_path, &config, all, &format)?;
+        RuntimeOperation::Preview => unreachable!(),
+        RuntimeOperation::Changed { all, format } => {
+            changed::run(&resolved, &build_path, all, &format)?;
         }
     }
 

@@ -13,7 +13,7 @@ use std::{
 
 use snafu::{ResultExt, Whatever};
 
-use crate::{cli::ChangedFormat, config::Config, git, layout::REPO_DIR};
+use crate::{cli::ChangedFormat, execution::ResolvedExecution, git, layout::REPO_DIR};
 
 pub(crate) fn is_proposal_path(mut p: PathBuf) -> bool {
     // Only lint `content/00001.md` and `content/00001/index.md` files.
@@ -53,20 +53,24 @@ pub(crate) fn is_proposal_path(mut p: PathBuf) -> bool {
 }
 
 pub(crate) fn run(
-    root_path: &Path,
+    resolved: &ResolvedExecution,
     build_path: &Path,
-    config: &Config,
     all: bool,
     format: &ChangedFormat,
 ) -> Result<(), Whatever> {
     let repo_path = build_path.join(REPO_DIR);
 
-    let both = git::Fresh::new(root_path, &repo_path, &config.locations)
-        .whatever_context("initializing build repo")?
-        .clone_src()
-        .whatever_context("cloning source repo")?
-        .fetch_upstream()
-        .whatever_context("fetching upstream repo")?;
+    let both = git::Fresh::new(
+        &resolved.root_path,
+        &repo_path,
+        resolved.repository_use.clone(),
+        resolved.source_materialization,
+    )
+    .whatever_context("initializing build repo")?
+    .clone_src()
+    .whatever_context("cloning source repo")?
+    .fetch_upstream()
+    .whatever_context("fetching upstream repo")?;
 
     let changed_files: Vec<_> = both
         .changed_files()
