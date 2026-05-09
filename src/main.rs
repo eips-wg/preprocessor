@@ -12,11 +12,13 @@ mod context;
 mod find_root;
 mod git;
 mod github;
+mod identity;
 mod layout;
 mod lint;
 mod markdown;
 mod print;
 mod progress;
+mod workspace;
 mod zola;
 
 use std::path::{Path, PathBuf};
@@ -30,7 +32,19 @@ use crate::{
     cli::{Args, Operation},
     config::Config,
     layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
+    workspace::{doctor_workspace, init_workspace},
 };
+
+fn repository_use(config: &Config, root_path: &Path) -> Result<git::RepositoryUse, Whatever> {
+    let repo_id = config
+        .locations
+        .identify_repository_title(root_path)
+        .whatever_context("cannot identify repository use")?;
+    let Some(repository_use) = config.locations.repository_use_for_title(&repo_id) else {
+        snafu::whatever!("repository metadata for `{repo_id}` is unavailable");
+    };
+    Ok(repository_use)
+}
 
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
     let lock_path = build_path.join(".lock");
@@ -81,12 +95,18 @@ impl Prepared {
         let content_path = repo_path.join(CONTENT_DIR);
         let output_path = build_path.join(OUTPUT_DIR);
 
-        let both = git::Fresh::new(&root_path, &repo_path, &config.locations)
-            .whatever_context("initializing build repo")?
-            .clone_src()
-            .whatever_context("cloning source repo")?
-            .fetch_upstream()
-            .whatever_context("fetching upstream repo")?;
+        let repository_use = repository_use(&config, &root_path)?;
+        let both = git::Fresh::new(
+            &root_path,
+            &repo_path,
+            repository_use,
+            git::SourceMaterialization::Clean,
+        )
+        .whatever_context("initializing build repo")?
+        .clone_src()
+        .whatever_context("cloning source repo")?
+        .fetch_upstream()
+        .whatever_context("fetching upstream repo")?;
 
         let changed_files: Vec<_> = both
             .changed_files()
@@ -124,11 +144,7 @@ impl Prepared {
     }
 
     fn build(self) -> Result<(), Whatever> {
-        let repository_use = self
-            .config
-            .locations
-            .identify_repository(&self.root_path)
-            .whatever_context("cannot identify repository use")?;
+        let repository_use = repository_use(&self.config, &self.root_path)?;
         zola::build(
             self.config.theme.repository.as_str(),
             &self.config.theme.commit,
@@ -172,6 +188,16 @@ fn run() -> Result<(), Whatever> {
         return Ok(());
     }
 
+    if let Operation::Init { path, template } = &args.operation {
+        init_workspace(&args, path.clone(), *template)?;
+        return Ok(());
+    }
+
+    if let Operation::Doctor = &args.operation {
+        doctor_workspace(&args)?;
+        return Ok(());
+    }
+
     let config = if args.staging {
         Config::staging()
     } else {
@@ -185,6 +211,8 @@ fn run() -> Result<(), Whatever> {
 
     match args.operation {
         Operation::Print { .. } => unreachable!(),
+        Operation::Init { .. } => unreachable!(),
+        Operation::Doctor => unreachable!(),
         Operation::Clean => {
             // TODO: There's a race condition here. Maybe we move the lockfile to the repository
             //       root?
