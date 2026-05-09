@@ -12,6 +12,7 @@ mod context;
 mod find_root;
 mod git;
 mod github;
+mod identity;
 mod layout;
 mod lint;
 mod markdown;
