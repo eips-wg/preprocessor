@@ -92,7 +92,7 @@ struct Config {
     eipw: eipw_lint::config::DefaultOptions,
 }
 
-#[derive(Debug, clap::Args, Serialize, Deserialize)]
+#[derive(Debug, Clone, clap::Args, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CmdArgs {
     /// Disable linting entirely
