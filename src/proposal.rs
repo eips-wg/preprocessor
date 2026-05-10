@@ -201,13 +201,13 @@ struct ProposalAssetInventoryEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProposalPublicSite {
+pub(crate) enum ProposalPublicSite {
     Eips,
     Ercs,
 }
 
 impl ProposalPublicSite {
-    fn proposal_url(self, proposal_number: ProposalNumber) -> String {
+    pub(crate) fn proposal_url(self, proposal_number: ProposalNumber) -> String {
         match self {
             Self::Eips => format!(
                 "https://eips.ethereum.org/EIPS/eip-{}",
@@ -500,6 +500,10 @@ impl OnlyRenderPlan {
         Some(public_asset_url(entry))
     }
 
+    pub(crate) fn is_selected_number(&self, proposal_number: ProposalNumber) -> bool {
+        self.selected_numbers.contains(&proposal_number)
+    }
+
     pub(crate) fn external_url_for_canonical_target(
         &self,
         canonical_target: &Path,
@@ -726,25 +730,36 @@ fn remove_dir_if_present(path: &Path) -> Result<(), Whatever> {
     }
 }
 
-fn public_site_for_markdown(
+pub(crate) fn parse_proposal_preamble<'a>(
     markdown_path: &Path,
-    contents: &str,
-) -> Result<ProposalPublicSite, Whatever> {
+    contents: &'a str,
+) -> Result<Preamble<'a>, Whatever> {
     let path_lossy = markdown_path.to_string_lossy();
     let (preamble, _) = Preamble::split(contents)
         .with_whatever_context(|_| format!("couldn't split preamble for `{path_lossy}`"))?;
-    let preamble = Preamble::parse(Some(&path_lossy), preamble)
+    Preamble::parse(None, preamble)
         .ok()
-        .with_whatever_context(|| format!("couldn't parse preamble in `{path_lossy}`"))?;
+        .with_whatever_context(|| format!("couldn't parse preamble in `{path_lossy}`"))
+}
+
+fn public_site_for_preamble(preamble: &Preamble<'_>) -> ProposalPublicSite {
     let is_erc = preamble
         .fields()
         .any(|field| field.name() == "category" && field.value().trim() == "ERC");
 
     if is_erc {
-        Ok(ProposalPublicSite::Ercs)
+        ProposalPublicSite::Ercs
     } else {
-        Ok(ProposalPublicSite::Eips)
+        ProposalPublicSite::Eips
     }
+}
+
+pub(crate) fn public_site_for_markdown(
+    markdown_path: &Path,
+    contents: &str,
+) -> Result<ProposalPublicSite, Whatever> {
+    let preamble = parse_proposal_preamble(markdown_path, contents)?;
+    Ok(public_site_for_preamble(&preamble))
 }
 
 #[allow(dead_code)]

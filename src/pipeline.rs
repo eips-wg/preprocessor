@@ -18,6 +18,7 @@ use crate::{
     layout::{mounted_theme_path, output_path, CONTENT_DIR, REPO_DIR},
     markdown,
     proposal::OnlyRenderPlan,
+    proposal_metadata,
     serve::{serve_sync_config, DirtyServeWatcher, LocalThemeServeSync},
     zola,
 };
@@ -111,6 +112,12 @@ impl Prepared {
             .map(|selected_numbers| OnlyRenderPlan::build(&content_path, selected_numbers))
             .transpose()
             .whatever_context("unable to build targeted render plan")?;
+        proposal_metadata::write_proposal_metadata_json(
+            &repo_path,
+            &repository_use.title,
+            only_plan.as_ref(),
+        )
+        .whatever_context("unable to write proposal metadata JSON")?;
         markdown::preprocess(&content_path, only_plan.as_ref())
             .whatever_context("unable to preprocess markdown")?;
         if let Some(only_plan) = &only_plan {
@@ -204,7 +211,8 @@ mod tests {
         editorial::editorial_runtime_execution,
         execution::{resolve_execution, ResolvedExecution},
         git::SourceMaterialization,
-        layout::{mounted_theme_path, theme_config_path, REPO_DIR},
+        layout::{mounted_theme_path, theme_config_path, CONTENT_DIR, REPO_DIR},
+        proposal_catalog::collect_proposal_catalog,
     };
 
     use super::{prepare_runtime_source, prepare_theme_for_zola};
@@ -296,6 +304,15 @@ base_url = "https://staging.example.test/{sibling_id}/"
         }
 
         manifest
+    }
+
+    fn pipeline_proposal_markdown(number: u32, category: Option<&str>, body: &str) -> String {
+        let category = category
+            .map(|category| format!("category: {category}\n"))
+            .unwrap_or_default();
+        format!(
+            "---\neip: {number}\ntitle: Proposal {number}\nstatus: Draft\ntype: Standards Track\n{category}---\n\n{body}\n"
+        )
     }
 
     fn runtime_workspace(with_sibling: bool) -> RuntimeWorkspace {
@@ -483,5 +500,45 @@ base_url = "https://staging.example.test/{sibling_id}/"
             std::fs::read_to_string(prepared_path(&resolved, "content/00001.md")).unwrap(),
             "active proposal\n"
         );
+    }
+
+    #[test]
+    fn proposal_catalog_collection_uses_prepared_merged_sources() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let active_path = workspace_root.join("EIPs");
+        let sibling_path = workspace_root.join("ERCs");
+        let active_url = file_url(&active_path);
+        let sibling_url = file_url(&sibling_path);
+        let manifest = repo_manifest_text("EIPs", &active_url, &[("ERCs", sibling_url)]);
+        let active_markdown = pipeline_proposal_markdown(1, None, "Active proposal.");
+        let sibling_markdown = pipeline_proposal_markdown(2, Some("ERC"), "Sibling proposal.");
+
+        write_file(&workspace_root, config::LOCAL_CONFIG_FILE, "");
+        std::fs::create_dir_all(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+        let _active_repo = init_repo(
+            &active_path,
+            &[
+                (config::REPO_MANIFEST_FILE, manifest.as_str()),
+                ("content/00001.md", active_markdown.as_str()),
+            ],
+        );
+        let _sibling_repo = init_repo(
+            &sibling_path,
+            &[("content/00002.md", sibling_markdown.as_str())],
+        );
+        let workspace = RuntimeWorkspace {
+            _temp: temp,
+            active_path,
+        };
+        let resolved = resolved_runtime(&workspace, &["build"]);
+
+        prepare_resolved_source(&resolved).unwrap();
+        let catalog =
+            collect_proposal_catalog(&prepared_path(&resolved, CONTENT_DIR), None).unwrap();
+        let records = catalog.into_records();
+
+        assert!(!resolved.root_path.join("content/00002.md").exists());
+        assert_eq!(records["erc-2"].title, "Proposal 2");
     }
 }
