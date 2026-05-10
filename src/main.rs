@@ -22,6 +22,8 @@ mod preview;
 mod print;
 mod progress;
 mod proposal;
+mod proposal_catalog;
+mod proposal_metadata;
 mod serve;
 mod workspace;
 mod zola;
