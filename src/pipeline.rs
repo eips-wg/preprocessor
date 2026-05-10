@@ -290,15 +290,24 @@ mod tests {
         .unwrap();
     }
 
-    fn init_repo(path: &Path, files: &[(&str, &str)]) -> Repository {
+    fn init_repo_with_files<I, P, C>(path: &Path, files: I) -> Repository
+    where
+        I: IntoIterator<Item = (P, C)>,
+        P: AsRef<Path>,
+        C: AsRef<str>,
+    {
         std::fs::create_dir_all(path).unwrap();
         let repo = Repository::init(path).unwrap();
         repo.set_head("refs/heads/master").unwrap();
         for (relative, contents) in files {
-            write_file(path, relative, contents);
+            write_file(path, relative, contents.as_ref());
         }
         commit_all(&repo, "initial");
         repo
+    }
+
+    fn init_repo(path: &Path, files: &[(&str, &str)]) -> Repository {
+        init_repo_with_files(path, files.iter().copied())
     }
 
     fn file_url(path: &Path) -> Url {
@@ -354,6 +363,78 @@ base_url = "https://staging.example.test/{sibling_id}/"
         format!(
             "---\neip: {number}\ntitle: Hardfork Meta {number}\nstatus: Draft\ntype: Meta\ncreated: {created}\n---\n\n{body}\n"
         )
+    }
+
+    fn pipeline_proposal_path(number: u32) -> String {
+        format!("content/{number:05}.md")
+    }
+
+    fn pipeline_included_heading(numbers: &[u32]) -> String {
+        numbers
+            .iter()
+            .map(|number| format!("* [EIP-{number}](./{number:05}.md)\n"))
+            .collect()
+    }
+
+    fn pipeline_historical_registry_source_files() -> Vec<(String, String)> {
+        [
+            (606, "2016-03-14", &[2, 7, 8][..]),
+            (608, "2016-10-18", &[150][..]),
+            (607, "2016-11-22", &[155, 160, 161, 170][..]),
+            (
+                609,
+                "2017-10-16",
+                &[100, 140, 196, 197, 198, 211, 214, 649, 658][..],
+            ),
+            (1013, "2019-02-28", &[145, 1014, 1052, 1234, 1283][..]),
+            (1679, "2019-12-08", &[152, 1108, 1344, 1884, 2028, 2200][..]),
+            (2387, "2020-01-02", &[2384][..]),
+        ]
+        .into_iter()
+        .map(|(number, created, members)| {
+            (
+                pipeline_proposal_path(number),
+                pipeline_meta_markdown(
+                    number,
+                    created,
+                    &format!(
+                        "### Included EIPs\n\n{}",
+                        pipeline_included_heading(members)
+                    ),
+                ),
+            )
+        })
+        .chain(
+            [
+                (779, "2016-07-20"),
+                (1716, "2019-02-28"),
+                (7568, "2024-01-01"),
+            ]
+            .into_iter()
+            .map(|(number, created)| {
+                (
+                    pipeline_proposal_path(number),
+                    pipeline_meta_markdown(number, created, ""),
+                )
+            }),
+        )
+        .collect()
+    }
+
+    fn pipeline_historical_registry_member_files() -> Vec<(String, String)> {
+        [
+            7, 8, 100, 140, 145, 150, 152, 155, 160, 161, 170, 196, 197, 198, 211, 214, 649, 658,
+            1014, 1052, 1108, 1234, 1283, 1344, 1559, 1884, 2028, 2200, 2384, 2565, 2718, 2929,
+            2930, 3198, 3529, 3541, 3554, 3651, 3675, 3855, 3860, 4345, 4399, 4895, 5133, 6049,
+        ]
+        .into_iter()
+        .map(|number| {
+            (
+                pipeline_proposal_path(number),
+                pipeline_proposal_markdown(number, None, "Registry member."),
+            )
+        })
+        .collect()
     }
 
     fn runtime_workspace(with_sibling: bool) -> RuntimeWorkspace {
@@ -663,20 +744,28 @@ base_url = "https://staging.example.test/{sibling_id}/"
 
         write_file(&workspace_root, config::LOCAL_CONFIG_FILE, "");
         std::fs::create_dir_all(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
-        let _active_repo = init_repo(
+        let mut active_files = vec![
+            (config::REPO_MANIFEST_FILE.to_owned(), manifest),
+            ("content/07773.md".to_owned(), glamsterdam),
+            ("content/08081.md".to_owned(), hegota),
+            ("content/07569.md".to_owned(), dencun),
+            ("content/07600.md".to_owned(), pectra),
+            ("content/07607.md".to_owned(), fusaka),
+        ];
+        active_files.extend(pipeline_historical_registry_source_files());
+        let _active_repo = init_repo_with_files(
             &active_path,
-            &[
-                (config::REPO_MANIFEST_FILE, manifest.as_str()),
-                ("content/07773.md", glamsterdam.as_str()),
-                ("content/08081.md", hegota.as_str()),
-                ("content/07569.md", dencun.as_str()),
-                ("content/07600.md", pectra.as_str()),
-                ("content/07607.md", fusaka.as_str()),
-            ],
+            active_files
+                .iter()
+                .map(|(relative, contents)| (relative.as_str(), contents.as_str())),
         );
-        let _sibling_repo = init_repo(
+        let mut sibling_files = vec![("content/00002.md".to_owned(), sibling_markdown)];
+        sibling_files.extend(pipeline_historical_registry_member_files());
+        let _sibling_repo = init_repo_with_files(
             &sibling_path,
-            &[("content/00002.md", sibling_markdown.as_str())],
+            sibling_files
+                .iter()
+                .map(|(relative, contents)| (relative.as_str(), contents.as_str())),
         );
         let workspace = RuntimeWorkspace {
             _temp: temp,
@@ -698,7 +787,13 @@ base_url = "https://staging.example.test/{sibling_id}/"
         only_plan.prune_content(&content_path).unwrap();
 
         assert!(!resolved.root_path.join("content/00002.md").exists());
-        assert_eq!(index.memberships_by_proposal[&number(2)].len(), 1);
+        let membership_names = index.memberships_by_proposal[&number(2)]
+            .iter()
+            .map(|membership| membership.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(membership_names.len(), 2);
+        assert!(membership_names.contains(&"Homestead"));
+        assert!(membership_names.contains(&"Glamsterdam"));
         assert!(prepared_path(&resolved, "static/assets/data/proposals.json").exists());
         assert!(prepared_path(&resolved, "content/hardforks/_index.md").exists());
         assert!(!prepared_path(&resolved, "content/07773.md").exists());
