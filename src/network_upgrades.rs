@@ -140,6 +140,8 @@ impl fmt::Display for NetworkUpgradeSourceBucket {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NetworkUpgradeParserMode {
     ModernStages,
+    LegacyIncludedList,
+    ExplicitIncludedMembers(&'static [u32]),
     #[allow(dead_code)]
     EmptyMembers,
 }
@@ -297,6 +299,12 @@ pub(crate) fn collect_network_upgrades_with_registries(
         )?;
         let parsed_stages = match selected_source.details.parser_mode {
             NetworkUpgradeParserMode::ModernStages => parse_modern_stage_members(source_document)?,
+            NetworkUpgradeParserMode::LegacyIncludedList => {
+                parse_legacy_included_members(source_document)?
+            }
+            NetworkUpgradeParserMode::ExplicitIncludedMembers(members) => {
+                explicit_included_members(members)?
+            }
             NetworkUpgradeParserMode::EmptyMembers => Vec::new(),
         };
         let upgrade = build_network_upgrade(
@@ -469,6 +477,185 @@ pub(crate) fn transitional_modern_registry() -> Vec<NetworkUpgradeRegistrySource
 
 pub(crate) fn permanent_registry() -> Vec<NetworkUpgradeRegistrySource> {
     vec![
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 606,
+            parser_mode: NetworkUpgradeParserMode::LegacyIncludedList,
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Homestead",
+                slug: None,
+                sort_order: Some(20160314),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 779,
+            parser_mode: NetworkUpgradeParserMode::EmptyMembers,
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "DAO Fork",
+                slug: None,
+                sort_order: Some(20160720),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 608,
+            parser_mode: NetworkUpgradeParserMode::LegacyIncludedList,
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Tangerine Whistle",
+                slug: None,
+                sort_order: Some(20161018),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 607,
+            parser_mode: NetworkUpgradeParserMode::LegacyIncludedList,
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Spurious Dragon",
+                slug: None,
+                sort_order: Some(20161122),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 609,
+            parser_mode: NetworkUpgradeParserMode::LegacyIncludedList,
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Byzantium",
+                slug: None,
+                sort_order: Some(20171016),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 1013,
+            parser_mode: NetworkUpgradeParserMode::LegacyIncludedList,
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Constantinople",
+                slug: None,
+                sort_order: Some(20190228),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 1716,
+            parser_mode: NetworkUpgradeParserMode::EmptyMembers,
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Petersburg",
+                slug: None,
+                sort_order: Some(20190228),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 1679,
+            parser_mode: NetworkUpgradeParserMode::LegacyIncludedList,
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Istanbul",
+                slug: None,
+                sort_order: Some(20191208),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 2387,
+            parser_mode: NetworkUpgradeParserMode::LegacyIncludedList,
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Muir Glacier",
+                slug: None,
+                sort_order: Some(20200102),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 7568,
+            parser_mode: NetworkUpgradeParserMode::EmptyMembers,
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Beacon Chain Launch - Serenity Phase 0",
+                slug: None,
+                sort_order: Some(20201201),
+            }],
+        },
+        // EIP-7568 points to execution-specs mainnet-upgrade files pinned at
+        // 8dbde99b132ff8d8fcc9cfb015a9947ccc8b12d6. These curated
+        // memberships mirror that pinned source family without runtime fetches.
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 7568,
+            parser_mode: NetworkUpgradeParserMode::ExplicitIncludedMembers(&[
+                2565, 2929, 2718, 2930,
+            ]),
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Berlin",
+                slug: None,
+                sort_order: Some(20210415),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 7568,
+            parser_mode: NetworkUpgradeParserMode::ExplicitIncludedMembers(&[
+                1559, 3198, 3529, 3541, 3554,
+            ]),
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "London",
+                slug: None,
+                sort_order: Some(20210805),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 7568,
+            parser_mode: NetworkUpgradeParserMode::EmptyMembers,
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Altair",
+                slug: None,
+                sort_order: Some(20211027),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 7568,
+            parser_mode: NetworkUpgradeParserMode::ExplicitIncludedMembers(&[4345]),
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Arrow Glacier",
+                slug: None,
+                sort_order: Some(20211209),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 7568,
+            parser_mode: NetworkUpgradeParserMode::ExplicitIncludedMembers(&[5133]),
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Gray Glacier",
+                slug: None,
+                sort_order: Some(20220630),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 7568,
+            parser_mode: NetworkUpgradeParserMode::ExplicitIncludedMembers(&[3675, 4399]),
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "The Merge",
+                slug: None,
+                sort_order: Some(20220915),
+            }],
+        },
+        NetworkUpgradeRegistrySource {
+            bucket: NetworkUpgradeSourceBucket::Permanent,
+            source_meta_eip: 7568,
+            parser_mode: NetworkUpgradeParserMode::ExplicitIncludedMembers(&[
+                3651, 3855, 3860, 4895, 6049,
+            ]),
+            upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                display_name: "Shapella",
+                slug: None,
+                sort_order: Some(20230412),
+            }],
+        },
         NetworkUpgradeRegistrySource {
             bucket: NetworkUpgradeSourceBucket::Permanent,
             source_meta_eip: 7569,
@@ -842,6 +1029,163 @@ fn parse_modern_stage_members(
     Ok(stages)
 }
 
+fn parse_legacy_included_members(
+    source_document: &ProposalCatalogSourceDocument,
+) -> Result<Vec<ParsedNetworkUpgradeStage>, Whatever> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let mut members = Vec::new();
+    let mut saw_included_section = false;
+    let mut active_heading_level = None::<u8>;
+    let mut heading_capture = None::<HeadingCapture>;
+    let mut link_capture = None::<LinkCapture>;
+    let mut list_depth = 0usize;
+    let mut included_list_depth = None::<usize>;
+    let mut item_text_stack = Vec::<String>::new();
+
+    for event in Parser::new_ext(source_document.body(), options) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                heading_capture = Some(HeadingCapture {
+                    level,
+                    text: String::new(),
+                });
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                let heading = heading_capture
+                    .take()
+                    .whatever_context("heading end without heading start")?;
+                let heading_level = heading_level_number(heading.level);
+                if normalize_stage_heading(heading.text.trim())
+                    == Some(NetworkUpgradeStageKey::Included)
+                {
+                    saw_included_section = true;
+                    active_heading_level = Some(heading_level);
+                } else if active_heading_level.is_some_and(|level| heading_level <= level) {
+                    active_heading_level = None;
+                }
+            }
+            Event::Start(Tag::List(_)) => {
+                list_depth += 1;
+                if included_list_depth.is_none()
+                    && item_text_stack
+                        .last()
+                        .is_some_and(|text| legacy_included_list_label(text))
+                {
+                    saw_included_section = true;
+                    included_list_depth = Some(list_depth);
+                }
+            }
+            Event::End(TagEnd::List(_)) => {
+                if included_list_depth == Some(list_depth) {
+                    included_list_depth = None;
+                }
+                list_depth = list_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::Item) => {
+                item_text_stack.push(String::new());
+            }
+            Event::End(TagEnd::Item) => {
+                item_text_stack.pop();
+            }
+            Event::Text(text) | Event::Code(text) => {
+                push_cow_text(&mut heading_capture, &mut link_capture, text.clone());
+                if let Some(item_text) = item_text_stack.last_mut() {
+                    item_text.push_str(&text);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some(heading) = &mut heading_capture {
+                    heading.text.push(' ');
+                }
+                if let Some(link) = &mut link_capture {
+                    link.text.push(' ');
+                }
+                if let Some(item_text) = item_text_stack.last_mut() {
+                    item_text.push(' ');
+                }
+            }
+            Event::Start(Tag::Link { dest_url, .. })
+                if heading_capture.is_none()
+                    && (active_heading_level.is_some() || included_list_depth.is_some()) =>
+            {
+                link_capture = Some(LinkCapture {
+                    dest_url: dest_url.into_string(),
+                    text: String::new(),
+                });
+            }
+            Event::End(TagEnd::Link) => {
+                let Some(link) = link_capture.take() else {
+                    continue;
+                };
+                let Some(proposal_number) = proposal_number_from_link(&link.dest_url, &link.text)
+                else {
+                    continue;
+                };
+                members.push(ParsedNetworkUpgradeMember {
+                    number: proposal_number,
+                    subgroup: None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // LegacyIncludedList is stricter than ModernStages because historical
+    // registered sources are expected to contain parseable member lists. True
+    // empty hardforks must use EmptyMembers instead.
+    if !saw_included_section {
+        snafu::whatever!(
+            "legacy included-list parsing failed for `{}` (EIP-{}): no Included EIPs section found",
+            source_document.source_path().to_string_lossy(),
+            source_document.number()
+        );
+    }
+    if members.is_empty() {
+        snafu::whatever!(
+            "legacy included-list parsing failed for `{}` (EIP-{}): Included EIPs section did not contain proposal links",
+            source_document.source_path().to_string_lossy(),
+            source_document.number()
+        );
+    }
+
+    Ok(vec![ParsedNetworkUpgradeStage {
+        key: NetworkUpgradeStageKey::Included,
+        members,
+    }])
+}
+
+fn explicit_included_members(members: &[u32]) -> Result<Vec<ParsedNetworkUpgradeStage>, Whatever> {
+    let members = members
+        .iter()
+        .map(|number| {
+            let number = match ProposalNumber::from_u32(*number) {
+                Ok(number) => number,
+                Err(()) => {
+                    snafu::whatever!("network upgrade explicit member `{number}` must be positive");
+                }
+            };
+            Ok(ParsedNetworkUpgradeMember {
+                number,
+                subgroup: None,
+            })
+        })
+        .collect::<Result<Vec<_>, Whatever>>()?;
+
+    Ok(vec![ParsedNetworkUpgradeStage {
+        key: NetworkUpgradeStageKey::Included,
+        members,
+    }])
+}
+
+fn legacy_included_list_label(text: &str) -> bool {
+    normalize_stage_heading(text.trim().trim_end_matches(':'))
+        == Some(NetworkUpgradeStageKey::Included)
+}
+
 fn handle_heading(
     source_document: &ProposalCatalogSourceDocument,
     heading: HeadingCapture,
@@ -1011,16 +1355,19 @@ fn created_render_sort_key(
 }
 
 fn validate_sort_orders(selected_sources: &[SelectedNetworkUpgradeSource]) -> Result<(), Whatever> {
-    let mut sort_orders = BTreeMap::<i32, &str>::new();
+    let mut sort_keys = BTreeMap::<RenderSortKey, &str>::new();
     for selected_source in selected_sources {
-        let Some(sort_order) = selected_source.details.sort_order else {
+        if selected_source.details.sort_order.is_none() {
             continue;
-        };
-        if let Some(existing_name) =
-            sort_orders.insert(sort_order, &selected_source.details.display_name)
-        {
+        }
+        if let Some(existing_name) = sort_keys.insert(
+            selected_source.render_sort_key,
+            &selected_source.details.display_name,
+        ) {
             snafu::whatever!(
-                "network upgrade sort_order `{sort_order}` is used by both `{existing_name}` and `{}`",
+                "network upgrade render sort key `{}:{}` is used by both `{existing_name}` and `{}`",
+                selected_source.render_sort_key.value,
+                selected_source.render_sort_key.source_meta_eip,
                 selected_source.details.display_name
             );
         }
@@ -1199,16 +1546,70 @@ mod tests {
         display_name: &'static str,
         sort_order: Option<i32>,
     ) -> NetworkUpgradeRegistrySource {
+        permanent_source_with_mode(
+            number,
+            display_name,
+            sort_order,
+            NetworkUpgradeParserMode::ModernStages,
+        )
+    }
+
+    fn permanent_source_with_mode(
+        number: u32,
+        display_name: &'static str,
+        sort_order: Option<i32>,
+        parser_mode: NetworkUpgradeParserMode,
+    ) -> NetworkUpgradeRegistrySource {
         NetworkUpgradeRegistrySource {
             bucket: NetworkUpgradeSourceBucket::Permanent,
             source_meta_eip: number,
-            parser_mode: NetworkUpgradeParserMode::ModernStages,
+            parser_mode,
             upgrades: vec![NetworkUpgradeRegistryUpgrade {
                 display_name,
                 slug: None,
                 sort_order,
             }],
         }
+    }
+
+    fn legacy_source(
+        number: u32,
+        display_name: &'static str,
+        sort_order: Option<i32>,
+    ) -> NetworkUpgradeRegistrySource {
+        permanent_source_with_mode(
+            number,
+            display_name,
+            sort_order,
+            NetworkUpgradeParserMode::LegacyIncludedList,
+        )
+    }
+
+    fn empty_source(
+        number: u32,
+        display_name: &'static str,
+        sort_order: Option<i32>,
+    ) -> NetworkUpgradeRegistrySource {
+        permanent_source_with_mode(
+            number,
+            display_name,
+            sort_order,
+            NetworkUpgradeParserMode::EmptyMembers,
+        )
+    }
+
+    fn explicit_source(
+        number: u32,
+        display_name: &'static str,
+        sort_order: Option<i32>,
+        members: &'static [u32],
+    ) -> NetworkUpgradeRegistrySource {
+        permanent_source_with_mode(
+            number,
+            display_name,
+            sort_order,
+            NetworkUpgradeParserMode::ExplicitIncludedMembers(members),
+        )
     }
 
     #[test]
@@ -1445,6 +1846,366 @@ mod tests {
     }
 
     #[test]
+    fn legacy_included_list_parser_supports_body_list_shape() {
+        let homestead = meta_markdown(
+            606,
+            "Hardfork Meta: Homestead",
+            "2017-04-23",
+            "requires: 2, 7, 8\n",
+            "## Specification\n\n- Codename: Homestead\n- Included EIPs:\n  - [EIP-2](./00002.md)\n  - [EIP-7](./00007.md)\n  - [EIP-8](./00008.md)\n\n## References\n\nSee [EIP-999](./00999.md).\n",
+        );
+        let catalog = catalog(&[
+            ("00606.md", homestead),
+            (
+                "00002.md",
+                proposal_markdown(2, "EIP 2", "Final", "Standards Track", None, "", ""),
+            ),
+            (
+                "00007.md",
+                proposal_markdown(7, "EIP 7", "Final", "Standards Track", None, "", ""),
+            ),
+            (
+                "00008.md",
+                proposal_markdown(8, "EIP 8", "Final", "Standards Track", None, "", ""),
+            ),
+        ]);
+
+        let index = collect_network_upgrades_with_registries(
+            &catalog,
+            &[],
+            &[legacy_source(606, "Homestead", Some(20160314))],
+        )
+        .unwrap();
+
+        assert_eq!(
+            index.upgrades[0].stages[0]
+                .rows
+                .iter()
+                .map(|row| row.number)
+                .collect::<Vec<_>>(),
+            [number(2), number(7), number(8)]
+        );
+    }
+
+    #[test]
+    fn legacy_included_list_parser_supports_heading_shape_and_stops_later() {
+        let istanbul = meta_markdown(
+            1679,
+            "Hardfork Meta: Istanbul",
+            "2019-01-04",
+            "",
+            "## Specification\n\n### Included EIPs\n\n- [EIP-152](./00152.md)\n- [EIP-1108](./01108.md)\n\n### References\n\nSee [EIP-1716](./01716.md).\n",
+        );
+        let catalog = catalog(&[
+            ("01679.md", istanbul),
+            (
+                "00152.md",
+                proposal_markdown(152, "EIP 152", "Final", "Standards Track", None, "", ""),
+            ),
+            (
+                "01108.md",
+                proposal_markdown(1108, "EIP 1108", "Final", "Standards Track", None, "", ""),
+            ),
+        ]);
+
+        let index = collect_network_upgrades_with_registries(
+            &catalog,
+            &[],
+            &[legacy_source(1679, "Istanbul", Some(20191208))],
+        )
+        .unwrap();
+
+        assert_eq!(
+            index.upgrades[0].stages[0]
+                .rows
+                .iter()
+                .map(|row| row.number)
+                .collect::<Vec<_>>(),
+            [number(152), number(1108)]
+        );
+    }
+
+    #[test]
+    fn legacy_included_list_parser_errors_without_included_section() {
+        let source = meta_markdown(
+            606,
+            "Hardfork Meta: Homestead",
+            "2017-04-23",
+            "",
+            "## Specification\n\nSee [EIP-2](./00002.md).\n",
+        );
+        let catalog = catalog(&[("00606.md", source)]);
+
+        let error = collect_network_upgrades_with_registries(
+            &catalog,
+            &[],
+            &[legacy_source(606, "Homestead", Some(20160314))],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("legacy included-list parsing failed"));
+        assert!(error.contains("00606.md"));
+        assert!(error.contains("no Included EIPs section found"));
+    }
+
+    #[test]
+    fn legacy_included_list_parser_errors_when_included_section_has_no_links() {
+        let source = meta_markdown(
+            1679,
+            "Hardfork Meta: Istanbul",
+            "2019-01-04",
+            "",
+            "## Specification\n\n### Included EIPs\n\nNo proposal links here.\n",
+        );
+        let catalog = catalog(&[("01679.md", source)]);
+
+        let error = collect_network_upgrades_with_registries(
+            &catalog,
+            &[],
+            &[legacy_source(1679, "Istanbul", Some(20191208))],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("legacy included-list parsing failed"));
+        assert!(error.contains("01679.md"));
+        assert!(error.contains("did not contain proposal links"));
+    }
+
+    #[test]
+    fn legacy_included_list_parser_ignores_requires_membership() {
+        let tangerine = meta_markdown(
+            608,
+            "Hardfork Meta: Tangerine Whistle",
+            "2017-04-23",
+            "requires: 150, 779\n",
+            "- Included EIPs:\n  - [EIP-150](./00150.md)\n",
+        );
+        let byzantium = meta_markdown(
+            609,
+            "Hardfork Meta: Byzantium",
+            "2017-04-23",
+            "requires: 100, 607\n",
+            "- Included EIPs:\n  - [EIP-100](./00100.md)\n",
+        );
+        let istanbul = meta_markdown(
+            1679,
+            "Hardfork Meta: Istanbul",
+            "2019-01-04",
+            "requires: 152, 1716\n",
+            "### Included EIPs\n\n- [EIP-152](./00152.md)\n",
+        );
+        let catalog = catalog(&[
+            ("00608.md", tangerine),
+            ("00609.md", byzantium),
+            ("01679.md", istanbul),
+            (
+                "00150.md",
+                proposal_markdown(150, "EIP 150", "Final", "Standards Track", None, "", ""),
+            ),
+            (
+                "00100.md",
+                proposal_markdown(100, "EIP 100", "Final", "Standards Track", None, "", ""),
+            ),
+            (
+                "00152.md",
+                proposal_markdown(152, "EIP 152", "Final", "Standards Track", None, "", ""),
+            ),
+        ]);
+
+        let index = collect_network_upgrades_with_registries(
+            &catalog,
+            &[],
+            &[
+                legacy_source(608, "Tangerine Whistle", Some(20161018)),
+                legacy_source(609, "Byzantium", Some(20171016)),
+                legacy_source(1679, "Istanbul", Some(20191208)),
+            ],
+        )
+        .unwrap();
+
+        let rows = index
+            .upgrades
+            .iter()
+            .map(|upgrade| {
+                (
+                    upgrade.display_name.as_str(),
+                    upgrade.stages[0].rows[0].number,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                ("Tangerine Whistle", number(150)),
+                ("Byzantium", number(100)),
+                ("Istanbul", number(152))
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_member_hardforks_emit_zero_stages() {
+        let temp = TempDir::new().unwrap();
+        write_file(
+            temp.path(),
+            "00779.md",
+            &meta_markdown(779, "Hardfork Meta: DAO Fork", "2017-11-26", "", ""),
+        );
+        write_file(
+            temp.path(),
+            "01716.md",
+            &meta_markdown(1716, "Hardfork Meta: Petersburg", "2019-01-21", "", ""),
+        );
+        let catalog = collect_proposal_catalog(temp.path(), None).unwrap();
+        let index = collect_network_upgrades_with_registries(
+            &catalog,
+            &[],
+            &[
+                empty_source(779, "DAO Fork", Some(20160720)),
+                empty_source(1716, "Petersburg", Some(20190228)),
+            ],
+        )
+        .unwrap();
+
+        write_hardforks_index(temp.path(), &index).unwrap();
+
+        let front_matter = front_matter_from_generated_hardforks_index(temp.path());
+        let upgrades = front_matter["extra"]["network_upgrades"]
+            .as_array()
+            .unwrap();
+        assert_eq!(upgrades[0]["display_name"].as_str().unwrap(), "DAO Fork");
+        assert_eq!(upgrades[1]["display_name"].as_str().unwrap(), "Petersburg");
+        assert!(upgrades[0]["stages"].as_array().unwrap().is_empty());
+        assert!(upgrades[1]["stages"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn eip_7568_backfill_entries_are_distinct_and_curated() {
+        let explicit_sources = permanent_registry()
+            .into_iter()
+            .filter(|source| source.source_meta_eip == 7568)
+            .collect::<Vec<_>>();
+        let mut files = vec![(
+            "07568.md",
+            meta_markdown(
+                7568,
+                "Hardfork Meta Backfill - Berlin to Shapella",
+                "2023-12-01",
+                "",
+                "",
+            ),
+        )];
+        for member in [
+            2565, 2929, 2718, 2930, 1559, 3198, 3529, 3541, 3554, 4345, 5133, 3675, 4399, 3651,
+            3855, 3860, 4895,
+        ] {
+            files.push((
+                Box::leak(format!("{member:05}.md").into_boxed_str()),
+                proposal_markdown(
+                    member,
+                    &format!("EIP {member}"),
+                    "Final",
+                    "Standards Track",
+                    Some("Core"),
+                    "",
+                    "",
+                ),
+            ));
+        }
+        files.push((
+            "06049.md",
+            proposal_markdown(6049, "EIP 6049", "Final", "Meta", None, "", ""),
+        ));
+        let catalog = catalog(&files);
+
+        let index =
+            collect_network_upgrades_with_registries(&catalog, &[], &explicit_sources).unwrap();
+
+        assert_eq!(
+            index
+                .upgrades
+                .iter()
+                .map(|upgrade| upgrade.display_name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Beacon Chain Launch - Serenity Phase 0",
+                "Berlin",
+                "London",
+                "Altair",
+                "Arrow Glacier",
+                "Gray Glacier",
+                "The Merge",
+                "Shapella"
+            ]
+        );
+        assert_eq!(
+            index.upgrades[0].slug,
+            "beacon-chain-launch-serenity-phase-0"
+        );
+        assert_eq!(index.upgrades[6].slug, "the-merge");
+        assert_eq!(index.upgrades[7].slug, "shapella");
+        assert!(index.upgrades[0].stages.is_empty());
+        assert!(index.upgrades[3].stages.is_empty());
+
+        let berlin_members = &index.upgrades[1].stages[0].rows;
+        assert_eq!(
+            berlin_members
+                .iter()
+                .map(|row| row.number)
+                .collect::<Vec<_>>(),
+            [number(2565), number(2929), number(2718), number(2930)]
+        );
+        let merge_members = &index.upgrades[6].stages[0].rows;
+        assert_eq!(
+            merge_members
+                .iter()
+                .map(|row| row.number)
+                .collect::<Vec<_>>(),
+            [number(3675), number(4399)]
+        );
+        assert!(!merge_members.iter().any(|row| row.number == number(2124)));
+        let shapella_members = &index.upgrades[7].stages[0].rows;
+        assert!(shapella_members
+            .iter()
+            .any(|row| row.number == number(6049)));
+        assert!(index.upgrades.iter().all(|upgrade| {
+            upgrade.display_name != "Bellatrix" && upgrade.display_name != "Capella"
+        }));
+        assert!(
+            index
+                .upgrades
+                .iter()
+                .filter(|upgrade| {
+                    upgrade
+                        .stages
+                        .first()
+                        .is_some_and(|stage| stage.key == "included" && stage.label == "Included")
+                })
+                .count()
+                >= 6
+        );
+    }
+
+    #[test]
+    fn missing_curated_member_references_error_with_upgrade_name() {
+        let source = meta_markdown(7568, "Backfill", "2023-12-01", "", "");
+        let catalog = catalog(&[("07568.md", source)]);
+
+        let error = collect_network_upgrades_with_registries(
+            &catalog,
+            &[],
+            &[explicit_source(7568, "Berlin", Some(20210415), &[2565])],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("network upgrade `Berlin`"));
+        assert!(error.contains("references missing proposal `2565`"));
+    }
+
+    #[test]
     fn hardfork_index_writer_emits_section_front_matter_contract() {
         let temp = TempDir::new().unwrap();
         let source = meta_markdown(
@@ -1514,6 +2275,9 @@ mod tests {
         assert!(!contents.contains("sort_order"));
         assert!(!contents.contains("source_bucket"));
         assert!(!contents.contains("parser_mode"));
+        assert!(!contents.contains("ExplicitIncludedMembers"));
+        assert!(!contents.contains("LegacyIncludedList"));
+        assert!(!contents.contains("source_meta_eip"));
     }
 
     #[test]
@@ -1941,8 +2705,23 @@ mod tests {
                 .iter()
                 .map(|source| source.source_meta_eip)
                 .collect::<Vec<_>>(),
-            [7569, 7600, 7607]
+            [
+                606, 779, 608, 607, 609, 1013, 1716, 1679, 2387, 7568, 7568, 7568, 7568, 7568,
+                7568, 7568, 7568, 7569, 7600, 7607
+            ]
         );
+    }
+
+    #[test]
+    fn bpo_withdrawn_stagnant_and_process_sources_are_not_registered_by_default() {
+        let permanent_source_numbers = permanent_registry()
+            .iter()
+            .map(|source| source.source_meta_eip)
+            .collect::<Vec<_>>();
+
+        for excluded in [8134, 7892, 233, 1588, 7675, 7692, 2070] {
+            assert!(!permanent_source_numbers.contains(&excluded));
+        }
     }
 
     #[test]
@@ -2024,25 +2803,86 @@ mod tests {
     }
 
     #[test]
-    fn sort_order_collisions_error_clearly() {
+    fn duplicate_render_sort_keys_error_clearly() {
         let first = meta_markdown(100, "First", "2024-01-01", "", "### Included EIPs\n");
-        let second = meta_markdown(200, "Second", "2024-02-01", "", "### Included EIPs\n");
-        let catalog = catalog(&[("00100.md", first), ("00200.md", second)]);
+        let catalog = catalog(&[("00100.md", first)]);
 
         let error = collect_network_upgrades_with_registries(
             &catalog,
             &[],
             &[
                 permanent_source(100, "First", Some(10)),
-                permanent_source(200, "Second", Some(10)),
+                permanent_source(100, "Second", Some(10)),
             ],
         )
         .unwrap_err()
         .to_string();
 
-        assert!(error.contains("sort_order `10`"));
+        assert!(error.contains("render sort key `10:100`"));
         assert!(error.contains("First"));
         assert!(error.contains("Second"));
+    }
+
+    #[test]
+    fn shared_sort_dates_use_source_number_as_tie_breaker() {
+        let constantinople = meta_markdown(
+            1013,
+            "Constantinople",
+            "2018-04-20",
+            "",
+            "### Included EIPs\n",
+        );
+        let petersburg = meta_markdown(1716, "Petersburg", "2019-01-21", "", "");
+        let catalog = catalog(&[("01013.md", constantinople), ("01716.md", petersburg)]);
+
+        let index = collect_network_upgrades_with_registries(
+            &catalog,
+            &[],
+            &[
+                empty_source(1716, "Petersburg", Some(20190228)),
+                permanent_source(1013, "Constantinople", Some(20190228)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            index
+                .upgrades
+                .iter()
+                .map(|upgrade| upgrade.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Constantinople", "Petersburg"]
+        );
+    }
+
+    #[test]
+    fn permanent_registry_chronology_is_deterministic() {
+        let mut entries = permanent_registry()
+            .into_iter()
+            .flat_map(|source| {
+                source.upgrades.into_iter().map(move |upgrade| {
+                    (
+                        upgrade.display_name,
+                        upgrade.sort_order.unwrap(),
+                        source.source_meta_eip,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(_, sort_order, source_meta_eip)| (*sort_order, *source_meta_eip));
+        let names = entries
+            .iter()
+            .map(|(display_name, _, _)| *display_name)
+            .collect::<Vec<_>>();
+        let position = |name: &str| names.iter().position(|entry| *entry == name).unwrap();
+
+        assert!(position("Homestead") < position("DAO Fork"));
+        assert!(position("DAO Fork") < position("Tangerine Whistle"));
+        assert!(position("Constantinople") < position("Petersburg"));
+        assert!(position("Muir Glacier") < position("Beacon Chain Launch - Serenity Phase 0"));
+        assert!(position("Shapella") < position("Dencun"));
+        assert!(position("Dencun") < position("Pectra"));
+        assert!(position("Pectra") < position("Fusaka"));
     }
 
     #[test]
