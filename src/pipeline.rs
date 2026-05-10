@@ -212,6 +212,11 @@ mod tests {
         execution::{resolve_execution, ResolvedExecution},
         git::SourceMaterialization,
         layout::{mounted_theme_path, theme_config_path, CONTENT_DIR, REPO_DIR},
+        network_upgrades::{
+            collect_network_upgrades_with_registries, NetworkUpgradeParserMode,
+            NetworkUpgradeRegistrySource, NetworkUpgradeRegistryUpgrade,
+            NetworkUpgradeSourceBucket,
+        },
         proposal_catalog::collect_proposal_catalog,
     };
 
@@ -312,6 +317,12 @@ base_url = "https://staging.example.test/{sibling_id}/"
             .unwrap_or_default();
         format!(
             "---\neip: {number}\ntitle: Proposal {number}\nstatus: Draft\ntype: Standards Track\n{category}---\n\n{body}\n"
+        )
+    }
+
+    fn pipeline_meta_markdown(number: u32, created: &str, body: &str) -> String {
+        format!(
+            "---\neip: {number}\ntitle: Hardfork Meta {number}\nstatus: Draft\ntype: Meta\ncreated: {created}\n---\n\n{body}\n"
         )
     }
 
@@ -540,5 +551,63 @@ base_url = "https://staging.example.test/{sibling_id}/"
 
         assert!(!resolved.root_path.join("content/00002.md").exists());
         assert_eq!(records["erc-2"].title, "Proposal 2");
+    }
+
+    #[test]
+    fn network_upgrade_collection_uses_prepared_merged_sources_without_active_fetch() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let active_path = workspace_root.join("EIPs");
+        let sibling_path = workspace_root.join("ERCs");
+        let missing_upstream = file_url(&temp.path().join("missing-upstream"));
+        let sibling_url = file_url(&sibling_path);
+        let manifest = repo_manifest_text("EIPs", &missing_upstream, &[("ERCs", sibling_url)]);
+        let meta_markdown = pipeline_meta_markdown(
+            7773,
+            "2024-09-26",
+            "### Included EIPs\n\n* [EIP-2](./00002.md)\n",
+        );
+        let sibling_markdown = pipeline_proposal_markdown(2, None, "Sibling proposal.");
+
+        write_file(&workspace_root, config::LOCAL_CONFIG_FILE, "");
+        std::fs::create_dir_all(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+        let _active_repo = init_repo(
+            &active_path,
+            &[
+                (config::REPO_MANIFEST_FILE, manifest.as_str()),
+                ("content/07773.md", meta_markdown.as_str()),
+            ],
+        );
+        let _sibling_repo = init_repo(
+            &sibling_path,
+            &[("content/00002.md", sibling_markdown.as_str())],
+        );
+        let workspace = RuntimeWorkspace {
+            _temp: temp,
+            active_path,
+        };
+        let resolved = resolved_runtime(&workspace, &["build"]);
+
+        prepare_resolved_source(&resolved).unwrap();
+        let catalog =
+            collect_proposal_catalog(&prepared_path(&resolved, CONTENT_DIR), None).unwrap();
+        let index = collect_network_upgrades_with_registries(
+            &catalog,
+            &[NetworkUpgradeRegistrySource {
+                bucket: NetworkUpgradeSourceBucket::Transitional,
+                source_meta_eip: 7773,
+                parser_mode: NetworkUpgradeParserMode::ModernStages,
+                upgrades: vec![NetworkUpgradeRegistryUpgrade {
+                    display_name: "Glamsterdam",
+                    slug: None,
+                    sort_order: None,
+                }],
+            }],
+            &[],
+        )
+        .unwrap();
+
+        assert!(!resolved.root_path.join("content/00002.md").exists());
+        assert_eq!(index.upgrades[0].stages[0].rows[0].number.get(), 2);
     }
 }
