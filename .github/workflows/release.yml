@@ -40,6 +40,11 @@ jobs:
           cd target/release
           $targetPath = Join-Path -Path (Resolve-Path ..\..\dist) -ChildPath $Env:EIPS_BUILD_ARCHIVE
           Compress-Archive -Path build-eips.exe -DestinationPath $targetPath
+          $archivePath = $targetPath
+          $archiveName = Split-Path -Leaf $archivePath
+          $sidecarPath = "$archivePath.sha256"
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToLower()
+          [System.IO.File]::WriteAllText($sidecarPath, "$hash  $archiveName`n")
       - name: Compress (Unix)
         if: matrix.os != 'windows'
         env:
@@ -47,6 +52,12 @@ jobs:
         run: |
           mkdir dist
           tar cavf "$EIPS_BUILD_ARCHIVE" -C target/release build-eips
+          archive_name=$(basename "$EIPS_BUILD_ARCHIVE")
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            (cd dist && shasum -a 256 "$archive_name" > "$archive_name.sha256")
+          else
+            (cd dist && sha256sum "$archive_name" > "$archive_name.sha256")
+          fi
       - name: Release
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda
         with:
