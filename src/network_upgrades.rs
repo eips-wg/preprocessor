@@ -9,14 +9,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    io::Write,
     path::Path,
 };
 
 use chrono::{Datelike, NaiveDate};
+use eipw_preamble::Preamble;
 use lazy_static::lazy_static;
 use log::warn;
 use pulldown_cmark::{CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use regex::Regex;
+use serde::Serialize;
 use snafu::{OptionExt, ResultExt, Whatever};
 
 use crate::{
@@ -72,6 +75,49 @@ pub(crate) struct NetworkUpgradeMembership {
     pub(crate) stage_key: String,
     pub(crate) stage_label: String,
     pub(crate) subgroup: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedHardforksFrontMatter {
+    title: &'static str,
+    template: &'static str,
+    extra: GeneratedHardforksExtra,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedHardforksExtra {
+    network_upgrades: Vec<GeneratedHardfork>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedHardfork {
+    slug: String,
+    display_name: String,
+    meta_eip: ProposalNumber,
+    meta_url: String,
+    meta_status: String,
+    stages: Vec<GeneratedHardforkStage>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedHardforkStage {
+    key: String,
+    label: String,
+    rows: Vec<GeneratedHardforkRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedHardforkRow {
+    number: ProposalNumber,
+    title: String,
+    status: String,
+    #[serde(rename = "type")]
+    proposal_type: String,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subgroup: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +351,97 @@ pub(crate) fn collect_marked_modern_sources(
         .collect()
 }
 
+pub(crate) fn write_hardforks_index(
+    content_root: &Path,
+    index: &NetworkUpgradeIndex,
+) -> Result<(), Whatever> {
+    let hardforks_dir = content_root.join("hardforks");
+    std::fs::create_dir_all(&hardforks_dir).with_whatever_context(|_| {
+        format!(
+            "unable to create generated hardforks directory `{}`",
+            hardforks_dir.to_string_lossy()
+        )
+    })?;
+    let index_path = hardforks_dir.join("_index.md");
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&index_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            snafu::whatever!(
+                "generated hardforks index `{}` already exists; refusing to overwrite it",
+                index_path.to_string_lossy()
+            );
+        }
+        Err(error) => {
+            snafu::whatever!(
+                "unable to create generated hardforks index `{}`: {error}",
+                index_path.to_string_lossy()
+            );
+        }
+    };
+
+    let front_matter = GeneratedHardforksFrontMatter {
+        title: "Hardforks",
+        template: "hardforks.html",
+        extra: GeneratedHardforksExtra {
+            network_upgrades: index
+                .upgrades
+                .iter()
+                .map(generated_hardfork)
+                .collect::<Vec<_>>(),
+        },
+    };
+    let front_matter = toml::to_string(&front_matter).with_whatever_context(|_| {
+        format!(
+            "unable to serialize generated hardforks index `{}`",
+            index_path.to_string_lossy()
+        )
+    })?;
+
+    file.write_all(b"+++\n").with_whatever_context(|_| {
+        format!(
+            "unable to write generated hardforks index `{}`",
+            index_path.to_string_lossy()
+        )
+    })?;
+    file.write_all(front_matter.as_bytes())
+        .with_whatever_context(|_| {
+            format!(
+                "unable to write generated hardforks index `{}`",
+                index_path.to_string_lossy()
+            )
+        })?;
+    file.write_all(b"+++\n").with_whatever_context(|_| {
+        format!(
+            "unable to finish generated hardforks index `{}`",
+            index_path.to_string_lossy()
+        )
+    })?;
+
+    Ok(())
+}
+
+pub(crate) fn is_registered_network_upgrade_source_number(proposal_number: ProposalNumber) -> bool {
+    transitional_modern_registry()
+        .into_iter()
+        .chain(permanent_registry())
+        .any(|source| source.source_meta_eip == proposal_number.get())
+}
+
+pub(crate) fn markdown_has_network_upgrade_marker(contents: &str) -> bool {
+    let Ok((preamble, _)) = Preamble::split(contents) else {
+        return false;
+    };
+    let Ok(preamble) = Preamble::parse(None, preamble) else {
+        return false;
+    };
+
+    preamble.by_name("network-upgrade").is_some()
+}
+
 pub(crate) fn transitional_modern_registry() -> Vec<NetworkUpgradeRegistrySource> {
     vec![
         NetworkUpgradeRegistrySource {
@@ -363,6 +500,41 @@ pub(crate) fn permanent_registry() -> Vec<NetworkUpgradeRegistrySource> {
             }],
         },
     ]
+}
+
+fn generated_hardfork(upgrade: &NetworkUpgrade) -> GeneratedHardfork {
+    GeneratedHardfork {
+        slug: upgrade.slug.clone(),
+        display_name: upgrade.display_name.clone(),
+        meta_eip: upgrade.source_meta_eip,
+        meta_url: upgrade.meta_url.clone(),
+        meta_status: upgrade.meta_status.clone(),
+        stages: upgrade
+            .stages
+            .iter()
+            .map(generated_hardfork_stage)
+            .collect(),
+    }
+}
+
+fn generated_hardfork_stage(stage: &NetworkUpgradeStage) -> GeneratedHardforkStage {
+    GeneratedHardforkStage {
+        key: stage.key.clone(),
+        label: stage.label.clone(),
+        rows: stage.rows.iter().map(generated_hardfork_row).collect(),
+    }
+}
+
+fn generated_hardfork_row(row: &NetworkUpgradeMemberRow) -> GeneratedHardforkRow {
+    GeneratedHardforkRow {
+        number: row.number,
+        title: row.title.clone(),
+        status: row.status.clone(),
+        proposal_type: row.proposal_type.clone(),
+        url: row.url.clone(),
+        category: row.category.clone(),
+        subgroup: row.subgroup.clone(),
+    }
 }
 
 fn marked_source_from_document(
@@ -935,18 +1107,20 @@ fn slug_ascii_alphanumeric(character: char) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{collections::BTreeMap, path::Path};
 
     use tempfile::TempDir;
+    use toml::Value as TomlValue;
 
     use super::{
         collect_marked_modern_sources, collect_network_upgrades_with_registries,
         network_upgrade_slug, normalize_stage_heading, permanent_registry,
-        transitional_modern_registry, NetworkUpgradeParserMode, NetworkUpgradeRegistrySource,
-        NetworkUpgradeRegistryUpgrade, NetworkUpgradeSourceBucket, NetworkUpgradeStageKey,
+        transitional_modern_registry, write_hardforks_index, NetworkUpgradeIndex,
+        NetworkUpgradeParserMode, NetworkUpgradeRegistrySource, NetworkUpgradeRegistryUpgrade,
+        NetworkUpgradeSourceBucket, NetworkUpgradeStageKey,
     };
     use crate::{
-        proposal::ProposalNumber,
+        proposal::{OnlyRenderPlan, ProposalNumber},
         proposal_catalog::{collect_proposal_catalog, ProposalCatalog},
     };
 
@@ -991,6 +1165,17 @@ mod tests {
             write_file(temp.path(), relative, contents);
         }
         collect_proposal_catalog(temp.path(), None).unwrap()
+    }
+
+    fn front_matter_from_generated_hardforks_index(content_root: &Path) -> TomlValue {
+        let contents = std::fs::read_to_string(content_root.join("hardforks/_index.md")).unwrap();
+        let front_matter = contents
+            .strip_prefix("+++\n")
+            .unwrap()
+            .split_once("\n+++\n")
+            .unwrap()
+            .0;
+        toml::from_str(front_matter).unwrap()
     }
 
     fn transitional_source(
@@ -1257,6 +1442,196 @@ mod tests {
         assert_eq!(pectra_rows[1].category, None);
         assert_eq!(fusaka_rows[0].subgroup.as_deref(), Some("Core EIPs"));
         assert_eq!(fusaka_rows[1].subgroup.as_deref(), Some("Other EIPs"));
+    }
+
+    #[test]
+    fn hardfork_index_writer_emits_section_front_matter_contract() {
+        let temp = TempDir::new().unwrap();
+        let source = meta_markdown(
+            7600,
+            "Hardfork Meta - Pectra",
+            "2024-01-18",
+            "",
+            "### Included EIPs\n\n#### Core EIPs\n\n* [EIP-2](./00002.md)\n\n#### Other EIPs\n\n* [EIP-3](./00003.md)\n",
+        );
+        write_file(temp.path(), "07600.md", &source);
+        write_file(
+            temp.path(),
+            "00002.md",
+            &proposal_markdown(
+                2,
+                "Core proposal",
+                "Final",
+                "Standards Track",
+                Some("Core"),
+                "",
+                "",
+            ),
+        );
+        write_file(
+            temp.path(),
+            "00003.md",
+            &proposal_markdown(3, "Meta proposal", "Review", "Meta", None, "", ""),
+        );
+        let catalog = collect_proposal_catalog(temp.path(), None).unwrap();
+        let index = collect_network_upgrades_with_registries(
+            &catalog,
+            &[],
+            &[permanent_source(7600, "Pectra", Some(20250507))],
+        )
+        .unwrap();
+
+        write_hardforks_index(temp.path(), &index).unwrap();
+
+        let contents = std::fs::read_to_string(temp.path().join("hardforks/_index.md")).unwrap();
+        let front_matter = front_matter_from_generated_hardforks_index(temp.path());
+        let upgrades = front_matter["extra"]["network_upgrades"]
+            .as_array()
+            .unwrap();
+        let upgrade = &upgrades[0];
+        let stage = &upgrade["stages"].as_array().unwrap()[0];
+        let rows = stage["rows"].as_array().unwrap();
+
+        assert_eq!(front_matter["title"].as_str().unwrap(), "Hardforks");
+        assert_eq!(front_matter["template"].as_str().unwrap(), "hardforks.html");
+        assert_eq!(upgrade["slug"].as_str().unwrap(), "pectra");
+        assert_eq!(upgrade["display_name"].as_str().unwrap(), "Pectra");
+        assert_eq!(upgrade["meta_eip"].as_integer().unwrap(), 7600);
+        assert_eq!(upgrade["meta_url"].as_str().unwrap(), "/7600/");
+        assert_eq!(upgrade["meta_status"].as_str().unwrap(), "Draft");
+        assert_eq!(stage["key"].as_str().unwrap(), "included");
+        assert_eq!(stage["label"].as_str().unwrap(), "Included");
+        assert_eq!(rows[0]["number"].as_integer().unwrap(), 2);
+        assert_eq!(rows[0]["title"].as_str().unwrap(), "Core proposal");
+        assert_eq!(rows[0]["status"].as_str().unwrap(), "Final");
+        assert_eq!(rows[0]["type"].as_str().unwrap(), "Standards Track");
+        assert_eq!(rows[0]["url"].as_str().unwrap(), "/2/");
+        assert_eq!(rows[0]["category"].as_str().unwrap(), "Core");
+        assert_eq!(rows[0]["subgroup"].as_str().unwrap(), "Core EIPs");
+        assert_eq!(rows[1]["type"].as_str().unwrap(), "Meta");
+        assert!(rows[1].get("category").is_none());
+        assert_eq!(rows[1]["subgroup"].as_str().unwrap(), "Other EIPs");
+        assert!(!contents.contains("sort_order"));
+        assert!(!contents.contains("source_bucket"));
+        assert!(!contents.contains("parser_mode"));
+    }
+
+    #[test]
+    fn hardfork_index_writer_preserves_empty_stage_order_and_labels() {
+        let temp = TempDir::new().unwrap();
+        let source = meta_markdown(
+            7773,
+            "Hardfork Meta - Glamsterdam",
+            "2024-09-26",
+            "",
+            "### EIPs Scheduled for Inclusion\n\n### Considered for Inclusion\n\n### Proposed for Inclusion\n\n### Declined for Inclusion\n",
+        );
+        write_file(temp.path(), "07773.md", &source);
+        let catalog = collect_proposal_catalog(temp.path(), None).unwrap();
+        let index = collect_network_upgrades_with_registries(
+            &catalog,
+            &[transitional_source(7773, "Glamsterdam")],
+            &[],
+        )
+        .unwrap();
+
+        write_hardforks_index(temp.path(), &index).unwrap();
+
+        let front_matter = front_matter_from_generated_hardforks_index(temp.path());
+        let stages = front_matter["extra"]["network_upgrades"][0]["stages"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            stages
+                .iter()
+                .map(|stage| stage["key"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["scheduled", "considered", "proposed", "declined"]
+        );
+        assert_eq!(
+            stages[0]["label"].as_str().unwrap(),
+            "Scheduled for Inclusion"
+        );
+        assert_eq!(
+            stages[1]["label"].as_str().unwrap(),
+            "Considered for Inclusion"
+        );
+        assert_eq!(
+            stages[2]["label"].as_str().unwrap(),
+            "Proposed for Inclusion"
+        );
+        assert_eq!(
+            stages[3]["label"].as_str().unwrap(),
+            "Declined for Inclusion"
+        );
+    }
+
+    #[test]
+    fn hardfork_index_writer_preserves_targeted_public_urls() {
+        let temp = TempDir::new().unwrap();
+        let source = meta_markdown(
+            7773,
+            "Hardfork Meta - Glamsterdam",
+            "2024-09-26",
+            "",
+            "### Included EIPs\n\n* [EIP-2](./00002.md)\n",
+        );
+        write_file(
+            temp.path(),
+            "00001.md",
+            &proposal_markdown(1, "Selected", "Draft", "Meta", None, "", ""),
+        );
+        write_file(temp.path(), "07773.md", &source);
+        write_file(
+            temp.path(),
+            "00002.md",
+            &proposal_markdown(2, "Omitted", "Draft", "Standards Track", None, "", ""),
+        );
+        let plan = OnlyRenderPlan::build(temp.path(), [number(1)].into_iter().collect()).unwrap();
+        let catalog = collect_proposal_catalog(temp.path(), Some(&plan)).unwrap();
+        let index = collect_network_upgrades_with_registries(
+            &catalog,
+            &[transitional_source(7773, "Glamsterdam")],
+            &[],
+        )
+        .unwrap();
+
+        write_hardforks_index(temp.path(), &index).unwrap();
+
+        let front_matter = front_matter_from_generated_hardforks_index(temp.path());
+        let upgrade = &front_matter["extra"]["network_upgrades"][0];
+        let row = &upgrade["stages"].as_array().unwrap()[0]["rows"]
+            .as_array()
+            .unwrap()[0];
+        assert_eq!(
+            upgrade["meta_url"].as_str().unwrap(),
+            "https://eips.ethereum.org/EIPS/eip-7773"
+        );
+        assert_eq!(
+            row["url"].as_str().unwrap(),
+            "https://eips.ethereum.org/EIPS/eip-2"
+        );
+    }
+
+    #[test]
+    fn hardfork_index_writer_refuses_existing_index() {
+        let temp = TempDir::new().unwrap();
+        write_file(temp.path(), "hardforks/_index.md", "existing\n");
+        let index = NetworkUpgradeIndex {
+            upgrades: Vec::new(),
+            memberships_by_proposal: BTreeMap::new(),
+            selected_sources: Vec::new(),
+        };
+
+        let error = write_hardforks_index(temp.path(), &index)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("already exists"));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("hardforks/_index.md")).unwrap(),
+            "existing\n"
+        );
     }
 
     #[test]

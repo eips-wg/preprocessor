@@ -23,7 +23,13 @@ use log::{debug, info, warn};
 use notify::{Event, RecursiveMode, Watcher};
 use snafu::{Report, ResultExt, Whatever};
 
-use crate::{git, layout::CONTENT_DIR, markdown, proposal::OnlyRenderPlan};
+use crate::{
+    git,
+    layout::CONTENT_DIR,
+    markdown, network_upgrades,
+    network_upgrades::NetworkUpgradeIndex,
+    proposal::{proposal_number_from_content_markdown_path, OnlyRenderPlan},
+};
 
 #[derive(Debug)]
 pub(crate) struct DirtyServeWatcher {
@@ -36,6 +42,7 @@ struct ActiveRepoServeSync {
     source_root: PathBuf,
     build_repo_path: PathBuf,
     only_plan: Option<OnlyRenderPlan>,
+    network_upgrade_index: Option<NetworkUpgradeIndex>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +130,7 @@ fn sync_dirty_serve_state(
     source_root: &Path,
     build_repo_path: &Path,
     only_plan: Option<&OnlyRenderPlan>,
+    network_upgrade_index: Option<&NetworkUpgradeIndex>,
     previous_dirty_paths: &mut BTreeSet<PathBuf>,
 ) -> Result<(), Whatever> {
     let current_dirty_paths = filter_dirty_paths(
@@ -144,13 +152,15 @@ fn sync_dirty_serve_state(
             path.to_string_lossy()
         );
     }
+    warn_for_changed_hardfork_meta_eips(source_root, &affected_paths);
 
     git::sync_materialized_paths(source_root, build_repo_path, &affected_paths)
         .whatever_context("unable to synchronize tracked paths into the materialized repo")?;
-    markdown::preprocess_paths(
+    markdown::preprocess_paths_with_network_upgrades(
         &build_repo_path.join(CONTENT_DIR),
         &affected_paths,
         only_plan,
+        network_upgrade_index,
     )
     .whatever_context("unable to preprocess synchronized markdown during dirty serve")?;
 
@@ -161,6 +171,45 @@ fn sync_dirty_serve_state(
 
     *previous_dirty_paths = current_dirty_paths;
     Ok(())
+}
+
+fn warn_for_changed_hardfork_meta_eips(source_root: &Path, affected_paths: &BTreeSet<PathBuf>) {
+    for path in changed_hardfork_meta_eip_paths(source_root, affected_paths) {
+        warn!(
+            "edit detected in hardfork Meta EIP `{}`; restart `build-eips serve` to refresh /hardforks/ and member EIP rows",
+            path.to_string_lossy()
+        );
+    }
+}
+
+fn changed_hardfork_meta_eip_paths(
+    source_root: &Path,
+    affected_paths: &BTreeSet<PathBuf>,
+) -> Vec<PathBuf> {
+    affected_paths
+        .iter()
+        .filter(|path| is_hardfork_meta_eip_path(source_root, path))
+        .cloned()
+        .collect()
+}
+
+fn is_hardfork_meta_eip_path(source_root: &Path, repo_relative_path: &Path) -> bool {
+    let Ok(content_relative_path) = repo_relative_path.strip_prefix(CONTENT_DIR) else {
+        return false;
+    };
+    let Some(proposal_number) = proposal_number_from_content_markdown_path(content_relative_path)
+    else {
+        return false;
+    };
+
+    if network_upgrades::is_registered_network_upgrade_source_number(proposal_number) {
+        return true;
+    }
+
+    match std::fs::read_to_string(source_root.join(repo_relative_path)) {
+        Ok(contents) => network_upgrades::markdown_has_network_upgrade_marker(&contents),
+        Err(_) => false,
+    }
 }
 
 fn filter_dirty_paths(
@@ -458,6 +507,7 @@ fn dirty_serve_sync_loop(
                     &active_repo.source_root,
                     &active_repo.build_repo_path,
                     active_repo.only_plan.as_ref(),
+                    active_repo.network_upgrade_index.as_ref(),
                     &mut previous_active_dirty_paths,
                 ) {
                     warn!(
@@ -490,6 +540,7 @@ pub(crate) fn serve_sync_config(
     source_root: &Path,
     repo_path: &Path,
     only_plan: Option<OnlyRenderPlan>,
+    network_upgrade_index: Option<NetworkUpgradeIndex>,
     local_theme_sync: Option<LocalThemeServeSync>,
 ) -> ServeSyncConfig {
     ServeSyncConfig {
@@ -498,6 +549,7 @@ pub(crate) fn serve_sync_config(
                 source_root: source_root.to_path_buf(),
                 build_repo_path: repo_path.to_path_buf(),
                 only_plan,
+                network_upgrade_index,
             }
         }),
         local_theme: local_theme_sync,
@@ -517,13 +569,14 @@ mod tests {
 
     use crate::{
         git::SourceMaterialization,
+        network_upgrades::{NetworkUpgradeIndex, NetworkUpgradeMembership},
         proposal::{OnlyRenderPlan, ProposalNumber},
     };
 
     use super::{
-        affected_dirty_paths, event_has_theme_index_path, filter_dirty_paths,
-        selected_deleted_proposal_markdown_paths, serve_sync_config, sync_dirty_serve_state,
-        LocalThemeServeSync,
+        affected_dirty_paths, changed_hardfork_meta_eip_paths, event_has_theme_index_path,
+        filter_dirty_paths, selected_deleted_proposal_markdown_paths, serve_sync_config,
+        sync_dirty_serve_state, LocalThemeServeSync,
     };
 
     fn fake_theme_sync(root: &Path) -> LocalThemeServeSync {
@@ -606,6 +659,38 @@ mod tests {
         contents.split_once("\n+++\n").unwrap().1.to_owned()
     }
 
+    fn rendered_front_matter(path: &Path) -> toml::Value {
+        let contents = std::fs::read_to_string(path).unwrap();
+        let front_matter = contents
+            .strip_prefix("+++\n")
+            .unwrap()
+            .split_once("\n+++\n")
+            .unwrap()
+            .0;
+        toml::from_str(front_matter).unwrap()
+    }
+
+    fn network_upgrade_index_for_member(proposal_number: ProposalNumber) -> NetworkUpgradeIndex {
+        NetworkUpgradeIndex {
+            upgrades: Vec::new(),
+            memberships_by_proposal: [(
+                proposal_number,
+                vec![NetworkUpgradeMembership {
+                    display_name: "Glamsterdam".to_owned(),
+                    slug: "glamsterdam".to_owned(),
+                    source_meta_eip: number(7773),
+                    meta_url: "/7773/".to_owned(),
+                    stage_key: "scheduled".to_owned(),
+                    stage_label: "Scheduled for Inclusion".to_owned(),
+                    subgroup: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            selected_sources: Vec::new(),
+        }
+    }
+
     fn dirty_sync_fixture() -> (TempDir, PathBuf, PathBuf, OnlyRenderPlan) {
         let temp = TempDir::new().unwrap();
         let source = temp.path().join("source");
@@ -666,6 +751,7 @@ mod tests {
             &temp.path().join("Core"),
             &temp.path().join(".local-build/Core/repo"),
             Some(plan),
+            None,
             Some(fake_theme_sync(temp.path())),
         );
 
@@ -687,6 +773,7 @@ mod tests {
             SourceMaterialization::Clean,
             &temp.path().join("Core"),
             &temp.path().join(".local-build/Core/repo"),
+            None,
             None,
             Some(fake_theme_sync(temp.path())),
         );
@@ -740,6 +827,36 @@ mod tests {
     }
 
     #[test]
+    fn dirty_serve_detects_changed_registered_or_marked_hardfork_meta_eips() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        write_file(
+            &source,
+            "content/01234.md",
+            "---\neip: 1234\ntitle: Marked\ntype: Meta\nnetwork-upgrade: Test\n---\n",
+        );
+        write_file(
+            &source,
+            "content/00001.md",
+            "---\neip: 1\ntitle: Plain\ntype: Meta\n---\n",
+        );
+        let affected_paths = paths(&[
+            "content/07773.md",
+            "content/01234.md",
+            "content/00001.md",
+            "README.md",
+        ]);
+
+        assert_eq!(
+            changed_hardfork_meta_eip_paths(&source, &affected_paths),
+            vec![
+                PathBuf::from("content/01234.md"),
+                PathBuf::from("content/07773.md")
+            ]
+        );
+    }
+
+    #[test]
     fn only_dirty_sync_does_not_reintroduce_unselected_markdown_or_assets() {
         let (_temp, source, build, plan) = dirty_sync_fixture();
         write_file(
@@ -754,7 +871,14 @@ mod tests {
         );
         let mut previous_dirty_paths = BTreeSet::new();
 
-        sync_dirty_serve_state(&source, &build, Some(&plan), &mut previous_dirty_paths).unwrap();
+        sync_dirty_serve_state(
+            &source,
+            &build,
+            Some(&plan),
+            None,
+            &mut previous_dirty_paths,
+        )
+        .unwrap();
 
         assert!(!build.join("content/00678.md").exists());
         assert!(!build.join("content/00678/assets/diagram.png").exists());
@@ -771,7 +895,14 @@ mod tests {
         );
         let mut previous_dirty_paths = BTreeSet::new();
 
-        sync_dirty_serve_state(&source, &build, Some(&plan), &mut previous_dirty_paths).unwrap();
+        sync_dirty_serve_state(
+            &source,
+            &build,
+            Some(&plan),
+            None,
+            &mut previous_dirty_paths,
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(build.join("content/00555/assets/diagram.png")).unwrap(),
@@ -795,7 +926,14 @@ mod tests {
         );
         let mut previous_dirty_paths = BTreeSet::new();
 
-        sync_dirty_serve_state(&source, &build, Some(&plan), &mut previous_dirty_paths).unwrap();
+        sync_dirty_serve_state(
+            &source,
+            &build,
+            Some(&plan),
+            None,
+            &mut previous_dirty_paths,
+        )
+        .unwrap();
 
         let selected = std::fs::read_to_string(build.join("content/00555.md")).unwrap();
         let index_body = rendered_body(&build.join("content/_index.md"));
@@ -804,12 +942,53 @@ mod tests {
     }
 
     #[test]
+    fn dirty_sync_preserves_network_upgrade_memberships_on_changed_member_eip() {
+        let (_temp, source, build, plan) = dirty_sync_fixture();
+        write_file(
+            &source,
+            "content/00555.md",
+            &proposal_markdown(555, "", "Dirty member EIP."),
+        );
+        let index = network_upgrade_index_for_member(number(555));
+        let mut previous_dirty_paths = BTreeSet::new();
+
+        sync_dirty_serve_state(
+            &source,
+            &build,
+            Some(&plan),
+            Some(&index),
+            &mut previous_dirty_paths,
+        )
+        .unwrap();
+
+        let front_matter = rendered_front_matter(&build.join("content/00555.md"));
+        let memberships = front_matter["extra"]["network_upgrades"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            memberships[0]["display_name"].as_str().unwrap(),
+            "Glamsterdam"
+        );
+        assert_eq!(
+            memberships[0]["stage_label"].as_str().unwrap(),
+            "Scheduled for Inclusion"
+        );
+    }
+
+    #[test]
     fn only_dirty_sync_propagates_selected_proposal_deletion() {
         let (_temp, source, build, plan) = dirty_sync_fixture();
         std::fs::remove_file(source.join("content/00555.md")).unwrap();
         let mut previous_dirty_paths = BTreeSet::new();
 
-        sync_dirty_serve_state(&source, &build, Some(&plan), &mut previous_dirty_paths).unwrap();
+        sync_dirty_serve_state(
+            &source,
+            &build,
+            Some(&plan),
+            None,
+            &mut previous_dirty_paths,
+        )
+        .unwrap();
 
         assert!(!build.join("content/00555.md").exists());
         assert!(previous_dirty_paths.contains(Path::new("content/00555.md")));

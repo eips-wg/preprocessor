@@ -91,6 +91,7 @@ impl ProposalCatalog {
         self.source_documents.get(&prefix.key(proposal_number))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn into_records(self) -> BTreeMap<String, ProposalCatalogRecord> {
         self.records
     }
