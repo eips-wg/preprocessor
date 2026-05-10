@@ -16,9 +16,9 @@ use crate::{
     execution::ResolvedExecution,
     git,
     layout::{mounted_theme_path, output_path, CONTENT_DIR, REPO_DIR},
-    markdown,
+    markdown, network_upgrades,
     proposal::OnlyRenderPlan,
-    proposal_metadata,
+    proposal_catalog, proposal_metadata,
     serve::{serve_sync_config, DirtyServeWatcher, LocalThemeServeSync},
     zola,
 };
@@ -66,6 +66,34 @@ fn prepare_runtime_source(
     Ok(())
 }
 
+fn prepare_runtime_derived_data(
+    repo_path: &Path,
+    repository_title: &str,
+    only_plan: Option<&OnlyRenderPlan>,
+) -> Result<network_upgrades::NetworkUpgradeIndex, Whatever> {
+    let content_path = repo_path.join(CONTENT_DIR);
+    let proposal_catalog = proposal_catalog::collect_proposal_catalog(&content_path, only_plan)
+        .whatever_context("unable to collect proposal catalog")?;
+    proposal_metadata::write_proposal_metadata_json_from_catalog(
+        repo_path,
+        repository_title,
+        &proposal_catalog,
+    )
+    .whatever_context("unable to write proposal metadata JSON")?;
+    let network_upgrade_index = network_upgrades::collect_network_upgrades(&proposal_catalog)
+        .whatever_context("unable to collect network upgrades")?;
+    markdown::preprocess_with_network_upgrades(
+        &content_path,
+        only_plan,
+        Some(&network_upgrade_index),
+    )
+    .whatever_context("unable to preprocess markdown")?;
+    network_upgrades::write_hardforks_index(&content_path, &network_upgrade_index)
+        .whatever_context("unable to write network upgrades index")?;
+
+    Ok(network_upgrade_index)
+}
+
 #[derive(Debug)]
 pub(crate) struct Prepared {
     repo_path: PathBuf,
@@ -74,6 +102,7 @@ pub(crate) struct Prepared {
     theme_path: PathBuf,
     local_theme_sync: Option<LocalThemeServeSync>,
     only_plan: Option<OnlyRenderPlan>,
+    network_upgrade_index: network_upgrades::NetworkUpgradeIndex,
     source_root: PathBuf,
     source_materialization: git::SourceMaterialization,
     server_binding: ServerBinding,
@@ -112,14 +141,8 @@ impl Prepared {
             .map(|selected_numbers| OnlyRenderPlan::build(&content_path, selected_numbers))
             .transpose()
             .whatever_context("unable to build targeted render plan")?;
-        proposal_metadata::write_proposal_metadata_json(
-            &repo_path,
-            &repository_use.title,
-            only_plan.as_ref(),
-        )
-        .whatever_context("unable to write proposal metadata JSON")?;
-        markdown::preprocess(&content_path, only_plan.as_ref())
-            .whatever_context("unable to preprocess markdown")?;
+        let network_upgrade_index =
+            prepare_runtime_derived_data(&repo_path, &repository_use.title, only_plan.as_ref())?;
         if let Some(only_plan) = &only_plan {
             only_plan
                 .prune_content(&content_path)
@@ -134,6 +157,7 @@ impl Prepared {
             repo_path,
             output_path,
             only_plan,
+            network_upgrade_index,
             source_root: root_path,
             source_materialization,
             server_binding,
@@ -162,6 +186,7 @@ impl Prepared {
             &self.source_root,
             &self.repo_path,
             self.only_plan.clone(),
+            Some(self.network_upgrade_index.clone()),
             self.local_theme_sync.clone(),
         );
         let dirty_watcher = if sync_config.has_targets() {
@@ -217,10 +242,11 @@ mod tests {
             NetworkUpgradeRegistrySource, NetworkUpgradeRegistryUpgrade,
             NetworkUpgradeSourceBucket,
         },
+        proposal::{OnlyRenderPlan, ProposalNumber},
         proposal_catalog::collect_proposal_catalog,
     };
 
-    use super::{prepare_runtime_source, prepare_theme_for_zola};
+    use super::{prepare_runtime_derived_data, prepare_runtime_source, prepare_theme_for_zola};
 
     struct RuntimeWorkspace {
         _temp: TempDir,
@@ -277,6 +303,10 @@ mod tests {
 
     fn file_url(path: &Path) -> Url {
         Url::from_directory_path(path).unwrap()
+    }
+
+    fn number(value: u32) -> ProposalNumber {
+        ProposalNumber::from_u32(value).unwrap()
     }
 
     fn repo_manifest_text(repo_id: &str, repository: &Url, siblings: &[(&str, Url)]) -> String {
@@ -609,5 +639,79 @@ base_url = "https://staging.example.test/{sibling_id}/"
 
         assert!(!resolved.root_path.join("content/00002.md").exists());
         assert_eq!(index.upgrades[0].stages[0].rows[0].number.get(), 2);
+    }
+
+    #[test]
+    fn prepared_runtime_derived_data_uses_prepared_sources_and_writes_hardfork_index() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let active_path = workspace_root.join("EIPs");
+        let sibling_path = workspace_root.join("ERCs");
+        let missing_upstream = file_url(&temp.path().join("missing-upstream"));
+        let sibling_url = file_url(&sibling_path);
+        let manifest = repo_manifest_text("EIPs", &missing_upstream, &[("ERCs", sibling_url)]);
+        let glamsterdam = pipeline_meta_markdown(
+            7773,
+            "2024-09-26",
+            "### Included EIPs\n\n* [EIP-2](./00002.md)\n",
+        );
+        let hegota = pipeline_meta_markdown(8081, "2025-11-11", "### Included EIPs\n");
+        let dencun = pipeline_meta_markdown(7569, "2023-12-01", "### Included EIPs\n");
+        let pectra = pipeline_meta_markdown(7600, "2024-01-18", "### Included EIPs\n");
+        let fusaka = pipeline_meta_markdown(7607, "2024-02-01", "### Included EIPs\n");
+        let sibling_markdown = pipeline_proposal_markdown(2, None, "Sibling proposal.");
+
+        write_file(&workspace_root, config::LOCAL_CONFIG_FILE, "");
+        std::fs::create_dir_all(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+        let _active_repo = init_repo(
+            &active_path,
+            &[
+                (config::REPO_MANIFEST_FILE, manifest.as_str()),
+                ("content/07773.md", glamsterdam.as_str()),
+                ("content/08081.md", hegota.as_str()),
+                ("content/07569.md", dencun.as_str()),
+                ("content/07600.md", pectra.as_str()),
+                ("content/07607.md", fusaka.as_str()),
+            ],
+        );
+        let _sibling_repo = init_repo(
+            &sibling_path,
+            &[("content/00002.md", sibling_markdown.as_str())],
+        );
+        let workspace = RuntimeWorkspace {
+            _temp: temp,
+            active_path,
+        };
+        let resolved = resolved_runtime(&workspace, &["build"]);
+
+        prepare_resolved_source(&resolved).unwrap();
+        let repo_path = resolved.build_path.join(REPO_DIR);
+        let content_path = repo_path.join(CONTENT_DIR);
+        let only_plan =
+            OnlyRenderPlan::build(&content_path, [number(2)].into_iter().collect()).unwrap();
+        let index = prepare_runtime_derived_data(
+            &repo_path,
+            &resolved.repository_use.title,
+            Some(&only_plan),
+        )
+        .unwrap();
+        only_plan.prune_content(&content_path).unwrap();
+
+        assert!(!resolved.root_path.join("content/00002.md").exists());
+        assert_eq!(index.memberships_by_proposal[&number(2)].len(), 1);
+        assert!(prepared_path(&resolved, "static/assets/data/proposals.json").exists());
+        assert!(prepared_path(&resolved, "content/hardforks/_index.md").exists());
+        assert!(!prepared_path(&resolved, "content/07773.md").exists());
+        let hardfork_index =
+            std::fs::read_to_string(prepared_path(&resolved, "content/hardforks/_index.md"))
+                .unwrap();
+        assert!(hardfork_index.contains("Glamsterdam"));
+        assert!(hardfork_index.contains("https://eips.ethereum.org/EIPS/eip-7773"));
+        assert!(hardfork_index.contains("url = \"/2/\""));
+        assert!(
+            std::fs::read_to_string(prepared_path(&resolved, "content/00002.md"))
+                .unwrap()
+                .contains("network_upgrades")
+        );
     }
 }

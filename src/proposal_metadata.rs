@@ -18,7 +18,9 @@ use snafu::{OptionExt, ResultExt, Whatever};
 use crate::{
     layout::CONTENT_DIR,
     proposal::OnlyRenderPlan,
-    proposal_catalog::{collect_proposal_catalog, ProposalCatalogPrefix, ProposalCatalogRecord},
+    proposal_catalog::{
+        collect_proposal_catalog, ProposalCatalog, ProposalCatalogPrefix, ProposalCatalogRecord,
+    },
 };
 
 const PROPOSAL_METADATA_SCHEMA_VERSION: u8 = 1;
@@ -30,10 +32,20 @@ struct ProposalMetadataIndex {
     proposals: BTreeMap<String, ProposalCatalogRecord>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn write_proposal_metadata_json(
     repo_path: &Path,
     repository_title: &str,
     only_plan: Option<&OnlyRenderPlan>,
+) -> Result<(), Whatever> {
+    let catalog = collect_proposal_catalog(&repo_path.join(CONTENT_DIR), only_plan)?;
+    write_proposal_metadata_json_from_catalog(repo_path, repository_title, &catalog)
+}
+
+pub(crate) fn write_proposal_metadata_json_from_catalog(
+    repo_path: &Path,
+    repository_title: &str,
+    catalog: &ProposalCatalog,
 ) -> Result<(), Whatever> {
     let json_path = proposal_metadata_json_path(repo_path);
     ensure_proposal_metadata_output_available(&json_path)?;
@@ -41,8 +53,7 @@ pub(crate) fn write_proposal_metadata_json(
     let metadata = ProposalMetadataIndex {
         schema_version: PROPOSAL_METADATA_SCHEMA_VERSION,
         active_prefix: active_proposal_metadata_prefix(repository_title)?,
-        proposals: collect_proposal_catalog(&repo_path.join(CONTENT_DIR), only_plan)?
-            .into_records(),
+        proposals: catalog.records().clone(),
     };
 
     write_proposal_metadata_file(&json_path, &metadata)
@@ -148,8 +159,14 @@ mod tests {
     use serde_json::{json, Value};
     use tempfile::TempDir;
 
-    use super::{proposal_metadata_json_path, write_proposal_metadata_json};
-    use crate::proposal::{OnlyRenderPlan, ProposalNumber};
+    use super::{
+        proposal_metadata_json_path, write_proposal_metadata_json,
+        write_proposal_metadata_json_from_catalog,
+    };
+    use crate::{
+        proposal::{OnlyRenderPlan, ProposalNumber},
+        proposal_catalog::collect_proposal_catalog,
+    };
 
     fn number(value: u32) -> ProposalNumber {
         ProposalNumber::from_u32(value).unwrap()
@@ -192,6 +209,24 @@ mod tests {
         .unwrap()
     }
 
+    fn write_proposal_metadata_fixture(root: &Path) {
+        write_file(
+            root,
+            "content/020.md",
+            &metadata_proposal_markdown(
+                20,
+                "Token Standard",
+                Some("ERC"),
+                Some("A standard interface for tokens."),
+            ),
+        );
+        write_file(
+            root,
+            "content/021.md",
+            &metadata_proposal_markdown(21, "Proposal 21", None, None),
+        );
+    }
+
     #[test]
     fn proposal_metadata_full_build_writes_json() {
         let temp = TempDir::new().unwrap();
@@ -222,6 +257,23 @@ mod tests {
         assert_eq!(proposal["type"], json!("Standards Track"));
         assert_eq!(proposal["category"], json!("ERC"));
         assert_eq!(proposal["url"], json!("/20/"));
+    }
+
+    #[test]
+    fn proposal_metadata_catalog_writer_matches_existing_output() {
+        let wrapper_temp = TempDir::new().unwrap();
+        let catalog_temp = TempDir::new().unwrap();
+        write_proposal_metadata_fixture(wrapper_temp.path());
+        write_proposal_metadata_fixture(catalog_temp.path());
+
+        write_proposal_metadata_json(wrapper_temp.path(), "EIPs", None).unwrap();
+        let catalog = collect_proposal_catalog(&catalog_temp.path().join("content"), None).unwrap();
+        write_proposal_metadata_json_from_catalog(catalog_temp.path(), "EIPs", &catalog).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(proposal_metadata_json_path(wrapper_temp.path())).unwrap(),
+            std::fs::read_to_string(proposal_metadata_json_path(catalog_temp.path())).unwrap()
+        );
     }
 
     #[test]

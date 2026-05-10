@@ -39,6 +39,7 @@ use walkdir::WalkDir;
 use iref::IriRefBuf;
 
 use crate::{
+    network_upgrades::{NetworkUpgradeIndex, NetworkUpgradeMembership},
     progress::ProgressIteratorExt,
     proposal::{
         path_component_proposal_number, proposal_number_from_content_markdown_path, OnlyRenderPlan,
@@ -82,6 +83,45 @@ impl From<Author> for Value {
         // TODO: Hacky way to implement this conversion...
         toml::from_str(&toml::to_string(&value).unwrap()).unwrap()
     }
+}
+
+fn network_upgrade_memberships_value(memberships: &[NetworkUpgradeMembership]) -> Value {
+    Value::Array(
+        memberships
+            .iter()
+            .map(network_upgrade_membership_value)
+            .collect(),
+    )
+}
+
+fn network_upgrade_membership_value(membership: &NetworkUpgradeMembership) -> Value {
+    let mut table = toml::Table::new();
+    table.insert(
+        "display_name".to_owned(),
+        Value::String(membership.display_name.clone()),
+    );
+    table.insert("slug".to_owned(), Value::String(membership.slug.clone()));
+    table.insert(
+        "meta_eip".to_owned(),
+        Value::Integer(i64::from(membership.source_meta_eip.get())),
+    );
+    table.insert(
+        "meta_url".to_owned(),
+        Value::String(membership.meta_url.clone()),
+    );
+    table.insert(
+        "stage_key".to_owned(),
+        Value::String(membership.stage_key.clone()),
+    );
+    table.insert(
+        "stage_label".to_owned(),
+        Value::String(membership.stage_label.clone()),
+    );
+    if let Some(subgroup) = &membership.subgroup {
+        table.insert("subgroup".to_owned(), Value::String(subgroup.clone()));
+    }
+
+    Value::Table(table)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -730,7 +770,16 @@ fn is_generated_zola_markdown(contents: &str) -> bool {
     contents.starts_with("+++\n")
 }
 
+#[allow(dead_code)]
 pub fn preprocess(root_path: &Path, only_plan: Option<&OnlyRenderPlan>) -> Result<(), Whatever> {
+    preprocess_with_network_upgrades(root_path, only_plan, None)
+}
+
+pub(crate) fn preprocess_with_network_upgrades(
+    root_path: &Path,
+    only_plan: Option<&OnlyRenderPlan>,
+    network_upgrade_index: Option<&NetworkUpgradeIndex>,
+) -> Result<(), Whatever> {
     let dir = std::fs::read_dir(root_path).with_whatever_context(|_| {
         format!("could not read directory `{}`", root_path.to_string_lossy())
     })?;
@@ -783,10 +832,22 @@ pub fn preprocess(root_path: &Path, only_plan: Option<&OnlyRenderPlan>) -> Resul
                 if let Some(plan) = only_plan {
                     let index_relative_path = relative_path.join("index.md");
                     if plan.should_preprocess_markdown(&index_relative_path) {
-                        process_eip(root_path, &index_path, only_plan, MissingPathMode::Error)?;
+                        process_eip(
+                            root_path,
+                            &index_path,
+                            only_plan,
+                            network_upgrade_index,
+                            MissingPathMode::Error,
+                        )?;
                     }
                 } else {
-                    process_eip(root_path, &index_path, only_plan, MissingPathMode::Error)?;
+                    process_eip(
+                        root_path,
+                        &index_path,
+                        only_plan,
+                        network_upgrade_index,
+                        MissingPathMode::Error,
+                    )?;
                 }
                 process_assets(root_path, &entry_path, only_plan, MissingPathMode::Error)?;
             }
@@ -804,7 +865,13 @@ pub fn preprocess(root_path: &Path, only_plan: Option<&OnlyRenderPlan>) -> Resul
                 .map(|plan| plan.should_preprocess_markdown(relative_path))
                 .unwrap_or(true)
             {
-                process_eip(root_path, &entry_path, only_plan, MissingPathMode::Error)?;
+                process_eip(
+                    root_path,
+                    &entry_path,
+                    only_plan,
+                    network_upgrade_index,
+                    MissingPathMode::Error,
+                )?;
             }
         }
     }
@@ -812,10 +879,20 @@ pub fn preprocess(root_path: &Path, only_plan: Option<&OnlyRenderPlan>) -> Resul
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn preprocess_paths(
     root_path: &Path,
     relative_paths: &BTreeSet<PathBuf>,
     only_plan: Option<&OnlyRenderPlan>,
+) -> Result<(), Whatever> {
+    preprocess_paths_with_network_upgrades(root_path, relative_paths, only_plan, None)
+}
+
+pub(crate) fn preprocess_paths_with_network_upgrades(
+    root_path: &Path,
+    relative_paths: &BTreeSet<PathBuf>,
+    only_plan: Option<&OnlyRenderPlan>,
+    network_upgrade_index: Option<&NetworkUpgradeIndex>,
 ) -> Result<(), Whatever> {
     let mut eips = BTreeSet::new();
     let mut asset_dirs = BTreeSet::new();
@@ -859,7 +936,13 @@ pub fn preprocess_paths(
     }
 
     for path in eips {
-        process_eip(root_path, &path, only_plan, MissingPathMode::Ignore)?;
+        process_eip(
+            root_path,
+            &path,
+            only_plan,
+            network_upgrade_index,
+            MissingPathMode::Ignore,
+        )?;
     }
 
     for path in asset_dirs {
@@ -1336,6 +1419,7 @@ fn process_eip(
     root: &Path,
     path: &Path,
     only_plan: Option<&OnlyRenderPlan>,
+    network_upgrade_index: Option<&NetworkUpgradeIndex>,
     missing_path_mode: MissingPathMode,
 ) -> Result<(), Whatever> {
     let path_lossy = path.to_string_lossy();
@@ -1382,6 +1466,8 @@ fn process_eip(
         updated,
         ..Default::default()
     };
+    let mut proposal_number = None;
+    let mut proposal_is_erc = false;
 
     for field in preamble.fields() {
         let value = field.value().trim();
@@ -1410,6 +1496,9 @@ fn process_eip(
                     .insert("type".into(), vec![value.into()]);
             }
             "category" => {
+                if value == "ERC" {
+                    proposal_is_erc = true;
+                }
                 front_matter.extra.insert("category".into(), value.into());
                 front_matter
                     .taxonomies
@@ -1423,6 +1512,7 @@ fn process_eip(
                 front_matter.template = Some("eip.html".into());
                 front_matter.slug = number.to_string();
                 front_matter.extra.insert("number".into(), number.into());
+                proposal_number = ProposalNumber::from_u32(number).ok();
 
                 let alias_path = PathBuf::from(&path);
                 if let Some(file_stem) = alias_path.file_stem() {
@@ -1487,6 +1577,17 @@ fn process_eip(
         }
     }
 
+    if let (Some(index), Some(proposal_number)) = (network_upgrade_index, proposal_number) {
+        if !proposal_is_erc {
+            if let Some(memberships) = index.memberships_by_proposal.get(&proposal_number) {
+                front_matter.extra.insert(
+                    "network_upgrades".into(),
+                    network_upgrade_memberships_value(memberships),
+                );
+            }
+        }
+    }
+
     match write_file(path, front_matter, &body) {
         Ok(()) => {}
         Err(error) if missing_path_mode.should_ignore_io_error(&error) => return Ok(()),
@@ -1508,9 +1609,11 @@ mod tests {
 
     use super::{
         absolute_rendered_path_for_content_path, preprocess, preprocess_paths,
-        proposal_asset_exists_in_content_tree, relative_url_from_rendered_paths,
-        resolve_proposal_asset_path, ProposalAssetPath, ProposalAssetPathResolution,
+        preprocess_with_network_upgrades, proposal_asset_exists_in_content_tree,
+        relative_url_from_rendered_paths, resolve_proposal_asset_path, ProposalAssetPath,
+        ProposalAssetPathResolution,
     };
+    use crate::network_upgrades::{NetworkUpgradeIndex, NetworkUpgradeMembership};
     use crate::proposal::ProposalAssetKind;
     use crate::proposal::{OnlyRenderPlan, ProposalNumber};
 
@@ -1597,6 +1700,35 @@ mod tests {
             .unwrap()
             .0;
         toml::from_str(front_matter).unwrap()
+    }
+
+    fn network_upgrade_index_for_memberships(
+        proposal_number: ProposalNumber,
+        memberships: Vec<NetworkUpgradeMembership>,
+    ) -> NetworkUpgradeIndex {
+        NetworkUpgradeIndex {
+            upgrades: Vec::new(),
+            memberships_by_proposal: [(proposal_number, memberships)].into_iter().collect(),
+            selected_sources: Vec::new(),
+        }
+    }
+
+    fn membership(
+        display_name: &str,
+        source_meta_eip: u32,
+        stage_key: &str,
+        stage_label: &str,
+        subgroup: Option<&str>,
+    ) -> NetworkUpgradeMembership {
+        NetworkUpgradeMembership {
+            display_name: display_name.to_owned(),
+            slug: display_name.to_ascii_lowercase(),
+            source_meta_eip: number(source_meta_eip),
+            meta_url: format!("/{source_meta_eip}/"),
+            stage_key: stage_key.to_owned(),
+            stage_label: stage_label.to_owned(),
+            subgroup: subgroup.map(str::to_owned),
+        }
     }
 
     fn resolved_asset(
@@ -2062,6 +2194,89 @@ mod tests {
 
         let body = rendered_body(&content.join("00555.md"));
         assert!(body.contains("(@/00678.md)"));
+    }
+
+    #[test]
+    fn preprocess_injects_network_upgrade_memberships_into_proposal_extra() {
+        let (_temp, content) = content_repo(&[(
+            "00555.md",
+            proposal_markdown(555, None, "", "Proposal body."),
+        )]);
+        let index = network_upgrade_index_for_memberships(
+            number(555),
+            vec![
+                membership("Dencun", 7569, "included", "Included", Some("Core EIPs")),
+                membership(
+                    "Glamsterdam",
+                    7773,
+                    "scheduled",
+                    "Scheduled for Inclusion",
+                    None,
+                ),
+            ],
+        );
+
+        preprocess_with_network_upgrades(&content, None, Some(&index)).unwrap();
+
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        let memberships = front_matter["extra"]["network_upgrades"]
+            .as_array()
+            .unwrap();
+        assert_eq!(memberships.len(), 2);
+        assert_eq!(memberships[0]["display_name"].as_str().unwrap(), "Dencun");
+        assert_eq!(memberships[0]["slug"].as_str().unwrap(), "dencun");
+        assert_eq!(memberships[0]["meta_eip"].as_integer().unwrap(), 7569);
+        assert_eq!(memberships[0]["meta_url"].as_str().unwrap(), "/7569/");
+        assert_eq!(memberships[0]["stage_key"].as_str().unwrap(), "included");
+        assert_eq!(memberships[0]["stage_label"].as_str().unwrap(), "Included");
+        assert_eq!(memberships[0]["subgroup"].as_str().unwrap(), "Core EIPs");
+        assert_eq!(
+            memberships[1]["display_name"].as_str().unwrap(),
+            "Glamsterdam"
+        );
+        assert!(memberships[1].as_table().unwrap().get("subgroup").is_none());
+    }
+
+    #[test]
+    fn preprocess_leaves_proposals_without_network_upgrade_memberships_unchanged() {
+        let (_temp, content) = content_repo(&[(
+            "00555.md",
+            proposal_markdown(555, None, "", "Proposal body."),
+        )]);
+        let index = network_upgrade_index_for_memberships(
+            number(777),
+            vec![membership("Dencun", 7569, "included", "Included", None)],
+        );
+
+        preprocess_with_network_upgrades(&content, None, Some(&index)).unwrap();
+
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        assert!(front_matter["extra"]
+            .as_table()
+            .unwrap()
+            .get("network_upgrades")
+            .is_none());
+    }
+
+    #[test]
+    fn preprocess_does_not_inject_eip_memberships_into_same_number_erc_pages() {
+        let (_temp, content) = content_repo(&[(
+            "00555.md",
+            proposal_markdown(555, Some("ERC"), "", "Proposal body."),
+        )]);
+        let index = network_upgrade_index_for_memberships(
+            number(555),
+            vec![membership("Dencun", 7569, "included", "Included", None)],
+        );
+
+        preprocess_with_network_upgrades(&content, None, Some(&index)).unwrap();
+
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        assert!(front_matter["extra"]
+            .as_table()
+            .unwrap()
+            .get("network_upgrades")
+            .is_none());
     }
 
     #[test]
