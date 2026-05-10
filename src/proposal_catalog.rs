@@ -14,14 +14,14 @@ use std::{
 
 use eipw_preamble::Preamble;
 use serde::Serialize;
-use snafu::{ResultExt, Whatever};
+use snafu::{OptionExt, ResultExt, Whatever};
 
 use crate::proposal::{
-    flat_proposal_number, parse_proposal_preamble, path_component_proposal_number,
-    public_site_for_markdown, OnlyRenderPlan, ProposalNumber, ProposalPublicSite,
+    flat_proposal_number, path_component_proposal_number, public_site_for_markdown, OnlyRenderPlan,
+    ProposalNumber, ProposalPublicSite,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(crate) enum ProposalCatalogPrefix {
     #[serde(rename = "EIP")]
     Eip,
@@ -71,11 +71,74 @@ pub(crate) struct ProposalCatalogRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct ProposalCatalog {
     records: BTreeMap<String, ProposalCatalogRecord>,
+    source_documents: BTreeMap<String, ProposalCatalogSourceDocument>,
 }
 
 impl ProposalCatalog {
+    pub(crate) fn records(&self) -> &BTreeMap<String, ProposalCatalogRecord> {
+        &self.records
+    }
+
+    pub(crate) fn source_documents(&self) -> impl Iterator<Item = &ProposalCatalogSourceDocument> {
+        self.source_documents.values()
+    }
+
+    pub(crate) fn source_document(
+        &self,
+        prefix: ProposalCatalogPrefix,
+        proposal_number: ProposalNumber,
+    ) -> Option<&ProposalCatalogSourceDocument> {
+        self.source_documents.get(&prefix.key(proposal_number))
+    }
+
     pub(crate) fn into_records(self) -> BTreeMap<String, ProposalCatalogRecord> {
         self.records
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProposalCatalogSourceDocument {
+    number: ProposalNumber,
+    prefix: ProposalCatalogPrefix,
+    source_path: PathBuf,
+    preamble_fields: Vec<(String, String)>,
+    body: String,
+}
+
+impl ProposalCatalogSourceDocument {
+    pub(crate) fn number(&self) -> ProposalNumber {
+        self.number
+    }
+
+    pub(crate) fn prefix(&self) -> ProposalCatalogPrefix {
+        self.prefix
+    }
+
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    pub(crate) fn field(&self, name: &str) -> Option<&str> {
+        self.preamble_fields
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    pub(crate) fn created(&self) -> Option<&str> {
+        self.field("created")
+    }
+
+    pub(crate) fn network_upgrade(&self) -> Option<&str> {
+        self.field("network-upgrade")
+    }
+
+    pub(crate) fn proposal_type(&self) -> Option<&str> {
+        self.field("type")
+    }
+
+    pub(crate) fn body(&self) -> &str {
+        &self.body
     }
 }
 
@@ -84,6 +147,7 @@ struct CollectedProposalCatalogRecord {
     key: String,
     source_path: PathBuf,
     record: ProposalCatalogRecord,
+    source_document: ProposalCatalogSourceDocument,
 }
 
 #[derive(Debug)]
@@ -173,11 +237,18 @@ pub(crate) fn collect_proposal_catalog(
         }
     }
 
+    let mut source_documents = BTreeMap::new();
+    let records = records
+        .into_iter()
+        .map(|(key, metadata)| {
+            source_documents.insert(key.clone(), metadata.source_document);
+            (key, metadata.record)
+        })
+        .collect();
+
     Ok(ProposalCatalog {
-        records: records
-            .into_iter()
-            .map(|(key, metadata)| (key, metadata.record))
-            .collect(),
+        records,
+        source_documents,
     })
 }
 
@@ -254,12 +325,23 @@ fn collect_proposal_catalog_from_contents(
         })?;
 
     let site = public_site_for_markdown(markdown_path, contents)?;
-    let preamble = parse_proposal_preamble(markdown_path, contents)?;
+    let (preamble, body) = split_proposal_source(markdown_path, contents)?;
     let prefix = ProposalCatalogPrefix::from(site);
     let fields = ProposalCatalogFields::parse(markdown_path, proposal_number, &preamble)?;
+    let key = prefix.key(proposal_number);
+    let source_document = ProposalCatalogSourceDocument {
+        number: proposal_number,
+        prefix,
+        source_path: markdown_path.to_path_buf(),
+        preamble_fields: preamble
+            .fields()
+            .map(|field| (field.name().to_owned(), field.value().trim().to_owned()))
+            .collect(),
+        body: body.to_owned(),
+    };
 
     Ok(CollectedProposalCatalogRecord {
-        key: prefix.key(proposal_number),
+        key,
         source_path: markdown_path.to_path_buf(),
         record: ProposalCatalogRecord {
             number: proposal_number,
@@ -271,7 +353,22 @@ fn collect_proposal_catalog_from_contents(
             category: fields.category,
             url: catalog_record_url(proposal_number, site, only_plan),
         },
+        source_document,
     })
+}
+
+fn split_proposal_source<'a>(
+    markdown_path: &Path,
+    contents: &'a str,
+) -> Result<(Preamble<'a>, &'a str), Whatever> {
+    let path_lossy = markdown_path.to_string_lossy();
+    let (preamble, body) = Preamble::split(contents)
+        .with_whatever_context(|_| format!("couldn't split preamble for `{path_lossy}`"))?;
+    let preamble = Preamble::parse(None, preamble)
+        .ok()
+        .with_whatever_context(|| format!("couldn't parse preamble in `{path_lossy}`"))?;
+
+    Ok((preamble, body))
 }
 
 fn insert_collected_proposal_catalog_record(
@@ -482,6 +579,27 @@ mod tests {
             .path()
             .join("static/assets/data/proposals.json")
             .exists());
+    }
+
+    #[test]
+    fn proposal_catalog_exposes_source_documents_separately_from_records() {
+        let temp = TempDir::new().unwrap();
+        write_file(
+            temp.path(),
+            "7773.md",
+            "---\neip: 7773\ntitle: Hardfork Meta\nstatus: Draft\ntype: Meta\ncreated: 2024-09-26\nnetwork-upgrade: Glamsterdam\n---\nBody\n",
+        );
+
+        let catalog = collect_proposal_catalog(temp.path(), None).unwrap();
+        let records = catalog.records();
+        let document = catalog.source_documents().next().unwrap();
+
+        assert_eq!(records["eip-7773"].title, "Hardfork Meta");
+        assert_eq!(document.number(), number(7773));
+        assert_eq!(document.prefix(), ProposalCatalogPrefix::Eip);
+        assert_eq!(document.created(), Some("2024-09-26"));
+        assert_eq!(document.network_upgrade(), Some("Glamsterdam"));
+        assert_eq!(document.body(), "Body\n");
     }
 
     #[test]

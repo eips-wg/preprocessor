@@ -17,6 +17,7 @@ mod identity;
 mod layout;
 mod lint;
 mod markdown;
+mod network_upgrades;
 mod pipeline;
 mod preview;
 mod print;
