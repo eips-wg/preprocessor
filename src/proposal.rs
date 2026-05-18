@@ -207,6 +207,13 @@ pub(crate) enum ProposalPublicSite {
 }
 
 impl ProposalPublicSite {
+    pub(crate) fn proposal_prefix(self) -> &'static str {
+        match self {
+            Self::Eips => "EIP",
+            Self::Ercs => "ERC",
+        }
+    }
+
     pub(crate) fn proposal_url(self, proposal_number: ProposalNumber) -> String {
         match self {
             Self::Eips => format!(
@@ -742,7 +749,7 @@ pub(crate) fn parse_proposal_preamble<'a>(
         .with_whatever_context(|| format!("couldn't parse preamble in `{path_lossy}`"))
 }
 
-fn public_site_for_preamble(preamble: &Preamble<'_>) -> ProposalPublicSite {
+pub(crate) fn public_site_for_preamble(preamble: &Preamble<'_>) -> ProposalPublicSite {
     let is_erc = preamble
         .fields()
         .any(|field| field.name() == "category" && field.value().trim() == "ERC");
