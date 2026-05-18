@@ -9,7 +9,7 @@
 use std::{
     collections::BTreeSet,
     io::ErrorKind,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use log::{debug, info};
@@ -24,7 +24,7 @@ use crate::{
     identity::ActiveRepoIdentity,
     layout::BUILD_DIR,
     proposal::ProposalNumber,
-    search::SearchConfig,
+    search::{SearchConfig, SearchCorpusConfig},
 };
 
 #[derive(Debug, Clone)]
@@ -376,10 +376,16 @@ fn resolve_base_url_override(
 fn resolve_search_config(
     args: &Args,
     workspace_config: Option<&LoadedWorkspaceConfig>,
-) -> SearchConfig {
-    let mut search = workspace_config
-        .map(|config| SearchConfig {
-            pagefind: config.search_settings().pagefind,
+) -> Result<SearchConfig, Whatever> {
+    let search_settings = workspace_config.map(|config| config.search_settings());
+    let mut search = search_settings
+        .map(|settings| SearchConfig {
+            pagefind: settings.pagefind,
+            corpus: SearchCorpusConfig {
+                enabled: settings.corpus.enabled,
+                format: settings.corpus.format,
+                output: settings.corpus.output.clone(),
+            },
         })
         .unwrap_or_default();
 
@@ -387,7 +393,48 @@ fn resolve_search_config(
         search.pagefind = false;
     }
 
-    search
+    if let Some(format) = args.operation.search_cli_args().search_corpus {
+        search.corpus.enabled = true;
+        if let Some(format) = format {
+            search.corpus.format = format;
+        }
+    }
+
+    validate_search_corpus_output(&search.corpus.output)?;
+
+    Ok(search)
+}
+
+fn validate_search_corpus_output(output: &Path) -> Result<(), Whatever> {
+    if output.as_os_str().is_empty() || output.is_absolute() {
+        snafu::whatever!(
+            "search corpus output path `{}` must be relative to the rendered output directory",
+            output.to_string_lossy()
+        );
+    }
+
+    for component in output.components() {
+        match component {
+            Component::Normal(value) if value == "pagefind" => {
+                snafu::whatever!(
+                    "search corpus output path `{}` must not be under `pagefind`",
+                    output.to_string_lossy()
+                );
+            }
+            Component::Normal(_) => {}
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                snafu::whatever!(
+                    "search corpus output path `{}` must contain only safe relative path components",
+                    output.to_string_lossy()
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
@@ -431,7 +478,7 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
         git::SourceMaterialization::Clean
     };
     let base_url_override = resolve_base_url_override(args, workspace_config.as_ref())?;
-    let search = resolve_search_config(args, workspace_config.as_ref());
+    let search = resolve_search_config(args, workspace_config.as_ref())?;
 
     Ok(ResolvedExecution {
         root_path,
@@ -451,6 +498,8 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
     use tempfile::TempDir;
 
@@ -733,8 +782,10 @@ base_url = "http://localhost:4000"
     #[test]
     fn search_config_defaults_to_pagefind_enabled() {
         let args = parse_args(&["build-eips", "build"]);
+        let search = resolve_search_config(&args, None).unwrap();
 
-        assert!(resolve_search_config(&args, None).pagefind);
+        assert!(search.pagefind);
+        assert!(!search.corpus.enabled);
     }
 
     #[test]
@@ -747,7 +798,11 @@ pagefind = false
         );
         let args = parse_args(&["build-eips", "build"]);
 
-        assert!(!resolve_search_config(&args, Some(&workspace_config)).pagefind);
+        assert!(
+            !resolve_search_config(&args, Some(&workspace_config))
+                .unwrap()
+                .pagefind
+        );
     }
 
     #[test]
@@ -765,7 +820,91 @@ pagefind = true
         ] {
             let args = parse_args(arguments);
 
-            assert!(!resolve_search_config(&args, Some(&workspace_config)).pagefind);
+            assert!(
+                !resolve_search_config(&args, Some(&workspace_config))
+                    .unwrap()
+                    .pagefind
+            );
+        }
+    }
+
+    #[test]
+    fn search_corpus_resolution_uses_workspace_and_cli_precedence() {
+        let workspace_config = load_workspace_config(
+            r#"
+[search]
+pagefind = true
+
+[search.corpus]
+enabled = false
+format = "documents"
+output = "debug/corpus.json"
+"#,
+        );
+
+        let default_args = parse_args(&["build-eips", "build"]);
+        let default_search = resolve_search_config(&default_args, Some(&workspace_config)).unwrap();
+        assert!(!default_search.corpus.enabled);
+        assert_eq!(
+            default_search.corpus.format,
+            config::SearchCorpusFormat::Documents
+        );
+        assert_eq!(
+            default_search.corpus.output,
+            PathBuf::from("debug/corpus.json")
+        );
+
+        let bare_args = parse_args(&["build-eips", "build", "--search-corpus"]);
+        let bare_search = resolve_search_config(&bare_args, Some(&workspace_config)).unwrap();
+        assert!(bare_search.corpus.enabled);
+        assert_eq!(
+            bare_search.corpus.format,
+            config::SearchCorpusFormat::Documents
+        );
+
+        let explicit_args = parse_args(&[
+            "build-eips",
+            "build",
+            "--no-search",
+            "--search-corpus",
+            "chunks",
+        ]);
+        let explicit_search =
+            resolve_search_config(&explicit_args, Some(&workspace_config)).unwrap();
+        assert!(!explicit_search.pagefind);
+        assert!(explicit_search.corpus.enabled);
+        assert_eq!(
+            explicit_search.corpus.format,
+            config::SearchCorpusFormat::Chunks
+        );
+    }
+
+    #[test]
+    fn unsafe_search_corpus_output_paths_are_rejected_during_resolution() {
+        for output in [
+            "/tmp/search-corpus.json",
+            "../search-corpus.json",
+            ".",
+            "./search-corpus.json",
+            "pagefind/search-corpus.json",
+            "debug/pagefind/search-corpus.json",
+        ] {
+            let workspace_config = load_workspace_config(&format!(
+                r#"
+[search.corpus]
+enabled = true
+output = "{output}"
+"#
+            ));
+            let args = parse_args(&["build-eips", "build"]);
+            let error = resolve_search_config(&args, Some(&workspace_config))
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains("search corpus output path"),
+                "unexpected error for `{output}`: {error}"
+            );
         }
     }
 

@@ -304,6 +304,7 @@ dependencies = [
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
  "regex",
+ "scraper",
  "semver",
  "serde",
  "serde_json",

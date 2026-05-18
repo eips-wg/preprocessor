@@ -15,22 +15,45 @@ use serde::Serialize;
 use snafu::{OptionExt, ResultExt, Whatever};
 use url::Url;
 
-use crate::layout::CONTENT_DIR;
+use crate::{config::SearchCorpusFormat, layout::CONTENT_DIR};
 
+mod corpus;
 mod pagefind;
 
 const SEARCH_ROUTE_FILE: &str = "search.md";
 const SEARCH_ROUTE_DIR: &str = "search";
 pub(crate) const SEARCH_DATA_FILE: &str = "build_eips_search.toml";
+pub(crate) const DEFAULT_CORPUS_OUTPUT_FILE: &str = "search-corpus.json";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SearchConfig {
     pub(crate) pagefind: bool,
+    pub(crate) corpus: SearchCorpusConfig,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self { pagefind: true }
+        Self {
+            pagefind: true,
+            corpus: SearchCorpusConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SearchCorpusConfig {
+    pub(crate) enabled: bool,
+    pub(crate) format: SearchCorpusFormat,
+    pub(crate) output: PathBuf,
+}
+
+impl Default for SearchCorpusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            format: SearchCorpusFormat::default(),
+            output: PathBuf::from(DEFAULT_CORPUS_OUTPUT_FILE),
+        }
     }
 }
 
@@ -42,6 +65,20 @@ pub(crate) struct SearchIndexRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SearchIndexSummary {
     pub(crate) pages_indexed: usize,
+    pub(crate) output_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SearchCorpusRequest {
+    pub(crate) output_path: PathBuf,
+    pub(crate) base_url: Url,
+    pub(crate) config: SearchCorpusConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SearchCorpusSummary {
+    pub(crate) documents: usize,
+    pub(crate) chunks: usize,
     pub(crate) output_path: PathBuf,
 }
 
@@ -87,6 +124,12 @@ struct SearchPageExtra<'a> {
 
 pub(crate) fn index_site(request: SearchIndexRequest) -> Result<SearchIndexSummary, Whatever> {
     pagefind::index_site(request)
+}
+
+pub(crate) fn reconcile_corpus(
+    request: SearchCorpusRequest,
+) -> Result<Option<SearchCorpusSummary>, Whatever> {
+    corpus::reconcile_corpus(request)
 }
 
 pub(crate) fn ensure_search_route_available(content_path: &Path) -> Result<(), Whatever> {
@@ -138,7 +181,7 @@ pub(crate) fn write_search_route(
     })
 }
 
-fn normalized_base_path(base_url: &Url) -> String {
+pub(crate) fn normalized_base_path(base_url: &Url) -> String {
     let path = base_url.path().trim_matches('/');
 
     if path.is_empty() {
@@ -263,6 +306,32 @@ mod tests {
             .unwrap_or(false)
     }
 
+    fn contains_forbidden_scraper_reference(path: &Path) -> bool {
+        let absolute_direct_path = ["::", "scraper", "::"].concat();
+        let direct_path = ["scraper", "::"].concat();
+        let use_direct = ["use", "scraper"].concat();
+        let use_absolute_direct = ["use", "::", "scraper"].concat();
+        let extern_crate = ["extern", "crate", "scraper"].concat();
+
+        std::fs::read_to_string(path)
+            .map(|contents| {
+                contents.lines().any(|line| {
+                    let code = line.split("//").next().unwrap_or_default();
+                    let compact = code
+                        .chars()
+                        .filter(|character| !character.is_whitespace())
+                        .collect::<String>();
+
+                    compact.contains(&absolute_direct_path)
+                        || compact.contains(&direct_path)
+                        || compact.starts_with(&use_direct)
+                        || compact.starts_with(&use_absolute_direct)
+                        || compact.starts_with(&extern_crate)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     #[test]
     fn pagefind_crate_imports_stay_inside_pagefind_module() {
         let src_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -280,6 +349,26 @@ mod tests {
         assert!(
             violations.is_empty(),
             "Pagefind crate imports must stay in src/search/pagefind.rs, found {violations:?}"
+        );
+    }
+
+    #[test]
+    fn scraper_crate_imports_stay_inside_corpus_module() {
+        let src_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let allowed_dir = src_path.join("search/corpus");
+        let violations = walkdir::WalkDir::new(&src_path)
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|entry| entry.into_path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+            .filter(|path| !path.starts_with(&allowed_dir))
+            .filter(|path| contains_forbidden_scraper_reference(path))
+            .map(|path| path.strip_prefix(&src_path).unwrap().to_path_buf())
+            .collect::<Vec<PathBuf>>();
+
+        assert!(
+            violations.is_empty(),
+            "Scraper crate imports must stay in src/search/corpus/, found {violations:?}"
         );
     }
 

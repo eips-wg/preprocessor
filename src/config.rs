@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use clap::ValueEnum;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use snafu::{Backtrace, IntoError, OptionExt, ResultExt, Snafu};
 use url::{Position, Url};
@@ -494,11 +495,67 @@ pub struct RenderSettings {
 pub struct SearchSettings {
     /// Whether `build-eips build` writes Pagefind search assets after rendering HTML.
     pub pagefind: bool,
+
+    /// Optional rendered-HTML corpus output for debugging and external consumers.
+    #[serde(default)]
+    pub corpus: SearchCorpusSettings,
 }
 
 impl Default for SearchSettings {
     fn default() -> Self {
-        Self { pagefind: true }
+        Self {
+            pagefind: true,
+            corpus: SearchCorpusSettings::default(),
+        }
+    }
+}
+
+/// Workspace-local rendered search corpus settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchCorpusSettings {
+    /// Whether `build-eips build` writes the rendered search corpus artifact.
+    pub enabled: bool,
+
+    /// Which corpus views to emit.
+    pub format: SearchCorpusFormat,
+
+    /// Corpus output path relative to the rendered output directory.
+    pub output: PathBuf,
+}
+
+impl Default for SearchCorpusSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            format: SearchCorpusFormat::default(),
+            output: PathBuf::from("search-corpus.json"),
+        }
+    }
+}
+
+/// Rendered search corpus output format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SearchCorpusFormat {
+    /// Emit only document records.
+    Documents,
+
+    /// Emit only retrieval chunk records.
+    Chunks,
+
+    /// Emit document and retrieval chunk records.
+    #[default]
+    DocumentsAndChunks,
+}
+
+impl fmt::Display for SearchCorpusFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Documents => write!(f, "documents"),
+            Self::Chunks => write!(f, "chunks"),
+            Self::DocumentsAndChunks => write!(f, "documents-and-chunks"),
+        }
     }
 }
 
@@ -717,8 +774,9 @@ mod tests {
 
     use super::{
         default_workspace_config_text, discover_path, LoadedRepoManifest, LoadedWorkspaceConfig,
-        RepoManifestError, ServerBinding, ServerSettings, WorkspaceError, DEFAULT_SERVER_HOST,
-        DEFAULT_SERVER_PORT, DEFAULT_SITE_BASE_URL, LOCAL_CONFIG_FILE, REPO_MANIFEST_FILE,
+        RepoManifestError, SearchCorpusFormat, ServerBinding, ServerSettings, WorkspaceError,
+        DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT, DEFAULT_SITE_BASE_URL, LOCAL_CONFIG_FILE,
+        REPO_MANIFEST_FILE,
     };
     use crate::proposal::ProposalNumber;
 
@@ -967,6 +1025,15 @@ base_url = "https://staging.example.test/ERCs/"
             "http://127.0.0.1:1111/"
         );
         assert!(config.search_settings().pagefind);
+        assert!(!config.search_settings().corpus.enabled);
+        assert_eq!(
+            config.search_settings().corpus.format,
+            SearchCorpusFormat::DocumentsAndChunks
+        );
+        assert_eq!(
+            config.search_settings().corpus.output,
+            PathBuf::from("search-corpus.json")
+        );
     }
 
     #[test]
@@ -986,6 +1053,10 @@ base_url = "https://staging.example.test/ERCs/"
         assert!(original.contains("only = []"));
         assert!(original.contains("[search]"));
         assert!(original.contains("pagefind = true"));
+        assert!(original.contains("[search.corpus]"));
+        assert!(original.contains("enabled = false"));
+        assert!(original.contains("format = \"documents-and-chunks\""));
+        assert!(original.contains("output = \"search-corpus.json\""));
         assert!(!original.contains("default_profile"));
         assert!(!original.contains("[profiles"));
     }
@@ -1120,6 +1191,7 @@ base_url = "http://127.0.0.1:1111"
         assert!(config.site_settings().base_url.is_none());
         assert!(config.render_settings().only.is_empty());
         assert!(config.search_settings().pagefind);
+        assert!(!config.search_settings().corpus.enabled);
     }
 
     #[test]
@@ -1130,6 +1202,7 @@ base_url = "http://127.0.0.1:1111"
         let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
 
         assert!(config.search_settings().pagefind);
+        assert!(!config.search_settings().corpus.enabled);
     }
 
     #[test]
@@ -1140,12 +1213,26 @@ base_url = "http://127.0.0.1:1111"
             r#"
 [search]
 pagefind = false
+
+[search.corpus]
+enabled = true
+format = "chunks"
+output = "debug/search-corpus.json"
 "#,
         );
 
         let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
 
         assert!(!config.search_settings().pagefind);
+        assert!(config.search_settings().corpus.enabled);
+        assert_eq!(
+            config.search_settings().corpus.format,
+            SearchCorpusFormat::Chunks
+        );
+        assert_eq!(
+            config.search_settings().corpus.output,
+            PathBuf::from("debug/search-corpus.json")
+        );
     }
 
     #[test]
