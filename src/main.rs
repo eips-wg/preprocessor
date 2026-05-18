@@ -24,6 +24,7 @@ mod progress;
 mod proposal;
 mod proposal_catalog;
 mod proposal_metadata;
+mod search;
 mod serve;
 mod workspace;
 mod zola;

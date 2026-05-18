@@ -577,6 +577,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
             source_materialization: crate::git::SourceMaterialization::Clean,
             server_binding: ServerBinding::default(),
             base_url_override: None,
+            search: Default::default(),
         }
     }
 
@@ -761,6 +762,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
             source_materialization: crate::git::SourceMaterialization::Clean,
             server_binding: ServerBinding::default(),
             base_url_override: None,
+            search: Default::default(),
         };
         let selectors = EditorialSelectorArgs {
             paths: Vec::new(),

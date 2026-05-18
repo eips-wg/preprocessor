@@ -454,6 +454,10 @@ pub struct WorkspaceConfig {
     /// Local render filtering defaults.
     #[serde(default)]
     pub render: RenderSettings,
+
+    /// Local search indexing defaults for rendered output.
+    #[serde(default)]
+    pub search: SearchSettings,
 }
 
 impl WorkspaceConfig {
@@ -462,6 +466,7 @@ impl WorkspaceConfig {
             server: ServerSettings::default(),
             site: SiteSettings::starter(),
             render: RenderSettings::default(),
+            search: SearchSettings::default(),
         }
     }
 }
@@ -473,6 +478,20 @@ pub struct RenderSettings {
     /// Proposal numbers to render for applicable local build and serve commands.
     #[serde(default)]
     pub only: Vec<ProposalNumber>,
+}
+
+/// Workspace-local search indexing settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchSettings {
+    /// Whether `build-eips build` writes Pagefind search assets after rendering HTML.
+    pub pagefind: bool,
+}
+
+impl Default for SearchSettings {
+    fn default() -> Self {
+        Self { pagefind: true }
+    }
 }
 
 /// Workspace-local bind address defaults for local server commands.
@@ -640,6 +659,10 @@ impl LoadedWorkspaceConfig {
 
     pub fn render_settings(&self) -> &RenderSettings {
         &self.config.render
+    }
+
+    pub fn search_settings(&self) -> &SearchSettings {
+        &self.config.search
     }
 
     pub fn local_theme_path(&self) -> PathBuf {
@@ -935,6 +958,7 @@ base_url = "https://staging.example.test/ERCs/"
             config.site_settings().base_url.as_ref().unwrap().as_str(),
             "http://127.0.0.1:1111/"
         );
+        assert!(config.search_settings().pagefind);
     }
 
     #[test]
@@ -952,6 +976,8 @@ base_url = "https://staging.example.test/ERCs/"
         assert!(original.contains(&format!("base_url = \"{DEFAULT_SITE_BASE_URL}\"")));
         assert!(original.contains("[render]"));
         assert!(original.contains("only = []"));
+        assert!(original.contains("[search]"));
+        assert!(original.contains("pagefind = true"));
         assert!(!original.contains("default_profile"));
         assert!(!original.contains("[profiles"));
     }
@@ -1085,6 +1111,33 @@ base_url = "http://127.0.0.1:1111"
         assert_eq!(config.server_settings(), &ServerSettings::default());
         assert!(config.site_settings().base_url.is_none());
         assert!(config.render_settings().only.is_empty());
+        assert!(config.search_settings().pagefind);
+    }
+
+    #[test]
+    fn search_config_defaults_to_pagefind_enabled_when_missing() {
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(LOCAL_CONFIG_FILE, "");
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert!(config.search_settings().pagefind);
+    }
+
+    #[test]
+    fn parses_workspace_config_search_settings() {
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[search]
+pagefind = false
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert!(!config.search_settings().pagefind);
     }
 
     #[test]

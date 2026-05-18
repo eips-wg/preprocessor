@@ -24,6 +24,7 @@ use crate::{
     identity::ActiveRepoIdentity,
     layout::BUILD_DIR,
     proposal::ProposalNumber,
+    search::SearchConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ pub(crate) struct ResolvedExecution {
     pub(crate) source_materialization: git::SourceMaterialization,
     pub(crate) server_binding: ServerBinding,
     pub(crate) base_url_override: Option<Url>,
+    pub(crate) search: SearchConfig,
 }
 
 impl ResolvedExecution {
@@ -371,6 +373,23 @@ fn resolve_base_url_override(
     Ok(workspace_config.and_then(|config| config.site_settings().base_url.clone()))
 }
 
+fn resolve_search_config(
+    args: &Args,
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+) -> SearchConfig {
+    let mut search = workspace_config
+        .map(|config| SearchConfig {
+            pagefind: config.search_settings().pagefind,
+        })
+        .unwrap_or_default();
+
+    if args.operation.search_cli_args().no_search {
+        search.pagefind = false;
+    }
+
+    search
+}
+
 pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     let root_path = root(args)?;
     let active_repo = ActiveRepoIdentity::load(&root_path)?;
@@ -412,6 +431,7 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
         git::SourceMaterialization::Clean
     };
     let base_url_override = resolve_base_url_override(args, workspace_config.as_ref())?;
+    let search = resolve_search_config(args, workspace_config.as_ref());
 
     Ok(ResolvedExecution {
         root_path,
@@ -425,6 +445,7 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
             &args.operation.server_cli_args(),
         ),
         base_url_override,
+        search,
     })
 }
 
@@ -440,7 +461,7 @@ mod tests {
 
     use super::{
         explicit_environment_or_parity, resolve_base_url_override, resolve_execution_settings,
-        resolve_only_selection, resolve_server_binding, resolve_theme_path,
+        resolve_only_selection, resolve_search_config, resolve_server_binding, resolve_theme_path,
         validate_non_execution_command_flags, ExecutionSettings, SelectedSource,
     };
 
@@ -707,6 +728,45 @@ base_url = "http://localhost:4000"
                 sibling: SelectedSource::WorkspaceLocal,
             }
         );
+    }
+
+    #[test]
+    fn search_config_defaults_to_pagefind_enabled() {
+        let args = parse_args(&["build-eips", "build"]);
+
+        assert!(resolve_search_config(&args, None).pagefind);
+    }
+
+    #[test]
+    fn search_config_uses_workspace_setting() {
+        let workspace_config = load_workspace_config(
+            r#"
+[search]
+pagefind = false
+"#,
+        );
+        let args = parse_args(&["build-eips", "build"]);
+
+        assert!(!resolve_search_config(&args, Some(&workspace_config)).pagefind);
+    }
+
+    #[test]
+    fn no_search_cli_override_wins_over_workspace_setting() {
+        let workspace_config = load_workspace_config(
+            r#"
+[search]
+pagefind = true
+"#,
+        );
+
+        for arguments in [
+            &["build-eips", "build", "--no-search"][..],
+            &["build-eips", "parity", "build", "--no-search"][..],
+        ] {
+            let args = parse_args(arguments);
+
+            assert!(!resolve_search_config(&args, Some(&workspace_config)).pagefind);
+        }
     }
 
     #[test]
