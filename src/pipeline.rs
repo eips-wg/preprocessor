@@ -20,8 +20,8 @@ use crate::{
     proposal::OnlyRenderPlan,
     proposal_metadata,
     search::{
-        self, SearchConfig, SearchIndexRequest, SearchIndexSummary, SearchRouteSummary,
-        SearchTemplateState,
+        self, SearchConfig, SearchCorpusRequest, SearchCorpusSummary, SearchIndexRequest,
+        SearchIndexSummary, SearchRouteSummary, SearchTemplateState,
     },
     serve::{serve_sync_config, DirtyServeWatcher, LocalThemeServeSync},
     zola,
@@ -101,18 +101,18 @@ enum SearchRouteMode {
     Serve,
 }
 
-fn should_index_search(mode: SearchIndexMode, search: SearchConfig) -> bool {
+fn should_index_search(mode: SearchIndexMode, search: &SearchConfig) -> bool {
     matches!(mode, SearchIndexMode::Build) && search.pagefind
 }
 
-fn search_route_enabled(mode: SearchRouteMode, search: SearchConfig) -> bool {
+fn search_route_enabled(mode: SearchRouteMode, search: &SearchConfig) -> bool {
     matches!(mode, SearchRouteMode::Build) && search.pagefind
 }
 
 fn run_search_index(
     mode: SearchIndexMode,
     output_path: &Path,
-    search_config: SearchConfig,
+    search_config: &SearchConfig,
 ) -> Result<Option<SearchIndexSummary>, Whatever> {
     if !should_index_search(mode, search_config) {
         return Ok(None);
@@ -123,6 +123,24 @@ fn run_search_index(
     })
     .map(Some)
     .whatever_context("search indexing failed")
+}
+
+fn run_search_corpus(
+    mode: SearchIndexMode,
+    output_path: &Path,
+    base_url: &Url,
+    search_config: &SearchConfig,
+) -> Result<Option<SearchCorpusSummary>, Whatever> {
+    if !matches!(mode, SearchIndexMode::Build) {
+        return Ok(None);
+    }
+
+    search::reconcile_corpus(SearchCorpusRequest {
+        output_path: output_path.to_path_buf(),
+        base_url: base_url.clone(),
+        config: search_config.corpus.clone(),
+    })
+    .whatever_context("search corpus output failed")
 }
 
 impl Prepared {
@@ -200,7 +218,13 @@ impl Prepared {
             base_url.as_str(),
         )
         .whatever_context("zola build failed")?;
-        let _ = run_search_index(SearchIndexMode::Build, &self.output_path, self.search)?;
+        let _ = run_search_index(SearchIndexMode::Build, &self.output_path, &self.search)?;
+        let _ = run_search_corpus(
+            SearchIndexMode::Build,
+            &self.output_path,
+            &base_url,
+            &self.search,
+        )?;
         Ok(())
     }
 
@@ -252,7 +276,7 @@ impl Prepared {
 
     fn search_template_state(&self, mode: SearchRouteMode) -> SearchTemplateState {
         SearchTemplateState::from_base_url(
-            search_route_enabled(mode, self.search),
+            search_route_enabled(mode, &self.search),
             self.resolved_base_url(),
         )
     }
@@ -285,12 +309,12 @@ mod tests {
         git::SourceMaterialization,
         layout::{mounted_theme_path, theme_config_path, CONTENT_DIR, REPO_DIR},
         proposal_catalog::collect_proposal_catalog,
-        search::{SearchConfig, SEARCH_DATA_FILE},
+        search::{SearchConfig, SearchCorpusConfig, SEARCH_DATA_FILE},
     };
 
     use super::{
-        prepare_runtime_source, prepare_theme_for_zola, run_search_index, search_route_enabled,
-        should_index_search, Prepared, SearchIndexMode, SearchRouteMode,
+        prepare_runtime_source, prepare_theme_for_zola, run_search_corpus, run_search_index,
+        search_route_enabled, should_index_search, Prepared, SearchIndexMode, SearchRouteMode,
     };
 
     struct RuntimeWorkspace {
@@ -667,24 +691,36 @@ base_url = "https://staging.example.test/{sibling_id}/"
 
     #[test]
     fn search_index_policy_runs_only_for_enabled_builds() {
-        let enabled = SearchConfig { pagefind: true };
-        let disabled = SearchConfig { pagefind: false };
+        let enabled = SearchConfig {
+            pagefind: true,
+            ..SearchConfig::default()
+        };
+        let disabled = SearchConfig {
+            pagefind: false,
+            ..SearchConfig::default()
+        };
 
-        assert!(should_index_search(SearchIndexMode::Build, enabled));
-        assert!(!should_index_search(SearchIndexMode::Build, disabled));
-        assert!(!should_index_search(SearchIndexMode::Check, enabled));
-        assert!(!should_index_search(SearchIndexMode::Serve, enabled));
+        assert!(should_index_search(SearchIndexMode::Build, &enabled));
+        assert!(!should_index_search(SearchIndexMode::Build, &disabled));
+        assert!(!should_index_search(SearchIndexMode::Check, &enabled));
+        assert!(!should_index_search(SearchIndexMode::Serve, &enabled));
     }
 
     #[test]
     fn search_route_state_policy_matches_runtime_command() {
-        let enabled = SearchConfig { pagefind: true };
-        let disabled = SearchConfig { pagefind: false };
+        let enabled = SearchConfig {
+            pagefind: true,
+            ..SearchConfig::default()
+        };
+        let disabled = SearchConfig {
+            pagefind: false,
+            ..SearchConfig::default()
+        };
 
-        assert!(search_route_enabled(SearchRouteMode::Build, enabled));
-        assert!(!search_route_enabled(SearchRouteMode::Build, disabled));
-        assert!(!search_route_enabled(SearchRouteMode::Check, enabled));
-        assert!(!search_route_enabled(SearchRouteMode::Serve, enabled));
+        assert!(search_route_enabled(SearchRouteMode::Build, &enabled));
+        assert!(!search_route_enabled(SearchRouteMode::Build, &disabled));
+        assert!(!search_route_enabled(SearchRouteMode::Check, &enabled));
+        assert!(!search_route_enabled(SearchRouteMode::Serve, &enabled));
     }
 
     #[test]
@@ -807,7 +843,10 @@ base_url = "https://staging.example.test/{sibling_id}/"
         let proposal = pipeline_proposal_markdown(1, None, "Active proposal.");
         let workspace = runtime_workspace_with_theme(&[("content/00001.md", proposal.as_str())]);
         let mut resolved = resolved_runtime(&workspace, &["build"]);
-        resolved.search = SearchConfig { pagefind: false };
+        resolved.search = SearchConfig {
+            pagefind: false,
+            ..SearchConfig::default()
+        };
         let prepared = Prepared::prepare(resolved).unwrap();
 
         let build_state = prepared.search_template_state(SearchRouteMode::Build);
@@ -831,7 +870,10 @@ base_url = "https://staging.example.test/{sibling_id}/"
         let summary = run_search_index(
             SearchIndexMode::Build,
             &output_path,
-            SearchConfig { pagefind: false },
+            &SearchConfig {
+                pagefind: false,
+                ..SearchConfig::default()
+            },
         )
         .unwrap();
 
@@ -840,5 +882,59 @@ base_url = "https://staging.example.test/{sibling_id}/"
             std::fs::read_to_string(output_path.join("pagefind/stale.txt")).unwrap(),
             "stale"
         );
+    }
+
+    #[test]
+    fn disabled_search_corpus_reconciles_stale_output_without_indexing() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("output");
+        write_file(&output_path, "search-corpus.json", "stale corpus");
+        let search = SearchConfig::default();
+
+        let summary = run_search_corpus(
+            SearchIndexMode::Build,
+            &output_path,
+            &Url::parse("https://eips-wg.github.io/EIPs/").unwrap(),
+            &search,
+        )
+        .unwrap();
+
+        assert!(summary.is_none());
+        assert!(!output_path.join("search-corpus.json").exists());
+    }
+
+    #[test]
+    fn no_search_build_can_emit_corpus_without_pagefind_assets() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("output");
+        write_file(
+            &output_path,
+            "1/index.html",
+            r#"<main data-pagefind-body><span data-pagefind-meta="proposal:EIP-1"></span><h2 id="abstract">Abstract</h2><p>Rendered text.</p></main>"#,
+        );
+        let search = SearchConfig {
+            pagefind: false,
+            corpus: SearchCorpusConfig {
+                enabled: true,
+                ..SearchCorpusConfig::default()
+            },
+        };
+
+        let index_summary =
+            run_search_index(SearchIndexMode::Build, &output_path, &search).unwrap();
+        let corpus_summary = run_search_corpus(
+            SearchIndexMode::Build,
+            &output_path,
+            &Url::parse("https://eips-wg.github.io/EIPs/").unwrap(),
+            &search,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(index_summary.is_none());
+        assert_eq!(corpus_summary.documents, 1);
+        assert_eq!(corpus_summary.chunks, 1);
+        assert!(output_path.join("search-corpus.json").is_file());
+        assert!(!output_path.join("pagefind").exists());
     }
 }
