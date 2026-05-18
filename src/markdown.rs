@@ -41,8 +41,9 @@ use iref::IriRefBuf;
 use crate::{
     progress::ProgressIteratorExt,
     proposal::{
-        path_component_proposal_number, proposal_number_from_content_markdown_path, OnlyRenderPlan,
-        ProposalAssetKind, ProposalNumber, ProposalReference,
+        path_component_proposal_number, proposal_number_from_content_markdown_path,
+        public_site_for_preamble, OnlyRenderPlan, ProposalAssetKind, ProposalNumber,
+        ProposalReference,
     },
 };
 
@@ -66,8 +67,26 @@ impl MissingPathMode {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Author {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Author {
+    pub(crate) name: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) github: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) email: Option<String>,
+}
+
+impl From<Author> for Value {
+    fn from(value: Author) -> Self {
+        // TODO: Hacky way to implement this conversion...
+        toml::from_str(&toml::to_string(&AuthorFrontMatter::from(value)).unwrap()).unwrap()
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AuthorFrontMatter {
     name: String,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,12 +94,29 @@ struct Author {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     email: Option<String>,
+
+    display: String,
 }
 
-impl From<Author> for Value {
-    fn from(value: Author) -> Self {
-        // TODO: Hacky way to implement this conversion...
-        toml::from_str(&toml::to_string(&value).unwrap()).unwrap()
+impl From<Author> for AuthorFrontMatter {
+    fn from(author: Author) -> Self {
+        let display = author_display(&author);
+
+        Self {
+            name: author.name,
+            github: author.github,
+            email: author.email,
+            display,
+        }
+    }
+}
+
+fn author_display(author: &Author) -> String {
+    match (&author.github, &author.email) {
+        (Some(github), Some(email)) => format!("{} (@{}) <{}>", author.name, github, email),
+        (Some(github), None) => format!("{} (@{})", author.name, github),
+        (None, Some(email)) => format!("{} <{}>", author.name, email),
+        (None, None) => author.name.clone(),
     }
 }
 
@@ -249,7 +285,7 @@ lazy_static! {
     static ref RE_NAME: Regex = Regex::new(r"^([^()<>,@]+)$").unwrap();
 }
 
-fn extract_authors(value: &str) -> Result<Vec<Author>, Whatever> {
+pub(crate) fn extract_authors(value: &str) -> Result<Vec<Author>, Whatever> {
     let mut authors = Vec::new();
     let items = value.split(',').map(|x| x.trim());
     for item in items {
@@ -1377,6 +1413,7 @@ fn process_eip(
         .with_whatever_context(|| format!("couldn't parse preamble in `{}`", path_lossy))?;
 
     let updated = Some(last_modified(path)?);
+    let proposal_prefix = public_site_for_preamble(&preamble).proposal_prefix();
 
     let mut front_matter = FrontMatter {
         updated,
@@ -1423,6 +1460,13 @@ fn process_eip(
                 front_matter.template = Some("eip.html".into());
                 front_matter.slug = number.to_string();
                 front_matter.extra.insert("number".into(), number.into());
+                front_matter
+                    .extra
+                    .insert("prefix".into(), proposal_prefix.into());
+                front_matter.extra.insert(
+                    "proposal_id".into(),
+                    format!("{proposal_prefix}-{number}").into(),
+                );
 
                 let alias_path = PathBuf::from(&path);
                 if let Some(file_stem) = alias_path.file_stem() {
@@ -1513,6 +1557,7 @@ mod tests {
     };
     use crate::proposal::ProposalAssetKind;
     use crate::proposal::{OnlyRenderPlan, ProposalNumber};
+    use crate::proposal_catalog::collect_proposal_catalog;
 
     fn number(value: u32) -> ProposalNumber {
         ProposalNumber::from_u32(value).unwrap()
@@ -2537,6 +2582,125 @@ See [EIP-678](/00678.md).
         let requires = front_matter["extra"]["requires"].as_array().unwrap();
         assert!(body.contains("@/00678.md"));
         assert_eq!(requires[0].as_str().unwrap(), "@/00678.md");
+    }
+
+    #[test]
+    fn preprocess_adds_proposal_prefix_extra_metadata() {
+        let (_temp, content) = content_repo(&[
+            ("00555.md", proposal_markdown(555, None, "", "EIP body.")),
+            (
+                "00678.md",
+                proposal_markdown(678, Some("ERC"), "", "ERC body."),
+            ),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let eip_front_matter = rendered_front_matter(&content.join("00555.md"));
+        let erc_front_matter = rendered_front_matter(&content.join("00678.md"));
+        assert_eq!(eip_front_matter["extra"]["prefix"].as_str().unwrap(), "EIP");
+        assert_eq!(erc_front_matter["extra"]["prefix"].as_str().unwrap(), "ERC");
+        assert_eq!(
+            eip_front_matter["extra"]["proposal_id"].as_str().unwrap(),
+            "EIP-555"
+        );
+        assert_eq!(
+            erc_front_matter["extra"]["proposal_id"].as_str().unwrap(),
+            "ERC-678"
+        );
+    }
+
+    #[test]
+    fn preprocess_proposal_id_matches_catalog_search_view() {
+        let (_temp, content) = content_repo(&[
+            (
+                "01559.md",
+                proposal_markdown(
+                    1559,
+                    None,
+                    "status: Final\ntype: Standards Track\n",
+                    "EIP body.",
+                ),
+            ),
+            (
+                "00020.md",
+                proposal_markdown(
+                    20,
+                    Some("ERC"),
+                    "status: Final\ntype: Standards Track\n",
+                    "ERC body.",
+                ),
+            ),
+        ]);
+        let catalog = collect_proposal_catalog(&content, None).unwrap();
+        let search_records = catalog.search_metadata_records();
+
+        preprocess(&content, None).unwrap();
+
+        let eip_front_matter = rendered_front_matter(&content.join("01559.md"));
+        let erc_front_matter = rendered_front_matter(&content.join("00020.md"));
+        assert_eq!(
+            eip_front_matter["extra"]["proposal_id"].as_str().unwrap(),
+            search_records["eip-1559"].proposal_id
+        );
+        assert_eq!(
+            erc_front_matter["extra"]["proposal_id"].as_str().unwrap(),
+            search_records["erc-20"].proposal_id
+        );
+    }
+
+    #[test]
+    fn preprocess_adds_author_display_extra_metadata() {
+        let (_temp, content) = content_repo(&[(
+            "00555.md",
+            proposal_markdown(
+                555,
+                None,
+                "author: Alice <alice@example.com>, Bob (@bob), Carol (@carol) <carol@example.com>, Dan\n",
+                "Body.",
+            ),
+        )]);
+
+        preprocess(&content, None).unwrap();
+
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        let author_details = front_matter["extra"]["author_details"].as_array().unwrap();
+        let author_names = front_matter["authors"].as_array().unwrap();
+
+        assert_eq!(author_details[0]["name"].as_str().unwrap(), "Alice");
+        assert_eq!(
+            author_details[0]["email"].as_str().unwrap(),
+            "alice@example.com"
+        );
+        assert_eq!(
+            author_details[0]["display"].as_str().unwrap(),
+            "Alice <alice@example.com>"
+        );
+        assert_eq!(author_details[1]["name"].as_str().unwrap(), "Bob");
+        assert_eq!(author_details[1]["github"].as_str().unwrap(), "bob");
+        assert_eq!(author_details[1]["display"].as_str().unwrap(), "Bob (@bob)");
+        assert_eq!(author_details[2]["name"].as_str().unwrap(), "Carol");
+        assert_eq!(author_details[2]["github"].as_str().unwrap(), "carol");
+        assert_eq!(
+            author_details[2]["email"].as_str().unwrap(),
+            "carol@example.com"
+        );
+        assert_eq!(
+            author_details[2]["display"].as_str().unwrap(),
+            "Carol (@carol) <carol@example.com>"
+        );
+        assert_eq!(author_details[3]["name"].as_str().unwrap(), "Dan");
+        assert_eq!(author_details[3]["display"].as_str().unwrap(), "Dan");
+        assert!(author_details[3].get("github").is_none());
+        assert!(author_details[3].get("email").is_none());
+
+        assert_eq!(
+            author_names
+                .iter()
+                .map(|author| author.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Alice", "Bob", "Carol", "Dan"]
+        );
     }
 
     #[test]

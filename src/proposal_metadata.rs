@@ -42,7 +42,7 @@ pub(crate) fn write_proposal_metadata_json(
         schema_version: PROPOSAL_METADATA_SCHEMA_VERSION,
         active_prefix: active_proposal_metadata_prefix(repository_title)?,
         proposals: collect_proposal_catalog(&repo_path.join(CONTENT_DIR), only_plan)?
-            .into_records(),
+            .into_metadata_json_records(),
     };
 
     write_proposal_metadata_file(&json_path, &metadata)
@@ -143,6 +143,7 @@ fn write_proposal_metadata_file(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::Path;
 
     use serde_json::{json, Value};
@@ -178,6 +179,33 @@ mod tests {
         format!(
             "---\neip: {number}\ntitle: {title}\n{description}status: Final\ntype: Standards Track\n{category}---\nBody\n"
         )
+    }
+
+    fn metadata_proposal_markdown_with_extra(
+        number: u32,
+        title: &str,
+        category: Option<&str>,
+        description: Option<&str>,
+        extra: &str,
+    ) -> String {
+        let description = description
+            .map(|description| format!("description: {description}\n"))
+            .unwrap_or_default();
+        let category = category
+            .map(|category| format!("category: {category}\n"))
+            .unwrap_or_default();
+        format!(
+            "---\neip: {number}\ntitle: {title}\n{description}status: Final\ntype: Standards Track\n{category}{extra}---\nBody\n"
+        )
+    }
+
+    fn object_keys(value: &Value) -> BTreeSet<&str> {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect()
     }
 
     fn write_metadata_json(
@@ -399,6 +427,53 @@ mod tests {
         let proposal = metadata["proposals"]["eip-1"].as_object().unwrap();
 
         assert!(!proposal.contains_key("description"));
+    }
+
+    #[test]
+    fn proposal_metadata_json_schema_keys_stay_compatible_with_expanded_catalog() {
+        let temp = TempDir::new().unwrap();
+        write_file(
+            temp.path(),
+            "content/1559.md",
+            &metadata_proposal_markdown_with_extra(
+                1559,
+                "Fee Market Change",
+                Some("Core"),
+                Some("A transaction pricing mechanism."),
+                "author: Alice <alice@example.com>, Bob (@bob)\ncreated: 2021-04-13\nrequires: 1, 2\nreplaces: 3\nsuperseded-by: 4\ndiscussions-to: https://ethereum-magicians.org/t/eip-1559\n",
+            ),
+        );
+
+        let metadata = write_metadata_json(temp.path(), "EIPs", None);
+        let proposal = &metadata["proposals"]["eip-1559"];
+
+        assert_eq!(
+            object_keys(&metadata),
+            BTreeSet::from(["active_prefix", "proposals", "schema_version"])
+        );
+        assert_eq!(
+            object_keys(proposal),
+            BTreeSet::from([
+                "category",
+                "description",
+                "number",
+                "prefix",
+                "status",
+                "title",
+                "type",
+                "url"
+            ])
+        );
+        assert_eq!(proposal["number"], json!(1559));
+        assert_eq!(proposal["prefix"], json!("EIP"));
+        assert_eq!(proposal["url"], json!("/1559/"));
+
+        let proposal = proposal.as_object().unwrap();
+        assert!(!proposal.contains_key("authors"));
+        assert!(!proposal.contains_key("author_filter_values"));
+        assert!(!proposal.contains_key("created"));
+        assert!(!proposal.contains_key("github"));
+        assert!(!proposal.contains_key("email"));
     }
 
     #[test]
