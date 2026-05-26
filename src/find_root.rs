@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use super::CONTENT_DIR;
+use crate::layout::CONTENT_DIR;
 use snafu::{ResultExt, Snafu};
 use std::{
     backtrace::Backtrace,
@@ -34,7 +34,7 @@ pub enum Error {
 pub fn is_root(path: &Path) -> Result<(), Error> {
     let git = path.join(".git");
     let contents = path.join(CONTENT_DIR);
-    if git.is_dir() && contents.is_dir() {
+    if (git.is_dir() || git.is_file()) && contents.is_dir() {
         Ok(())
     } else {
         NoRootSnafu.fail()
