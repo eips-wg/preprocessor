@@ -22,11 +22,11 @@ use regex::Regex;
 
 use serde::{Deserialize, Serialize};
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::read_to_string;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{ErrorKind, Write};
+use std::path::{Component, Path, PathBuf};
 
 use snafu::{whatever, OptionExt, ResultExt, Whatever};
 
@@ -38,7 +38,34 @@ use walkdir::WalkDir;
 
 use iref::IriRefBuf;
 
-use crate::progress::ProgressIteratorExt;
+use crate::{
+    network_upgrades::{NetworkUpgradeIndex, NetworkUpgradeMembership},
+    progress::ProgressIteratorExt,
+    proposal::{
+        path_component_proposal_number, proposal_number_from_content_markdown_path, OnlyRenderPlan,
+        ProposalAssetKind, ProposalNumber, ProposalReference,
+    },
+};
+
+#[derive(Clone, Copy)]
+enum MissingPathMode {
+    Error,
+    Ignore,
+}
+
+impl MissingPathMode {
+    fn should_ignore_io_error(self, error: &std::io::Error) -> bool {
+        matches!(self, Self::Ignore)
+            && matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+    }
+
+    fn should_ignore_walkdir_error(self, error: &walkdir::Error) -> bool {
+        error
+            .io_error()
+            .map(|error| self.should_ignore_io_error(error))
+            .unwrap_or(false)
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Author {
@@ -56,6 +83,45 @@ impl From<Author> for Value {
         // TODO: Hacky way to implement this conversion...
         toml::from_str(&toml::to_string(&value).unwrap()).unwrap()
     }
+}
+
+fn network_upgrade_memberships_value(memberships: &[NetworkUpgradeMembership]) -> Value {
+    Value::Array(
+        memberships
+            .iter()
+            .map(network_upgrade_membership_value)
+            .collect(),
+    )
+}
+
+fn network_upgrade_membership_value(membership: &NetworkUpgradeMembership) -> Value {
+    let mut table = toml::Table::new();
+    table.insert(
+        "display_name".to_owned(),
+        Value::String(membership.display_name.clone()),
+    );
+    table.insert("slug".to_owned(), Value::String(membership.slug.clone()));
+    table.insert(
+        "meta_eip".to_owned(),
+        Value::Integer(i64::from(membership.source_meta_eip.get())),
+    );
+    table.insert(
+        "meta_url".to_owned(),
+        Value::String(membership.meta_url.clone()),
+    );
+    table.insert(
+        "stage_key".to_owned(),
+        Value::String(membership.stage_key.clone()),
+    );
+    table.insert(
+        "stage_label".to_owned(),
+        Value::String(membership.stage_label.clone()),
+    );
+    if let Some(subgroup) = &membership.subgroup {
+        table.insert("subgroup".to_owned(), Value::String(subgroup.clone()));
+    }
+
+    Value::Table(table)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -137,6 +203,19 @@ impl Default for FrontMatter {
     }
 }
 
+fn filesystem_modified(p: &Path) -> Result<Datetime, Whatever> {
+    let metadata = std::fs::metadata(p)
+        .with_whatever_context(|e| format!("unable to read metadata for `{}`: {e}", p.display()))?;
+    let modified = metadata.modified().with_whatever_context(|e| {
+        format!(
+            "unable to read filesystem modified time for `{}`: {e}",
+            p.display()
+        )
+    })?;
+    let date_time: DateTime<chrono::Utc> = modified.into();
+    Ok(date_time.to_rfc3339().parse().unwrap())
+}
+
 fn last_modified(p: &Path) -> Result<Datetime, Whatever> {
     // TODO: Replace this with `git2`
     let mut command = std::process::Command::new("git");
@@ -158,7 +237,16 @@ fn last_modified(p: &Path) -> Result<Datetime, Whatever> {
     }
 
     let date_str = std::str::from_utf8(&output.stdout)
-        .with_whatever_context(|e| format!("command {:?} output not UTF-8: {e}", command))?;
+        .with_whatever_context(|e| format!("command {:?} output not UTF-8: {e}", command))?
+        .trim();
+
+    if date_str.is_empty() {
+        debug!(
+            "falling back to filesystem modified time for `{}` because git has no timestamp for the current path",
+            p.to_string_lossy()
+        );
+        return filesystem_modified(p);
+    }
 
     let unix: i64 = date_str.parse().with_whatever_context(|e| {
         let err_str = std::str::from_utf8(&output.stderr).unwrap_or("<non-utf-8>");
@@ -183,6 +271,10 @@ fn write_file(path: &Path, front_matter: FrontMatter, body: &str) -> std::io::Re
     writeln!(output, "+++")?;
     writeln!(output, "{}", body)?;
     Ok(())
+}
+
+fn is_section_index_path(path: &Path) -> bool {
+    path.file_name() == Some(OsStr::new("_index.md"))
 }
 
 lazy_static! {
@@ -232,7 +324,462 @@ fn extract_authors(value: &str) -> Result<Vec<Author>, Whatever> {
     Ok(authors)
 }
 
-pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProposalAssetPathResolution {
+    NotAProposalAsset,
+    ProposalAsset(ProposalAssetPath),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProposalAssetPath {
+    pub(crate) target_proposal_number: ProposalNumber,
+    pub(crate) content_relative_asset_path: PathBuf,
+    pub(crate) asset_relative_path: PathBuf,
+    pub(crate) kind: ProposalAssetKind,
+    pub(crate) rendered_target_path: String,
+}
+
+#[derive(Debug)]
+struct DecodedPathSegment {
+    value: String,
+}
+
+pub(crate) fn resolve_proposal_asset_path(
+    content_root: &Path,
+    source_md_path: &Path,
+    iri_path: &str,
+) -> Result<ProposalAssetPathResolution, Whatever> {
+    let source_parent = source_md_path.parent().with_whatever_context(|| {
+        format!(
+            "source markdown path `{}` has no parent",
+            source_md_path.to_string_lossy()
+        )
+    })?;
+    let normalized_root = normalize_path_lexically(content_root);
+    if !raw_iri_resolves_to_proposal_asset_candidate(
+        &normalized_root,
+        content_root,
+        source_parent,
+        iri_path,
+    ) {
+        return Ok(ProposalAssetPathResolution::NotAProposalAsset);
+    }
+
+    let decoded_segments = decode_iri_path_segments(iri_path)?;
+    reject_unsafe_asset_segments(&decoded_segments)?;
+
+    let target_path =
+        resolve_url_path_lexically(content_root, source_parent, iri_path, &decoded_segments);
+    let normalized_target = normalize_path_lexically(&target_path);
+    let Ok(content_relative_path) = normalized_target.strip_prefix(&normalized_root) else {
+        return Ok(ProposalAssetPathResolution::NotAProposalAsset);
+    };
+
+    let Some((target_proposal_number, asset_relative_path)) =
+        proposal_asset_parts(content_relative_path)
+    else {
+        return Ok(ProposalAssetPathResolution::NotAProposalAsset);
+    };
+
+    let kind = if iri_path.ends_with(".md") {
+        ProposalAssetKind::Markdown
+    } else {
+        ProposalAssetKind::Static
+    };
+    let rendered_target_path =
+        rendered_asset_path(target_proposal_number, &asset_relative_path, kind)?;
+
+    Ok(ProposalAssetPathResolution::ProposalAsset(
+        ProposalAssetPath {
+            target_proposal_number,
+            content_relative_asset_path: content_relative_path.to_path_buf(),
+            asset_relative_path,
+            kind,
+            rendered_target_path,
+        },
+    ))
+}
+
+pub(crate) fn absolute_rendered_path_for_content_path(
+    content_relative_path: &Path,
+) -> Result<String, Whatever> {
+    if content_relative_path == Path::new("_index.md") {
+        return Ok("/".to_owned());
+    }
+
+    if let Some(proposal_number) = proposal_number_from_content_markdown_path(content_relative_path)
+    {
+        return Ok(format!("/{proposal_number}/"));
+    }
+
+    if let Some((proposal_number, asset_relative_path)) =
+        proposal_asset_parts(content_relative_path)
+    {
+        return rendered_asset_path(
+            proposal_number,
+            &asset_relative_path,
+            ProposalAssetKind::from_path(&asset_relative_path),
+        );
+    }
+
+    snafu::whatever!(
+        "content path `{}` is not a proposal page or proposal asset",
+        content_relative_path.to_string_lossy()
+    );
+}
+
+pub(crate) fn relative_url_from_rendered_paths(
+    source_rendered_path: &str,
+    target_rendered_path: &str,
+) -> Result<String, Whatever> {
+    let source_segments = rendered_directory_segments(source_rendered_path)?;
+    let (target_segments, target_is_directory) = rendered_path_segments(target_rendered_path)?;
+    let common_len = source_segments
+        .iter()
+        .zip(target_segments.iter())
+        .take_while(|(source, target)| source == target)
+        .count();
+
+    let mut relative_segments = Vec::new();
+    relative_segments.extend(std::iter::repeat_n(
+        "..",
+        source_segments.len() - common_len,
+    ));
+    relative_segments.extend(target_segments[common_len..].iter().copied());
+
+    let mut relative_url = if relative_segments.is_empty() {
+        ".".to_owned()
+    } else {
+        relative_segments.join("/")
+    };
+    if target_is_directory && !relative_url.ends_with('/') {
+        relative_url.push('/');
+    }
+
+    Ok(relative_url)
+}
+
+pub(crate) fn proposal_asset_exists_in_content_tree(
+    content_root: &Path,
+    content_relative_asset_path: &Path,
+) -> bool {
+    if !content_relative_asset_path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return false;
+    }
+
+    let Ok(canonical_content_root) = std::fs::canonicalize(content_root) else {
+        return false;
+    };
+    let Ok(canonical_target) =
+        std::fs::canonicalize(content_root.join(content_relative_asset_path))
+    else {
+        return false;
+    };
+
+    if !canonical_target.starts_with(canonical_content_root) {
+        return false;
+    }
+
+    std::fs::metadata(canonical_target)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
+fn decode_iri_path_segments(iri_path: &str) -> Result<Vec<DecodedPathSegment>, Whatever> {
+    iri_path
+        .split('/')
+        .map(|segment| {
+            Ok(DecodedPathSegment {
+                value: percent_decode_url_segment(segment)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn percent_decode_url_segment(segment: &str) -> Result<String, Whatever> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+
+        if index + 2 >= bytes.len() {
+            snafu::whatever!("invalid percent encoding in URL path segment `{segment}`");
+        }
+
+        let high = hex_value(bytes[index + 1]).with_whatever_context(|| {
+            format!("invalid percent encoding in URL path segment `{segment}`")
+        })?;
+        let low = hex_value(bytes[index + 2]).with_whatever_context(|| {
+            format!("invalid percent encoding in URL path segment `{segment}`")
+        })?;
+        let value = (high << 4) | low;
+        if matches!(value, b'/' | b'\\' | b'\0') {
+            snafu::whatever!("unsafe percent encoding in URL path segment `{segment}`");
+        }
+        decoded.push(value);
+        index += 3;
+    }
+
+    String::from_utf8(decoded)
+        .with_whatever_context(|_| format!("URL path segment `{segment}` is not UTF-8"))
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn reject_unsafe_asset_segments(segments: &[DecodedPathSegment]) -> Result<(), Whatever> {
+    let Some(assets_index) = segments.windows(2).position(|window| {
+        path_component_proposal_number(Some(OsStr::new(window[0].value.as_str()))).is_some()
+            && window[1].value == "assets"
+    }) else {
+        return Ok(());
+    };
+
+    for segment in &segments[assets_index + 2..] {
+        if segment.value.is_empty() {
+            continue;
+        }
+        if segment.value == "." || segment.value == ".." {
+            snafu::whatever!("unsafe proposal asset path segment `{}`", segment.value);
+        }
+        if segment.value.contains(['/', '\\', '\0']) {
+            snafu::whatever!("unsafe proposal asset path segment `{}`", segment.value);
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_url_path_lexically(
+    content_root: &Path,
+    source_parent: &Path,
+    iri_path: &str,
+    decoded_segments: &[DecodedPathSegment],
+) -> PathBuf {
+    let mut path = if iri_path.starts_with('/') {
+        content_root.to_path_buf()
+    } else {
+        source_parent.to_path_buf()
+    };
+
+    for segment in decoded_segments {
+        match segment.value.as_str() {
+            "" | "." => {}
+            ".." => {
+                path.pop();
+            }
+            _ => path.push(&segment.value),
+        }
+    }
+
+    path
+}
+
+fn raw_iri_resolves_to_proposal_asset_candidate(
+    normalized_root: &Path,
+    content_root: &Path,
+    source_parent: &Path,
+    iri_path: &str,
+) -> bool {
+    let mut path = if iri_path.starts_with('/') {
+        content_root.to_path_buf()
+    } else {
+        source_parent.to_path_buf()
+    };
+    let raw_segments = iri_path.split('/').collect::<Vec<_>>();
+
+    for (index, segment) in raw_segments.iter().enumerate() {
+        match *segment {
+            "" | "." => {}
+            ".." => {
+                path.pop();
+            }
+            _ => path.push(segment),
+        }
+
+        let normalized_path = normalize_path_lexically(&path);
+        let Ok(content_relative_path) = normalized_path.strip_prefix(normalized_root) else {
+            continue;
+        };
+
+        if proposal_asset_parts(content_relative_path).is_some() {
+            return true;
+        }
+
+        if proposal_asset_dir_prefix(content_relative_path).is_some()
+            && raw_segments[index + 1..]
+                .iter()
+                .any(|remaining_segment| !remaining_segment.is_empty())
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn proposal_asset_dir_prefix(content_relative_path: &Path) -> Option<ProposalNumber> {
+    let mut components = content_relative_path.components();
+    let proposal_component = components.next()?;
+    let assets_component = components.next()?;
+    if components.next().is_some() || assets_component.as_os_str() != OsStr::new("assets") {
+        return None;
+    }
+
+    path_component_proposal_number(Some(proposal_component.as_os_str()))
+}
+
+fn proposal_asset_parts(content_relative_path: &Path) -> Option<(ProposalNumber, PathBuf)> {
+    let mut components = content_relative_path.components();
+    let proposal_component = components.next()?;
+    let assets_component = components.next()?;
+    if assets_component.as_os_str() != OsStr::new("assets") {
+        return None;
+    }
+
+    let proposal_number = path_component_proposal_number(Some(proposal_component.as_os_str()))?;
+    let asset_relative_path = components.as_path();
+    if asset_relative_path.as_os_str().is_empty() {
+        return None;
+    }
+    if !asset_relative_path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+
+    Some((proposal_number, asset_relative_path.to_path_buf()))
+}
+
+fn rendered_asset_path(
+    proposal_number: ProposalNumber,
+    asset_relative_path: &Path,
+    kind: ProposalAssetKind,
+) -> Result<String, Whatever> {
+    let mut segments = vec![proposal_number.to_string(), "assets".to_owned()];
+    let asset_segments = asset_relative_path
+        .components()
+        .map(|component| match component {
+            Component::Normal(part) => {
+                part.to_str().map(str::to_owned).with_whatever_context(|| {
+                    format!(
+                        "non-UTF-8 proposal asset path `{}`",
+                        asset_relative_path.to_string_lossy()
+                    )
+                })
+            }
+            _ => snafu::whatever!(
+                "unsupported proposal asset path component in `{}`",
+                asset_relative_path.to_string_lossy()
+            ),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let last_index = asset_segments.len().saturating_sub(1);
+    for (index, mut segment) in asset_segments.into_iter().enumerate() {
+        if kind == ProposalAssetKind::Markdown && index == last_index {
+            segment = segment
+                .strip_suffix(".md")
+                .with_whatever_context(|| {
+                    format!(
+                        "proposal asset markdown path `{}` does not end in `.md`",
+                        asset_relative_path.to_string_lossy()
+                    )
+                })?
+                .to_owned();
+        }
+        segments.push(percent_encode_url_segment(&segment));
+    }
+
+    let mut rendered_path = format!("/{}", segments.join("/"));
+    if kind == ProposalAssetKind::Markdown {
+        rendered_path.push('/');
+    }
+
+    Ok(rendered_path)
+}
+
+fn percent_encode_url_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn rendered_directory_segments(rendered_path: &str) -> Result<Vec<&str>, Whatever> {
+    let (mut segments, is_directory) = rendered_path_segments(rendered_path)?;
+    if !is_directory {
+        segments.pop();
+    }
+    Ok(segments)
+}
+
+fn rendered_path_segments(rendered_path: &str) -> Result<(Vec<&str>, bool), Whatever> {
+    if !rendered_path.starts_with('/') {
+        snafu::whatever!("rendered path `{rendered_path}` is not absolute");
+    }
+
+    let is_directory = rendered_path.ends_with('/');
+    let segments = rendered_path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    Ok((segments, is_directory))
+}
+
+fn is_generated_zola_markdown(contents: &str) -> bool {
+    contents.starts_with("+++\n")
+}
+
+#[allow(dead_code)]
+pub fn preprocess(root_path: &Path, only_plan: Option<&OnlyRenderPlan>) -> Result<(), Whatever> {
+    preprocess_with_network_upgrades(root_path, only_plan, None)
+}
+
+pub(crate) fn preprocess_with_network_upgrades(
+    root_path: &Path,
+    only_plan: Option<&OnlyRenderPlan>,
+    network_upgrade_index: Option<&NetworkUpgradeIndex>,
+) -> Result<(), Whatever> {
     let dir = std::fs::read_dir(root_path).with_whatever_context(|_| {
         format!("could not read directory `{}`", root_path.to_string_lossy())
     })?;
@@ -268,11 +815,138 @@ pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
         }
 
         if file_type.is_dir() {
-            process_eip(root_path, &entry_path.join("index.md"))?;
-            process_assets(root_path, &entry_path)?;
+            let relative_path = entry_path
+                .strip_prefix(root_path)
+                .with_whatever_context(|_| {
+                    format!(
+                        "content directory entry `{}` is outside `{}`",
+                        entry_path.to_string_lossy(),
+                        root_path.to_string_lossy()
+                    )
+                })?;
+            if only_plan
+                .map(|plan| plan.should_process_proposal_dir(relative_path))
+                .unwrap_or(true)
+            {
+                let index_path = entry_path.join("index.md");
+                if let Some(plan) = only_plan {
+                    let index_relative_path = relative_path.join("index.md");
+                    if plan.should_preprocess_markdown(&index_relative_path) {
+                        process_eip(
+                            root_path,
+                            &index_path,
+                            only_plan,
+                            network_upgrade_index,
+                            MissingPathMode::Error,
+                        )?;
+                    }
+                } else {
+                    process_eip(
+                        root_path,
+                        &index_path,
+                        only_plan,
+                        network_upgrade_index,
+                        MissingPathMode::Error,
+                    )?;
+                }
+                process_assets(root_path, &entry_path, only_plan, MissingPathMode::Error)?;
+            }
         } else if entry_path.extension().and_then(OsStr::to_str) == Some("md") {
-            process_eip(root_path, &entry_path)?;
+            let relative_path = entry_path
+                .strip_prefix(root_path)
+                .with_whatever_context(|_| {
+                    format!(
+                        "content file `{}` is outside `{}`",
+                        entry_path.to_string_lossy(),
+                        root_path.to_string_lossy()
+                    )
+                })?;
+            if only_plan
+                .map(|plan| plan.should_preprocess_markdown(relative_path))
+                .unwrap_or(true)
+            {
+                process_eip(
+                    root_path,
+                    &entry_path,
+                    only_plan,
+                    network_upgrade_index,
+                    MissingPathMode::Error,
+                )?;
+            }
         }
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn preprocess_paths(
+    root_path: &Path,
+    relative_paths: &BTreeSet<PathBuf>,
+    only_plan: Option<&OnlyRenderPlan>,
+) -> Result<(), Whatever> {
+    preprocess_paths_with_network_upgrades(root_path, relative_paths, only_plan, None)
+}
+
+pub(crate) fn preprocess_paths_with_network_upgrades(
+    root_path: &Path,
+    relative_paths: &BTreeSet<PathBuf>,
+    only_plan: Option<&OnlyRenderPlan>,
+    network_upgrade_index: Option<&NetworkUpgradeIndex>,
+) -> Result<(), Whatever> {
+    let mut eips = BTreeSet::new();
+    let mut asset_dirs = BTreeSet::new();
+
+    for relative_path in relative_paths {
+        let Ok(content_relative_path) = relative_path.strip_prefix("content") else {
+            continue;
+        };
+
+        if content_relative_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        if content_relative_path.extension().and_then(OsStr::to_str) != Some("md") {
+            continue;
+        }
+
+        if only_plan
+            .map(|plan| !plan.should_sync_dirty_path(relative_path))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let mut components = content_relative_path.components();
+        let Some(first_component) = components.next() else {
+            continue;
+        };
+
+        if matches!(
+            components.next(),
+            Some(component) if component.as_os_str() == OsStr::new("assets")
+        ) {
+            let proposal_dir = root_path.join(first_component.as_os_str());
+            asset_dirs.insert(proposal_dir);
+            continue;
+        }
+
+        let path = root_path.join(content_relative_path);
+        eips.insert(path);
+    }
+
+    for path in eips {
+        process_eip(
+            root_path,
+            &path,
+            only_plan,
+            network_upgrade_index,
+            MissingPathMode::Ignore,
+        )?;
+    }
+
+    for path in asset_dirs {
+        process_assets(root_path, &path, only_plan, MissingPathMode::Ignore)?;
     }
 
     Ok(())
@@ -333,9 +1007,108 @@ fn canonicalize_md(path: &Path) -> Result<PathBuf, Whatever> {
     })
 }
 
+enum AssetLinkRewrite {
+    Rewrite(String),
+    FallThrough,
+}
+
+fn resolve_asset_link_rewrite(
+    root: &Path,
+    source_md_path: &Path,
+    only_plan: Option<&OnlyRenderPlan>,
+    iri_path: &str,
+) -> Result<Option<AssetLinkRewrite>, Whatever> {
+    if iri_path.is_empty() {
+        return Ok(None);
+    }
+
+    let ProposalAssetPathResolution::ProposalAsset(asset_path) =
+        resolve_proposal_asset_path(root, source_md_path, iri_path)?
+    else {
+        return Ok(None);
+    };
+
+    if let Some(plan) = only_plan {
+        if let Some(public_url) =
+            plan.public_url_for_omitted_proposal_asset(&asset_path.content_relative_asset_path)
+        {
+            return Ok(Some(AssetLinkRewrite::Rewrite(public_url)));
+        }
+
+        if plan.has_proposal_asset(&asset_path.content_relative_asset_path) {
+            validate_local_proposal_asset(root, source_md_path, iri_path, &asset_path)?;
+            return local_asset_link_rewrite(root, source_md_path, asset_path).map(Some);
+        }
+
+        snafu::whatever!(
+            "proposal asset link `{iri_path}` in `{}` resolved to `{}` but was not found in targeted render inventory",
+            source_md_path.to_string_lossy(),
+            asset_path.content_relative_asset_path.to_string_lossy()
+        );
+    }
+
+    validate_local_proposal_asset(root, source_md_path, iri_path, &asset_path)?;
+    local_asset_link_rewrite(root, source_md_path, asset_path).map(Some)
+}
+
+fn validate_local_proposal_asset(
+    root: &Path,
+    source_md_path: &Path,
+    iri_path: &str,
+    asset_path: &ProposalAssetPath,
+) -> Result<(), Whatever> {
+    if proposal_asset_exists_in_content_tree(root, &asset_path.content_relative_asset_path) {
+        return Ok(());
+    }
+
+    snafu::whatever!(
+        "proposal asset link `{iri_path}` in `{}` resolved to missing asset `{}`",
+        source_md_path.to_string_lossy(),
+        asset_path.content_relative_asset_path.to_string_lossy()
+    );
+}
+
+fn local_asset_link_rewrite(
+    root: &Path,
+    source_md_path: &Path,
+    asset_path: ProposalAssetPath,
+) -> Result<AssetLinkRewrite, Whatever> {
+    if asset_path.kind == ProposalAssetKind::Markdown {
+        return Ok(AssetLinkRewrite::FallThrough);
+    }
+
+    let source_relative_path = source_md_path
+        .strip_prefix(root)
+        .with_whatever_context(|_| {
+            format!(
+                "source markdown `{}` is outside content root `{}`",
+                source_md_path.to_string_lossy(),
+                root.to_string_lossy()
+            )
+        })?;
+    let source_rendered_path = absolute_rendered_path_for_content_path(source_relative_path)?;
+    let relative_url =
+        relative_url_from_rendered_paths(&source_rendered_path, &asset_path.rendered_target_path)?;
+
+    Ok(AssetLinkRewrite::Rewrite(relative_url))
+}
+
+fn append_query_and_fragment(mut url: String, iri_ref: &IriRefBuf) -> String {
+    if let Some(query) = iri_ref.query() {
+        url.push('?');
+        url.push_str(query.as_str());
+    }
+    if let Some(fragment) = iri_ref.fragment() {
+        url.push('#');
+        url.push_str(fragment.as_str());
+    }
+    url
+}
+
 fn fix_links<'a, 'b>(
     root: &'a Path,
-    parent: &'a Path,
+    source_md_path: &'a Path,
+    only_plan: Option<&'a OnlyRenderPlan>,
     mut e: Event<'b>,
 ) -> Result<Event<'b>, Whatever> {
     match &mut e {
@@ -344,13 +1117,64 @@ fn fix_links<'a, 'b>(
                 .map_err(|e| e.to_string())
                 .whatever_context("invalid URL in image/link")?;
 
-            if iri_ref.authority().is_some() {
+            if iri_ref.scheme().is_some() || iri_ref.authority().is_some() {
                 // Is a protocol-relative or absolute URL.
                 return Ok(e);
             }
 
+            let iri_path: &str = iri_ref.path().as_ref();
+            match resolve_asset_link_rewrite(root, source_md_path, only_plan, iri_path)? {
+                Some(AssetLinkRewrite::Rewrite(url)) => {
+                    *dest_url = CowStr::from(append_query_and_fragment(url, &iri_ref));
+                    return Ok(e);
+                }
+                Some(AssetLinkRewrite::FallThrough) | None => {}
+            }
+
             if !iri_ref.path().ends_with(".md") {
                 // Only markdown files need the `@` syntax.
+                return Ok(e);
+            }
+
+            let parent = source_md_path.parent().with_whatever_context(|| {
+                format!(
+                    "source markdown path `{}` has no parent",
+                    source_md_path.to_string_lossy()
+                )
+            })?;
+            let child = if iri_path.starts_with("/") {
+                let mut path = Path::new(iri_path);
+                path = path.strip_prefix("/").unwrap();
+                root.join(path)
+            } else {
+                parent.join(Path::new(iri_path))
+            };
+            let normalized_root = normalize_path_lexically(root);
+            let normalized_child = normalize_path_lexically(&child);
+            if let Some(public_url) = only_plan.and_then(|plan| {
+                normalized_child
+                    .strip_prefix(&normalized_root)
+                    .ok()
+                    .and_then(|relative_path| plan.external_url_for_content_target(relative_path))
+            }) {
+                let mut external_url = public_url.to_owned();
+                if let Some(query) = iri_ref.query() {
+                    external_url.push('?');
+                    external_url.push_str(query.as_str());
+                }
+                if let Some(fragment) = iri_ref.fragment() {
+                    external_url.push('#');
+                    external_url.push_str(fragment.as_str());
+                }
+                *dest_url = CowStr::from(external_url);
+                return Ok(e);
+            }
+            let canonicalized = canonicalize_md(&child)?;
+            if let Some(public_url) =
+                only_plan.and_then(|plan| plan.external_url_for_canonical_target(&canonicalized))
+            {
+                *dest_url =
+                    CowStr::from(append_query_and_fragment(public_url.to_owned(), &iri_ref));
                 return Ok(e);
             }
 
@@ -429,7 +1253,12 @@ impl RenderCsl {
     }
 }
 
-fn transform_markdown(root: &Path, path: &Path, body: &str) -> Result<String, Whatever> {
+fn transform_markdown(
+    root: &Path,
+    path: &Path,
+    body: &str,
+    only_plan: Option<&OnlyRenderPlan>,
+) -> Result<String, Whatever> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_FOOTNOTES);
@@ -437,11 +1266,10 @@ fn transform_markdown(root: &Path, path: &Path, body: &str) -> Result<String, Wh
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
 
-    let parent = path.parent().unwrap();
     let mut csl = RenderCsl { contents: None };
 
     let events = Parser::new_ext(body, opts)
-        .map(|e| fix_links(root, parent, e))
+        .map(|e| fix_links(root, path, only_plan, e))
         .filter_map(|r| match r {
             Ok(e) => csl.render_csl(e).transpose(),
             err => Some(err),
@@ -456,8 +1284,67 @@ fn transform_markdown(root: &Path, path: &Path, body: &str) -> Result<String, Wh
     Ok(output)
 }
 
-fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
+fn process_assets(
+    root: &Path,
+    path: &Path,
+    only_plan: Option<&OnlyRenderPlan>,
+    missing_path_mode: MissingPathMode,
+) -> Result<(), Whatever> {
     let canon_root = std::fs::canonicalize(root).whatever_context("could not canonicalize root")?;
+    let assets_dir = path.join("assets");
+
+    let mut entries = Vec::new();
+    let mut ignored_missing_path = false;
+
+    for entry in WalkDir::new(&assets_dir).follow_links(true).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if missing_path_mode.should_ignore_walkdir_error(&error) => {
+                ignored_missing_path = true;
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_whatever_context(|_| {
+                    format!("couldn't read entry in `{}`", assets_dir.to_string_lossy())
+                });
+            }
+        };
+
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        if entry.path().extension().and_then(OsStr::to_str) != Some("md") {
+            continue;
+        }
+
+        let candidate = match std::fs::canonicalize(entry.path()) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "unable to canonicalize `{}`: {e}",
+                    entry.path().to_string_lossy()
+                );
+                continue;
+            }
+        };
+
+        let in_root = candidate.starts_with(&canon_root);
+        if !in_root {
+            warn!(
+                "asset `{}` not in root, skipping",
+                entry.path().to_string_lossy()
+            );
+            continue;
+        }
+
+        entries.push(entry);
+    }
+
+    if entries.is_empty() && ignored_missing_path {
+        return Ok(());
+    }
+
     let number_txt = path
         .file_name()
         .with_whatever_context(|| format!("no file name for `{}`", path.to_string_lossy()))?
@@ -468,60 +1355,28 @@ fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
         format!("can't parse number for `{}`", path.to_string_lossy())
     })?;
 
-    let assets_dir = path.join("assets");
-
-    let dir = WalkDir::new(&assets_dir)
-        .follow_links(true)
-        .into_iter()
-        .filter(|e| match e {
-            Ok(f) if !f.file_type().is_file() => false,
-            Ok(f) => f.path().extension().and_then(OsStr::to_str) == Some("md"),
-            Err(_) => true,
-        })
-        .filter(|e| {
-            let f = match e {
-                Ok(f) => f,
-                _ => return true,
-            };
-
-            let candidate = match std::fs::canonicalize(f.path()) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        "unable to canonicalize `{}`: {e}",
-                        f.path().to_string_lossy()
-                    );
-                    return false;
-                }
-            };
-
-            let in_root = candidate.starts_with(&canon_root);
-            if !in_root {
-                warn!(
-                    "asset `{}` not in root, skipping",
-                    f.path().to_string_lossy()
-                );
-            }
-            in_root
-        });
-    let dirs: Vec<_> = dir.collect();
-
-    for entry in dirs.into_iter().progress_ext("Assets") {
-        let entry = entry.with_whatever_context(|_| {
-            format!("couldn't read entry in `{}`", assets_dir.to_string_lossy())
-        })?;
-
+    for entry in entries.into_iter().progress_ext("Assets") {
         let path = entry.path();
-        let contents = read_to_string(path).with_whatever_context(|_| {
-            format!("could not read file `{}`", path.to_string_lossy())
-        })?;
+        let contents = match read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if missing_path_mode.should_ignore_io_error(&error) => continue,
+            Err(error) => {
+                return Err(error).with_whatever_context(|_| {
+                    format!("could not read file `{}`", path.to_string_lossy())
+                });
+            }
+        };
+        if is_generated_zola_markdown(&contents) {
+            continue;
+        }
 
-        let contents = transform_markdown(root, path, &contents).with_whatever_context(|_| {
-            format!(
-                "unable to transform markdown for `{}`",
-                path.to_string_lossy()
-            )
-        })?;
+        let contents =
+            transform_markdown(root, path, &contents, only_plan).with_whatever_context(|_| {
+                format!(
+                    "unable to transform markdown for `{}`",
+                    path.to_string_lossy()
+                )
+            })?;
 
         let relative_path = path.strip_prefix(&assets_dir).unwrap();
         let relative_path = relative_path.with_file_name(relative_path.file_stem().unwrap());
@@ -550,36 +1405,69 @@ fn process_assets(root: &Path, path: &Path) -> Result<(), Whatever> {
             ..Default::default()
         };
 
-        write_file(path, front_matter, &contents).whatever_context("couldn't write file")?;
+        match write_file(path, front_matter, &contents) {
+            Ok(()) => {}
+            Err(error) if missing_path_mode.should_ignore_io_error(&error) => continue,
+            Err(error) => return Err(error).whatever_context("couldn't write file"),
+        }
     }
 
     Ok(())
 }
 
-fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
+fn process_eip(
+    root: &Path,
+    path: &Path,
+    only_plan: Option<&OnlyRenderPlan>,
+    network_upgrade_index: Option<&NetworkUpgradeIndex>,
+    missing_path_mode: MissingPathMode,
+) -> Result<(), Whatever> {
     let path_lossy = path.to_string_lossy();
-    let contents = read_to_string(path)
-        .with_whatever_context(|_| format!("could not read file `{}`", path_lossy))?;
+    let contents = match read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if missing_path_mode.should_ignore_io_error(&error) => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_whatever_context(|_| format!("could not read file `{}`", path_lossy));
+        }
+    };
+    if is_generated_zola_markdown(&contents) {
+        return Ok(());
+    }
 
     let (preamble, body) = Preamble::split(&contents)
         .with_whatever_context(|_| format!("couldn't split preamble for `{}`", path_lossy))?;
 
-    let body = transform_markdown(root, path, body)
+    let body = transform_markdown(root, path, body, only_plan)
         .with_whatever_context(|_| format!("unable to transform markdown for `{path_lossy}`"))?;
+
+    if is_section_index_path(path) {
+        let front_matter =
+            serde_yaml::from_str::<FrontMatter>(preamble).with_whatever_context(|_| {
+                format!("couldn't parse section front matter in `{}`", path_lossy)
+            })?;
+
+        match write_file(path, front_matter, &body) {
+            Ok(()) => {}
+            Err(error) if missing_path_mode.should_ignore_io_error(&error) => return Ok(()),
+            Err(error) => return Err(error).whatever_context("couldn't write file"),
+        }
+
+        return Ok(());
+    }
 
     let preamble = Preamble::parse(Some(&path_lossy), preamble)
         .ok()
         .with_whatever_context(|| format!("couldn't parse preamble in `{}`", path_lossy))?;
 
-    let updated = match path.file_name() {
-        Some(x) if x == "_index.md" => None,
-        _ => Some(last_modified(path)?),
-    };
+    let updated = Some(last_modified(path)?);
 
     let mut front_matter = FrontMatter {
         updated,
         ..Default::default()
     };
+    let mut proposal_number = None;
+    let mut proposal_is_erc = false;
 
     for field in preamble.fields() {
         let value = field.value().trim();
@@ -608,6 +1496,9 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
                     .insert("type".into(), vec![value.into()]);
             }
             "category" => {
+                if value == "ERC" {
+                    proposal_is_erc = true;
+                }
                 front_matter.extra.insert("category".into(), value.into());
                 front_matter
                     .taxonomies
@@ -621,6 +1512,7 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
                 front_matter.template = Some("eip.html".into());
                 front_matter.slug = number.to_string();
                 front_matter.extra.insert("number".into(), number.into());
+                proposal_number = ProposalNumber::from_u32(number).ok();
 
                 let alias_path = PathBuf::from(&path);
                 if let Some(file_stem) = alias_path.file_stem() {
@@ -654,8 +1546,24 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
                     .whatever_context("could not parse requires")?
                     .into_iter()
                     .map(|eip| {
-                        let path = format!("/{eip:0>5}.md");
-                        path_to_at(root, root, &path)
+                        let proposal_number = match ProposalNumber::from_u32(eip) {
+                            Ok(proposal_number) => proposal_number,
+                            Err(()) => snafu::whatever!("could not parse requires"),
+                        };
+                        match only_plan {
+                            Some(plan) => {
+                                match plan.reference_for_required_number(proposal_number)? {
+                                    ProposalReference::Internal(path) => Ok(path),
+                                    ProposalReference::External(public_url) => {
+                                        Ok(public_url.to_owned())
+                                    }
+                                }
+                            }
+                            None => {
+                                let path = format!("/{eip:0>5}.md");
+                                path_to_at(root, root, &path)
+                            }
+                        }
                     })
                     .collect::<Result<_, _>>()?;
                 front_matter
@@ -669,7 +1577,1194 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
         }
     }
 
-    write_file(Path::new(&path), front_matter, &body).whatever_context("couldn't write file")?;
+    if let (Some(index), Some(proposal_number)) = (network_upgrade_index, proposal_number) {
+        if !proposal_is_erc {
+            if let Some(memberships) = index.memberships_by_proposal.get(&proposal_number) {
+                front_matter.extra.insert(
+                    "network_upgrades".into(),
+                    network_upgrade_memberships_value(memberships),
+                );
+            }
+        }
+    }
+
+    match write_file(path, front_matter, &body) {
+        Ok(()) => {}
+        Err(error) if missing_path_mode.should_ignore_io_error(&error) => return Ok(()),
+        Err(error) => return Err(error).whatever_context("couldn't write file"),
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    use git2::{IndexAddOption, Repository, Signature};
+    use snafu::Report;
+    use tempfile::TempDir;
+    use toml::Value as TomlValue;
+
+    use super::{
+        absolute_rendered_path_for_content_path, preprocess, preprocess_paths,
+        preprocess_with_network_upgrades, proposal_asset_exists_in_content_tree,
+        relative_url_from_rendered_paths, resolve_proposal_asset_path, ProposalAssetPath,
+        ProposalAssetPathResolution,
+    };
+    use crate::network_upgrades::{NetworkUpgradeIndex, NetworkUpgradeMembership};
+    use crate::proposal::ProposalAssetKind;
+    use crate::proposal::{OnlyRenderPlan, ProposalNumber};
+
+    fn number(value: u32) -> ProposalNumber {
+        ProposalNumber::from_u32(value).unwrap()
+    }
+
+    fn write_file(root: &Path, relative: &str, contents: impl AsRef<str>) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents.as_ref()).unwrap();
+    }
+
+    fn commit_all(repo: &Repository) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["content"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("build-eips test", "build-eips@example.test").unwrap();
+
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+    }
+
+    fn content_repo(files: &[(&str, String)]) -> (TempDir, PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path().join("repo");
+        let content_root = repo_root.join("content");
+        std::fs::create_dir_all(&content_root).unwrap();
+        let repo = Repository::init(&repo_root).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+
+        for (relative, contents) in files {
+            write_file(&content_root, relative, contents);
+        }
+
+        commit_all(&repo);
+        (temp, content_root)
+    }
+
+    fn proposal_markdown(
+        proposal_number: u32,
+        category: Option<&str>,
+        extra_preamble: &str,
+        body: &str,
+    ) -> String {
+        let category = category
+            .map(|category| format!("category: {category}\n"))
+            .unwrap_or_default();
+        format!(
+            "---\neip: {proposal_number}\ntitle: Proposal {proposal_number}\n{category}{extra_preamble}---\n{body}\n"
+        )
+    }
+
+    fn only_plan(content_root: &Path, selected: &[u32]) -> OnlyRenderPlan {
+        let selected = selected
+            .iter()
+            .copied()
+            .map(number)
+            .collect::<BTreeSet<_>>();
+        OnlyRenderPlan::build(content_root, selected).unwrap()
+    }
+
+    fn repo_paths(paths: &[&str]) -> BTreeSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    fn rendered_body(path: &Path) -> String {
+        let contents = std::fs::read_to_string(path).unwrap();
+        contents.split_once("\n+++\n").unwrap().1.to_owned()
+    }
+
+    fn rendered_front_matter(path: &Path) -> TomlValue {
+        let contents = std::fs::read_to_string(path).unwrap();
+        let front_matter = contents
+            .strip_prefix("+++\n")
+            .unwrap()
+            .split_once("\n+++\n")
+            .unwrap()
+            .0;
+        toml::from_str(front_matter).unwrap()
+    }
+
+    fn network_upgrade_index_for_memberships(
+        proposal_number: ProposalNumber,
+        memberships: Vec<NetworkUpgradeMembership>,
+    ) -> NetworkUpgradeIndex {
+        NetworkUpgradeIndex {
+            upgrades: Vec::new(),
+            memberships_by_proposal: [(proposal_number, memberships)].into_iter().collect(),
+            selected_sources: Vec::new(),
+        }
+    }
+
+    fn membership(
+        display_name: &str,
+        source_meta_eip: u32,
+        stage_key: &str,
+        stage_label: &str,
+        subgroup: Option<&str>,
+    ) -> NetworkUpgradeMembership {
+        NetworkUpgradeMembership {
+            display_name: display_name.to_owned(),
+            slug: display_name.to_ascii_lowercase(),
+            source_meta_eip: number(source_meta_eip),
+            meta_url: format!("/{source_meta_eip}/"),
+            stage_key: stage_key.to_owned(),
+            stage_label: stage_label.to_owned(),
+            subgroup: subgroup.map(str::to_owned),
+        }
+    }
+
+    fn resolved_asset(
+        content_root: &Path,
+        source_md_path: &Path,
+        iri_path: &str,
+    ) -> ProposalAssetPath {
+        match resolve_proposal_asset_path(content_root, source_md_path, iri_path).unwrap() {
+            ProposalAssetPathResolution::ProposalAsset(asset_path) => asset_path,
+            ProposalAssetPathResolution::NotAProposalAsset => {
+                panic!("expected `{iri_path}` to resolve as proposal asset")
+            }
+        }
+    }
+
+    #[test]
+    fn resolver_detects_flat_source_cross_proposal_static_asset() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path().join("content");
+        let source = content.join("00555.md");
+
+        let asset_path = resolved_asset(&content, &source, "./00678/assets/foo.pdf");
+
+        assert_eq!(asset_path.target_proposal_number, number(678));
+        assert_eq!(
+            asset_path.content_relative_asset_path,
+            Path::new("00678/assets/foo.pdf")
+        );
+        assert_eq!(asset_path.asset_relative_path, Path::new("foo.pdf"));
+        assert_eq!(asset_path.kind, ProposalAssetKind::Static);
+        assert_eq!(asset_path.rendered_target_path, "/678/assets/foo.pdf");
+    }
+
+    #[test]
+    fn resolver_detects_directory_source_cross_proposal_static_asset() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path().join("content");
+        let source = content.join("00555/index.md");
+
+        let asset_path = resolved_asset(&content, &source, "../00678/assets/foo.pdf");
+
+        assert_eq!(
+            asset_path.content_relative_asset_path,
+            Path::new("00678/assets/foo.pdf")
+        );
+        assert_eq!(asset_path.rendered_target_path, "/678/assets/foo.pdf");
+    }
+
+    #[test]
+    fn resolver_detects_asset_markdown_lexically_without_filesystem() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path().join("content");
+        let source = content.join("00555/assets/guide.md");
+
+        let asset_path = resolved_asset(&content, &source, "../../00678/assets/guide.md");
+
+        assert_eq!(asset_path.kind, ProposalAssetKind::Markdown);
+        assert_eq!(
+            asset_path.content_relative_asset_path,
+            Path::new("00678/assets/guide.md")
+        );
+        assert_eq!(asset_path.rendered_target_path, "/678/assets/guide/");
+    }
+
+    #[test]
+    fn resolver_decodes_safe_percent_paths_and_renders_encoded_urls() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path().join("content");
+        let source = content.join("00555.md");
+
+        let asset_path = resolved_asset(
+            &content,
+            &source,
+            "./00678/assets/Contract%20Interactions%20diagram.svg",
+        );
+
+        assert_eq!(
+            asset_path.content_relative_asset_path,
+            Path::new("00678/assets/Contract Interactions diagram.svg")
+        );
+        assert_eq!(
+            asset_path.rendered_target_path,
+            "/678/assets/Contract%20Interactions%20diagram.svg"
+        );
+    }
+
+    #[test]
+    fn resolver_rejects_unsafe_percent_and_asset_segments() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path().join("content");
+        let source = content.join("00555.md");
+
+        for iri_path in [
+            "./00678/assets/foo%2Fbar.pdf",
+            "./00678/assets/foo%5Cbar.pdf",
+            "./00678/assets/foo%00bar.pdf",
+            "./00678/assets/.",
+            "./00678/assets/..",
+            "./00678/assets/%2E",
+            "./00678/assets/%2E%2E",
+        ] {
+            let error = resolve_proposal_asset_path(&content, &source, iri_path)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("unsafe"),
+                "expected unsafe path error for `{iri_path}`, got `{error}`"
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_allows_unsafe_percent_encodings_for_non_proposal_paths() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path().join("content");
+        let source = content.join("00555.md");
+
+        let resolution =
+            resolve_proposal_asset_path(&content, &source, "./images/foo%2Fbar.pdf").unwrap();
+
+        assert_eq!(resolution, ProposalAssetPathResolution::NotAProposalAsset);
+    }
+
+    #[test]
+    fn resolver_still_rejects_unsafe_percent_encodings_for_proposal_assets() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path().join("content");
+        let source = content.join("00555.md");
+
+        let error = resolve_proposal_asset_path(&content, &source, "./00678/assets/foo%2Fbar.pdf")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unsafe"));
+    }
+
+    #[test]
+    fn resolver_returns_passthrough_for_outside_root_without_error() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path().join("content");
+        let source = content.join("00555.md");
+
+        let resolution =
+            resolve_proposal_asset_path(&content, &source, "../elsewhere/foo.pdf").unwrap();
+
+        assert_eq!(resolution, ProposalAssetPathResolution::NotAProposalAsset);
+    }
+
+    #[test]
+    fn resolver_returns_passthrough_for_non_proposal_asset_paths() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path().join("content");
+        let source = content.join("00555.md");
+
+        let resolution =
+            resolve_proposal_asset_path(&content, &source, "./images/foo.pdf").unwrap();
+
+        assert_eq!(resolution, ProposalAssetPathResolution::NotAProposalAsset);
+    }
+
+    #[test]
+    fn rendered_path_helper_maps_proposal_and_asset_content_paths() {
+        for (content_relative_path, expected_rendered_path) in [
+            ("_index.md", "/"),
+            ("00555.md", "/555/"),
+            ("00555/index.md", "/555/"),
+            ("00555/assets/guide.md", "/555/assets/guide/"),
+            ("00555/assets/README.md", "/555/assets/README/"),
+            ("00555/assets/index.md", "/555/assets/index/"),
+            ("00678/assets/foo.pdf", "/678/assets/foo.pdf"),
+            (
+                "00678/assets/Contract Interactions diagram.svg",
+                "/678/assets/Contract%20Interactions%20diagram.svg",
+            ),
+        ] {
+            assert_eq!(
+                absolute_rendered_path_for_content_path(Path::new(content_relative_path)).unwrap(),
+                expected_rendered_path
+            );
+        }
+    }
+
+    #[test]
+    fn relative_url_helper_uses_rendered_paths() {
+        assert_eq!(
+            relative_url_from_rendered_paths("/555/", "/678/assets/foo.pdf").unwrap(),
+            "../678/assets/foo.pdf"
+        );
+        assert_eq!(
+            relative_url_from_rendered_paths("/555/assets/guide/", "/678/assets/foo.pdf").unwrap(),
+            "../../../678/assets/foo.pdf"
+        );
+        assert_eq!(
+            relative_url_from_rendered_paths("/555/", "/678/assets/guide/").unwrap(),
+            "../678/assets/guide/"
+        );
+    }
+
+    #[test]
+    fn filesystem_validator_checks_content_relative_assets() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path().join("content");
+        write_file(&content, "00678/assets/foo.pdf", "");
+
+        assert!(proposal_asset_exists_in_content_tree(
+            &content,
+            Path::new("00678/assets/foo.pdf")
+        ));
+        assert!(!proposal_asset_exists_in_content_tree(
+            &content,
+            Path::new("00678/assets/missing.pdf")
+        ));
+        assert!(!proposal_asset_exists_in_content_tree(
+            &content,
+            Path::new("../00678/assets/foo.pdf")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_validator_rejects_symlink_targets_outside_content_root() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path().join("content");
+        write_file(&content, "00678/assets/placeholder", "");
+        let outside = temp.path().join("outside.pdf");
+        std::fs::write(&outside, "").unwrap();
+        std::os::unix::fs::symlink(&outside, content.join("00678/assets/outside.pdf")).unwrap();
+
+        assert!(!proposal_asset_exists_in_content_tree(
+            &content,
+            Path::new("00678/assets/outside.pdf")
+        ));
+    }
+
+    #[test]
+    fn preprocess_rewrites_flat_source_cross_proposal_static_asset() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "See [asset](./00678/assets/foo.pdf)."),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/foo.pdf", "".to_owned()),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("(../678/assets/foo.pdf)"));
+    }
+
+    #[test]
+    fn preprocess_rewrites_directory_source_cross_proposal_static_asset() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555/index.md",
+                proposal_markdown(555, None, "", "See [asset](../00678/assets/foo.pdf)."),
+            ),
+            ("00555/assets/.keep", "".to_owned()),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/foo.pdf", "".to_owned()),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555/index.md"));
+        assert!(body.contains("(../678/assets/foo.pdf)"));
+    }
+
+    #[test]
+    fn preprocess_rewrites_root_index_source_cross_proposal_static_asset() {
+        let (_temp, content) = content_repo(&[
+            (
+                "_index.md",
+                "---\ntitle: Home\n---\nSee [asset](/00678/assets/foo.pdf).\n".to_owned(),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/foo.pdf", "".to_owned()),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("_index.md"));
+        assert!(body.contains("(678/assets/foo.pdf)"));
+    }
+
+    #[test]
+    fn preprocess_rewrites_asset_markdown_source_using_rendered_source_path() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555/index.md",
+                proposal_markdown(555, None, "", "Source."),
+            ),
+            (
+                "00555/assets/guide.md",
+                "See [asset](../../00678/assets/foo.pdf).".to_owned(),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/foo.pdf", "".to_owned()),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555/assets/guide.md"));
+        assert!(body.contains("(../../../678/assets/foo.pdf)"));
+    }
+
+    #[test]
+    fn preprocess_rewrites_source_root_absolute_asset_path() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "See [asset](/00678/assets/foo.pdf)."),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/foo.pdf", "".to_owned()),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("(../678/assets/foo.pdf)"));
+    }
+
+    #[test]
+    fn preprocess_rewrites_cross_proposal_image_links() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "![diagram](./00678/assets/diagram.png)"),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/diagram.png", "".to_owned()),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("![diagram](../678/assets/diagram.png)"));
+    }
+
+    #[test]
+    fn preprocess_preserves_query_and_fragment_on_asset_links() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(
+                    555,
+                    None,
+                    "",
+                    "See [asset](./00678/assets/foo.pdf?download=1#page=2).",
+                ),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/foo.pdf", "".to_owned()),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("(../678/assets/foo.pdf?download=1#page=2)"));
+    }
+
+    #[test]
+    fn preprocess_decodes_asset_paths_and_keeps_generated_urls_encoded() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(
+                    555,
+                    None,
+                    "",
+                    "See [asset](./00678/assets/Contract%20Interactions%20diagram.svg).",
+                ),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            (
+                "00678/assets/Contract Interactions diagram.svg",
+                "".to_owned(),
+            ),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("../678/assets/Contract%20Interactions%20diagram.svg"));
+    }
+
+    #[test]
+    fn preprocess_keeps_selected_or_full_asset_markdown_links_on_existing_md_path() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "See [guide](./00678/assets/guide.md)."),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/guide.md", "Guide.".to_owned()),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("(@/00678/assets/guide.md)"));
+    }
+
+    #[test]
+    fn preprocess_keeps_asset_markdown_fragment_links_unchanged() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555/index.md",
+                proposal_markdown(555, None, "", "Source."),
+            ),
+            (
+                "00555/assets/guide.md",
+                "See [heading](#heading).\n\n## Heading\n".to_owned(),
+            ),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555/assets/guide.md"));
+        assert!(body.contains("[heading](#heading)"));
+    }
+
+    #[test]
+    fn preprocess_keeps_ordinary_proposal_markdown_links_on_existing_path() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "See [proposal](./00678.md)."),
+            ),
+            ("00678.md", proposal_markdown(678, None, "", "Target.")),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("(@/00678.md)"));
+    }
+
+    #[test]
+    fn preprocess_injects_network_upgrade_memberships_into_proposal_extra() {
+        let (_temp, content) = content_repo(&[(
+            "00555.md",
+            proposal_markdown(555, None, "", "Proposal body."),
+        )]);
+        let index = network_upgrade_index_for_memberships(
+            number(555),
+            vec![
+                membership("Dencun", 7569, "included", "Included", Some("Core EIPs")),
+                membership(
+                    "Glamsterdam",
+                    7773,
+                    "scheduled",
+                    "Scheduled for Inclusion",
+                    None,
+                ),
+            ],
+        );
+
+        preprocess_with_network_upgrades(&content, None, Some(&index)).unwrap();
+
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        let memberships = front_matter["extra"]["network_upgrades"]
+            .as_array()
+            .unwrap();
+        assert_eq!(memberships.len(), 2);
+        assert_eq!(memberships[0]["display_name"].as_str().unwrap(), "Dencun");
+        assert_eq!(memberships[0]["slug"].as_str().unwrap(), "dencun");
+        assert_eq!(memberships[0]["meta_eip"].as_integer().unwrap(), 7569);
+        assert_eq!(memberships[0]["meta_url"].as_str().unwrap(), "/7569/");
+        assert_eq!(memberships[0]["stage_key"].as_str().unwrap(), "included");
+        assert_eq!(memberships[0]["stage_label"].as_str().unwrap(), "Included");
+        assert_eq!(memberships[0]["subgroup"].as_str().unwrap(), "Core EIPs");
+        assert_eq!(
+            memberships[1]["display_name"].as_str().unwrap(),
+            "Glamsterdam"
+        );
+        assert!(memberships[1].as_table().unwrap().get("subgroup").is_none());
+    }
+
+    #[test]
+    fn preprocess_leaves_proposals_without_network_upgrade_memberships_unchanged() {
+        let (_temp, content) = content_repo(&[(
+            "00555.md",
+            proposal_markdown(555, None, "", "Proposal body."),
+        )]);
+        let index = network_upgrade_index_for_memberships(
+            number(777),
+            vec![membership("Dencun", 7569, "included", "Included", None)],
+        );
+
+        preprocess_with_network_upgrades(&content, None, Some(&index)).unwrap();
+
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        assert!(front_matter["extra"]
+            .as_table()
+            .unwrap()
+            .get("network_upgrades")
+            .is_none());
+    }
+
+    #[test]
+    fn preprocess_does_not_inject_eip_memberships_into_same_number_erc_pages() {
+        let (_temp, content) = content_repo(&[(
+            "00555.md",
+            proposal_markdown(555, Some("ERC"), "", "Proposal body."),
+        )]);
+        let index = network_upgrade_index_for_memberships(
+            number(555),
+            vec![membership("Dencun", 7569, "included", "Included", None)],
+        );
+
+        preprocess_with_network_upgrades(&content, None, Some(&index)).unwrap();
+
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        assert!(front_matter["extra"]
+            .as_table()
+            .unwrap()
+            .get("network_upgrades")
+            .is_none());
+    }
+
+    #[test]
+    fn targeted_preprocess_rewrites_omitted_static_asset_to_public_url() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "See [asset](./00678/assets/foo.pdf)."),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/foo.pdf", "".to_owned()),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("(https://eips.ethereum.org/678/assets/foo.pdf)"));
+    }
+
+    #[test]
+    fn targeted_preprocess_rewrites_omitted_asset_markdown_to_public_url() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "See [guide](./00678/assets/guide.md)."),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/guide.md", "Guide.".to_owned()),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("(https://eips.ethereum.org/678/assets/guide/)"));
+    }
+
+    #[test]
+    fn targeted_preprocess_rewrites_omitted_readme_and_index_asset_markdown_public_urls() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(
+                    555,
+                    None,
+                    "",
+                    "See [readme](./00678/assets/README.md) and [index](./00678/assets/index.md).",
+                ),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/README.md", "Readme.".to_owned()),
+            ("00678/assets/index.md", "Index.".to_owned()),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("(https://eips.ethereum.org/678/assets/README/)"));
+        assert!(body.contains("(https://eips.ethereum.org/678/assets/index/)"));
+    }
+
+    #[test]
+    fn targeted_preprocess_keeps_selected_static_asset_local() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "See [asset](./00678/assets/foo.pdf)."),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/foo.pdf", "".to_owned()),
+        ]);
+        let plan = only_plan(&content, &[555, 678]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("(../678/assets/foo.pdf)"));
+        assert!(!body.contains("https://eips.ethereum.org/678/assets/foo.pdf"));
+    }
+
+    #[test]
+    fn targeted_dirty_preprocess_uses_inventory_after_omitted_target_is_pruned() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "See [asset](./00678/assets/foo.pdf)."),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/foo.pdf", "".to_owned()),
+        ]);
+        let plan = only_plan(&content, &[555]);
+        plan.prune_content(&content).unwrap();
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("(https://eips.ethereum.org/678/assets/foo.pdf)"));
+    }
+
+    #[test]
+    fn preprocess_errors_clearly_for_missing_selected_or_full_asset_target() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "See [asset](./00678/assets/missing.pdf)."),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/.keep", "".to_owned()),
+        ]);
+
+        let error = Report::from_error(preprocess(&content, None).unwrap_err()).to_string();
+
+        assert!(error.contains("proposal asset link"));
+        assert!(error.contains("00555.md"));
+        assert!(error.contains("./00678/assets/missing.pdf"));
+        assert!(error.contains("00678/assets/missing.pdf"));
+    }
+
+    #[test]
+    fn preprocess_skips_generated_zola_markdown_files() {
+        let original =
+            "+++\ntitle = \"Generated\"\n+++\nSee [asset](./00678/assets/missing.pdf).\n";
+        let (_temp, content) = content_repo(&[("00555.md", original.to_owned())]);
+
+        preprocess(&content, None).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(content.join("00555.md")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn process_assets_skips_only_generated_asset_markdown_file() {
+        let generated =
+            "+++\ntitle = \"Generated\"\n+++\nSee [missing](../../00678/assets/missing.pdf).\n";
+        let (_temp, content) = content_repo(&[
+            (
+                "00555/index.md",
+                proposal_markdown(555, None, "", "Source."),
+            ),
+            ("00555/assets/generated.md", generated.to_owned()),
+            ("00555/assets/fresh.md", "Fresh asset markdown.".to_owned()),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(content.join("00555/assets/generated.md")).unwrap(),
+            generated
+        );
+        assert!(
+            std::fs::read_to_string(content.join("00555/assets/fresh.md"))
+                .unwrap()
+                .starts_with("+++\n")
+        );
+    }
+
+    #[test]
+    fn preprocess_leaves_non_proposal_relative_asset_links_unchanged() {
+        let (_temp, content) = content_repo(&[(
+            "00555.md",
+            proposal_markdown(555, None, "", "See [local](./images/foo.pdf)."),
+        )]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("(./images/foo.pdf)"));
+    }
+
+    #[test]
+    fn preprocess_leaves_raw_html_asset_references_unchanged() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(
+                    555,
+                    None,
+                    "",
+                    r#"<img src="./00678/assets/foo.pdf" alt="asset">"#,
+                ),
+            ),
+            (
+                "00678/index.md",
+                proposal_markdown(678, None, "", "Target."),
+            ),
+            ("00678/assets/foo.pdf", "".to_owned()),
+        ]);
+
+        preprocess(&content, None).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains(r#"<img src="./00678/assets/foo.pdf" alt="asset">"#));
+    }
+
+    #[test]
+    fn targeted_preprocess_rewrites_selected_body_links_to_unselected_public_urls() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "", "See [ERC-678](/00678.md)."),
+            ),
+            (
+                "00678.md",
+                proposal_markdown(678, Some("ERC"), "", "Target."),
+            ),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("https://ercs.ethereum.org/ERCS/erc-678"));
+        assert!(!body.contains("@/00678.md"));
+    }
+
+    #[test]
+    fn targeted_preprocess_paths_rewrites_selected_dirty_markdown_with_plan() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(
+                    555,
+                    None,
+                    "requires: 155\n",
+                    "See [EIP-155](./00155.md#list-of-chain-id-s).",
+                ),
+            ),
+            ("00155.md", proposal_markdown(155, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess_paths(&content, &repo_paths(&["content/00555.md"]), Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        let requires = front_matter["extra"]["requires"].as_array().unwrap();
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-155#list-of-chain-id-s"));
+        assert_eq!(
+            requires[0].as_str().unwrap(),
+            "https://eips.ethereum.org/EIPS/eip-155"
+        );
+    }
+
+    #[test]
+    fn targeted_preprocess_paths_ignores_deleted_dirty_markdown() {
+        let (_temp, content) =
+            content_repo(&[("00555.md", proposal_markdown(555, None, "", "Selected."))]);
+        let plan = only_plan(&content, &[555]);
+        std::fs::remove_file(content.join("00555.md")).unwrap();
+
+        preprocess_paths(&content, &repo_paths(&["content/00555.md"]), Some(&plan)).unwrap();
+
+        assert!(!content.join("00555.md").exists());
+    }
+
+    #[test]
+    fn targeted_preprocess_rewrites_retained_non_proposal_links_to_public_urls() {
+        let (_temp, content) = content_repo(&[
+            (
+                "_index.md",
+                "---\ntitle: Home\n---\nSee [EIP-678](/00678.md).\n".to_owned(),
+            ),
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            ("00678.md", proposal_markdown(678, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("_index.md"));
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-678"));
+        assert!(!body.contains("@/00678.md"));
+    }
+
+    #[test]
+    fn preprocess_preserves_section_extra_front_matter_and_rewrites_body_links() {
+        let (_temp, content) = content_repo(&[
+            (
+                "_index.md",
+                r#"---
+title: Home
+extra:
+  homepage_badges:
+    - href: https://discord.gg/9FxN6CfaQR
+      image: https://dcbadge.limes.pink/api/server/9FxN6CfaQR?style=flat
+      alt: Badge for ERCRef Discord channel
+---
+See [EIP-678](/00678.md).
+"#
+                .to_owned(),
+            ),
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            ("00678.md", proposal_markdown(678, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let front_matter = rendered_front_matter(&content.join("_index.md"));
+        let badges = front_matter["extra"]["homepage_badges"].as_array().unwrap();
+        assert_eq!(
+            badges[0]["href"].as_str().unwrap(),
+            "https://discord.gg/9FxN6CfaQR"
+        );
+        let body = rendered_body(&content.join("_index.md"));
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-678"));
+        assert!(!body.contains("@/00678.md"));
+    }
+
+    #[test]
+    fn targeted_preprocess_paths_rewrites_retained_non_proposal_markdown_with_plan() {
+        let (_temp, content) = content_repo(&[
+            (
+                "_index.md",
+                "---\ntitle: Home\n---\nSee [EIP-678](/00678.md).\n".to_owned(),
+            ),
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            ("00678.md", proposal_markdown(678, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess_paths(&content, &repo_paths(&["content/_index.md"]), Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("_index.md"));
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-678"));
+        assert!(!body.contains("@/00678.md"));
+    }
+
+    #[test]
+    fn targeted_preprocess_paths_rewrites_selected_asset_markdown_with_plan() {
+        let (_temp, content) = content_repo(&[
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            (
+                "00555/assets/guide.md",
+                "See [EIP-678](/00678.md).\n".to_owned(),
+            ),
+            ("00555/assets/diagram.png", "image\n".to_owned()),
+            (
+                "00678.md",
+                proposal_markdown(678, Some("ERC"), "", "Unselected."),
+            ),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess_paths(
+            &content,
+            &repo_paths(&["content/00555/assets/guide.md"]),
+            Some(&plan),
+        )
+        .unwrap();
+
+        let body = rendered_body(&content.join("00555/assets/guide.md"));
+        assert!(body.contains("https://ercs.ethereum.org/ERCS/erc-678"));
+        assert_eq!(
+            std::fs::read_to_string(content.join("00555/assets/diagram.png")).unwrap(),
+            "image\n"
+        );
+    }
+
+    #[test]
+    fn targeted_preprocess_paths_ignores_deleted_dirty_asset_dir() {
+        let (_temp, content) = content_repo(&[
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            (
+                "00555/assets/guide.md",
+                "See [EIP-678](/00678.md).\n".to_owned(),
+            ),
+            ("00678.md", proposal_markdown(678, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+        std::fs::remove_dir_all(content.join("00555/assets")).unwrap();
+
+        preprocess_paths(
+            &content,
+            &repo_paths(&["content/00555/assets/guide.md"]),
+            Some(&plan),
+        )
+        .unwrap();
+
+        assert!(!content.join("00555/assets").exists());
+    }
+
+    #[test]
+    fn targeted_preprocess_preserves_query_and_fragment_on_external_links() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(
+                    555,
+                    None,
+                    "",
+                    "See [Fragment](./00155.md#list-of-chain-id-s).\nSee [Query](./00155.md?foo=bar#list-of-chain-id-s).",
+                ),
+            ),
+            (
+                "00155.md",
+                proposal_markdown(155, None, "", "Unselected."),
+            ),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-155#list-of-chain-id-s"));
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-155?foo=bar#list-of-chain-id-s"));
+    }
+
+    #[test]
+    fn targeted_preprocess_rewrites_requires_to_unselected_public_urls() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "requires: 678\n", "Selected."),
+            ),
+            (
+                "00678.md",
+                proposal_markdown(678, Some("ERC"), "", "Target."),
+            ),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        let requires = front_matter["extra"]["requires"].as_array().unwrap();
+        assert_eq!(
+            requires[0].as_str().unwrap(),
+            "https://ercs.ethereum.org/ERCS/erc-678"
+        );
+    }
+
+    #[test]
+    fn targeted_preprocess_keeps_internal_references_between_selected_proposals() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(555, None, "requires: 678\n", "See [EIP-678](/00678.md)."),
+            ),
+            (
+                "00678.md",
+                proposal_markdown(678, Some("ERC"), "", "Target."),
+            ),
+        ]);
+        let plan = only_plan(&content, &[555, 678]);
+
+        preprocess(&content, Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        let requires = front_matter["extra"]["requires"].as_array().unwrap();
+        assert!(body.contains("@/00678.md"));
+        assert_eq!(requires[0].as_str().unwrap(), "@/00678.md");
+    }
+
+    #[test]
+    fn targeted_preprocess_does_not_mask_missing_body_link_targets() {
+        let (_temp, content) = content_repo(&[(
+            "00555.md",
+            proposal_markdown(555, None, "", "See [Missing](/00678.md)."),
+        )]);
+        let plan = only_plan(&content, &[555]);
+
+        let error = Report::from_error(preprocess(&content, Some(&plan)).unwrap_err()).to_string();
+
+        assert!(error.contains("could not canonicalize"));
+        assert!(error.contains("00678.md"));
+    }
 }
