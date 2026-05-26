@@ -1,0 +1,558 @@
+#!/bin/sh
+
+set -eu
+
+DEFAULT_ACTIVE_REPO_URL=https://github.com/ethereum/EIPs.git
+
+say() {
+    printf '%s\n' "$*"
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+absolute_path() {
+    case "$1" in
+        /*)
+            printf '%s\n' "$1"
+            ;;
+        *)
+            printf '%s/%s\n' "$INVOCATION_DIR" "$1"
+            ;;
+    esac
+}
+
+ensure_active_repo_root() {
+    if [ "$ACTIVE_REPO_EXPLICIT" = true ]; then
+        if [ ! -d "$ACTIVE_REPO_ROOT" ]; then
+            die "configured ACTIVE_REPO_ROOT does not exist: $ACTIVE_REPO_ROOT. Fix ACTIVE_REPO_ROOT or unset it to let this script clone EIPs."
+        fi
+        if [ ! -e "$ACTIVE_REPO_ROOT/.git" ]; then
+            die "configured ACTIVE_REPO_ROOT is not a git checkout: $ACTIVE_REPO_ROOT. Fix ACTIVE_REPO_ROOT or unset it to let this script clone EIPs."
+        fi
+    else
+        if [ ! -e "$ACTIVE_REPO_ROOT" ]; then
+            command -v git >/dev/null 2>&1 || die "need git to clone default proposal repo from $DEFAULT_ACTIVE_REPO_URL"
+
+            say "No active proposal repo found at $ACTIVE_REPO_ROOT."
+            say "Cloning default proposal repo from $DEFAULT_ACTIVE_REPO_URL"
+            say "This may take a few minutes..."
+            if ! git clone "$DEFAULT_ACTIVE_REPO_URL" "$ACTIVE_REPO_ROOT"; then
+                die "failed to clone default proposal repo from $DEFAULT_ACTIVE_REPO_URL to $ACTIVE_REPO_ROOT"
+            fi
+            say "Cloned default proposal repo to $ACTIVE_REPO_ROOT"
+        fi
+
+        if [ ! -d "$ACTIVE_REPO_ROOT" ]; then
+            die "default active proposal repo path exists but is not a directory: $ACTIVE_REPO_ROOT. Remove it or set ACTIVE_REPO_ROOT."
+        fi
+        if [ ! -e "$ACTIVE_REPO_ROOT/.git" ]; then
+            die "default active proposal repo path exists but is not a git checkout: $ACTIVE_REPO_ROOT. Remove it or set ACTIVE_REPO_ROOT."
+        fi
+    fi
+
+    ACTIVE_REPO_ROOT=$(CDPATH= cd -- "$ACTIVE_REPO_ROOT" && pwd)
+}
+
+normalize_dir_for_path_compare() {
+    dir=$1
+    [ -n "$dir" ] || return 1
+
+    while [ "$dir" != "/" ] && [ "${dir%/}" != "$dir" ]; do
+        dir=${dir%/}
+    done
+
+    case "$dir" in
+        /*)
+            absolute_dir=$dir
+            ;;
+        *)
+            absolute_dir=$(pwd -P)/$dir
+            ;;
+    esac
+
+    if [ -d "$absolute_dir" ]; then
+        (CDPATH= cd -P -- "$absolute_dir" 2>/dev/null && pwd -P)
+    else
+        printf '%s\n' "$absolute_dir"
+    fi
+}
+
+move_dir_to_front_of_script_path() {
+    dir=$1
+    target=$(normalize_dir_for_path_compare "$dir") || return 1
+    new_path=
+    old_ifs=$IFS
+    IFS=:
+    for path_entry in ${PATH:-}; do
+        [ -n "$path_entry" ] || continue
+        candidate=$(normalize_dir_for_path_compare "$path_entry") || continue
+        if [ "$candidate" = "$target" ]; then
+            continue
+        fi
+
+        if [ -n "$new_path" ]; then
+            new_path=$new_path:$path_entry
+        else
+            new_path=$path_entry
+        fi
+    done
+    IFS=$old_ifs
+
+    if [ -n "$new_path" ]; then
+        updated_path=$dir:$new_path
+    else
+        updated_path=$dir
+    fi
+
+    if [ "${PATH:-}" != "$updated_path" ]; then
+        PATH=$updated_path
+        add_path_note "$dir"
+    fi
+}
+
+add_path_note() {
+    dir=$1
+    target=$(normalize_dir_for_path_compare "$dir") || return 1
+    old_ifs=$IFS
+    IFS='
+'
+    for path_note in $PATH_NOTES; do
+        candidate=$(normalize_dir_for_path_compare "$path_note") || continue
+        if [ "$candidate" = "$target" ]; then
+            IFS=$old_ifs
+            return 0
+        fi
+    done
+    IFS=$old_ifs
+
+    case "
+$PATH_NOTES
+" in
+        *"
+$dir
+"*)
+            return 0
+            ;;
+    esac
+
+    if [ -n "$PATH_NOTES" ]; then
+        PATH_NOTES=$PATH_NOTES'
+'$dir
+    else
+        PATH_NOTES=$dir
+    fi
+}
+
+pick_home_install_dir() {
+    [ -n "${HOME:-}" ] || return 1
+    dir=$HOME/.local/bin
+    mkdir -p "$dir" 2>/dev/null || return 1
+    [ -d "$dir" ] || return 1
+    [ -w "$dir" ] || return 1
+    printf '%s\n' "$dir"
+}
+
+pick_writable_path_dir() {
+    old_ifs=$IFS
+    IFS=:
+    for dir in ${PATH:-}; do
+        [ -n "$dir" ] || continue
+        [ -d "$dir" ] || continue
+        [ -w "$dir" ] || continue
+        printf '%s\n' "$dir"
+        IFS=$old_ifs
+        return 0
+    done
+    IFS=$old_ifs
+    return 1
+}
+
+pick_install_dir() {
+    if dir=$(pick_home_install_dir); then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+
+    pick_writable_path_dir
+}
+
+ensure_install_dir() {
+    [ -n "${INSTALL_DIR:-}" ] && return 0
+
+    INSTALL_DIR=$(pick_install_dir) || die "could not find a writable install directory"
+    move_dir_to_front_of_script_path "$INSTALL_DIR"
+}
+
+download() {
+    url=$1
+    destination=$2
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$destination"
+        return 0
+    fi
+
+    if command -v wget >/dev/null 2>&1; then
+        wget -qO "$destination" "$url"
+        return 0
+    fi
+
+    die "need curl or wget to download release binaries"
+}
+
+file_sha256() {
+    path=$1
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" | awk '{ print $1 }' | tr 'A-F' 'a-f'
+        return 0
+    fi
+
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$path" | awk '{ print $1 }' | tr 'A-F' 'a-f'
+        return 0
+    fi
+
+    if command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 -r "$path" | awk '{ print $1 }' | tr 'A-F' 'a-f'
+        return 0
+    fi
+
+    die "need sha256sum, shasum, or openssl to verify release checksums"
+}
+
+verify_file_hash() {
+    archive_path=$1
+    expected_hash=$2
+    archive_name=$3
+
+    actual_hash=$(file_sha256 "$archive_path")
+    [ "$actual_hash" = "$expected_hash" ] || die "checksum mismatch for $archive_name"
+}
+
+cleanup_tmpdir() {
+    if [ -n "${INSTALL_TMP_TO_CLEAN:-}" ]; then
+        rm -f "$INSTALL_TMP_TO_CLEAN"
+        INSTALL_TMP_TO_CLEAN=
+    fi
+    if [ -n "${TMPDIR_TO_CLEAN:-}" ]; then
+        rm -rf "$TMPDIR_TO_CLEAN"
+        TMPDIR_TO_CLEAN=
+    fi
+}
+
+cleanup_for_signal() {
+    cleanup_tmpdir
+    trap - EXIT INT TERM HUP QUIT
+    exit 1
+}
+
+set_cleanup_traps() {
+    trap cleanup_tmpdir EXIT
+    trap cleanup_for_signal INT TERM HUP QUIT
+}
+
+clear_cleanup_traps() {
+    trap - EXIT INT TERM HUP QUIT
+}
+
+unsupported_zola_platform() {
+    os=$1
+    arch=$2
+    die "Unsupported platform $os/$arch for automatic Zola install. Install Zola 0.22.1 manually from https://github.com/getzola/zola/releases and ensure it is on PATH."
+}
+
+is_linux_musl() {
+    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+        return 0
+    fi
+
+    set -- /lib/ld-musl-*.so.1
+    [ -e "$1" ]
+}
+
+select_zola_release() {
+    os=$(uname -s)
+    arch=$(uname -m)
+
+    case "$os" in
+        Linux)
+            if is_linux_musl; then
+                case "$arch" in
+                    x86_64)
+                        ZOLA_ARCHIVE_NAME=zola-v0.22.1-x86_64-unknown-linux-musl.tar.gz
+                        ZOLA_ARCHIVE_HASH=227df99b664421240a8ba77747067c51259b08159125d5603763b3b173b9a881
+                        ;;
+                    *)
+                        unsupported_zola_platform "$os" "$arch"
+                        ;;
+                esac
+            else
+                case "$arch" in
+                    x86_64)
+                        ZOLA_ARCHIVE_NAME=zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz
+                        ZOLA_ARCHIVE_HASH=0ca09aa40376aaa9ddfb512ff9ad963262ef95edb0d0f2d5ec6961b6f5cf22ef
+                        ;;
+                    aarch64|arm64)
+                        ZOLA_ARCHIVE_NAME=zola-v0.22.1-aarch64-unknown-linux-gnu.tar.gz
+                        ZOLA_ARCHIVE_HASH=8af437ec6352f33ccd24d7a1cfcb54a3db95d3ce376dc69525b4ef3fb6b8c1d1
+                        ;;
+                    *)
+                        unsupported_zola_platform "$os" "$arch"
+                        ;;
+                esac
+            fi
+            ;;
+        Darwin)
+            case "$arch" in
+                x86_64)
+                    ZOLA_ARCHIVE_NAME=zola-v0.22.1-x86_64-apple-darwin.tar.gz
+                    ZOLA_ARCHIVE_HASH=3898709e154ae0593933264a540c869348bdb10d7f1b03a42dfb78d63703b3b5
+                    ;;
+                arm64|aarch64)
+                    ZOLA_ARCHIVE_NAME=zola-v0.22.1-aarch64-apple-darwin.tar.gz
+                    ZOLA_ARCHIVE_HASH=46ac45a9e7628dba8593b124ee8794f4f9aa1c6b569918ecd4bbc5d0be190515
+                    ;;
+                *)
+                    unsupported_zola_platform "$os" "$arch"
+                    ;;
+            esac
+            ;;
+        *)
+            unsupported_zola_platform "$os" "$arch"
+            ;;
+    esac
+}
+
+parse_zola_version() {
+    output=$1
+
+    set -f
+    set -- $output
+    set +f
+    [ "$#" -ge 2 ] || return 1
+
+    ZOLA_FOUND_VERSION=$2
+    version_core=$(printf '%s\n' "$ZOLA_FOUND_VERSION" | sed -n 's/^\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p')
+    [ -n "$version_core" ] || return 1
+
+    set -- $version_core
+    ZOLA_VERSION_MAJOR=$1
+    ZOLA_VERSION_MINOR=$2
+    ZOLA_VERSION_PATCH=$3
+    ZOLA_VERSION_SUFFIX=$(printf '%s\n' "$ZOLA_FOUND_VERSION" | sed -n 's/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*//p')
+
+    return 0
+}
+
+zola_version_relation() {
+    if [ "$ZOLA_VERSION_MAJOR" -lt 0 ]; then
+        printf '%s\n' below
+    elif [ "$ZOLA_VERSION_MAJOR" -gt 0 ]; then
+        printf '%s\n' newer
+    elif [ "$ZOLA_VERSION_MINOR" -lt 22 ]; then
+        printf '%s\n' below
+    elif [ "$ZOLA_VERSION_MINOR" -gt 22 ]; then
+        printf '%s\n' newer
+    elif [ "$ZOLA_VERSION_PATCH" -lt 1 ]; then
+        printf '%s\n' below
+    elif [ "$ZOLA_VERSION_PATCH" -gt 1 ]; then
+        printf '%s\n' newer
+    elif [ -n "$ZOLA_VERSION_SUFFIX" ]; then
+        printf '%s\n' below
+    else
+        printf '%s\n' equal
+    fi
+}
+
+install_zola() {
+    command -v tar >/dev/null 2>&1 || die "need tar to unpack the zola release archive"
+    select_zola_release
+    ensure_install_dir
+
+    tmpdir=$(mktemp -d)
+    TMPDIR_TO_CLEAN=$tmpdir
+    set_cleanup_traps
+
+    archive_path=$tmpdir/$ZOLA_ARCHIVE_NAME
+    release_base_url=https://github.com/getzola/zola/releases/download/v0.22.1
+
+    say "Installing zola 0.22.1 from $release_base_url/$ZOLA_ARCHIVE_NAME"
+    download "$release_base_url/$ZOLA_ARCHIVE_NAME" "$archive_path"
+    verify_file_hash "$archive_path" "$ZOLA_ARCHIVE_HASH" "$ZOLA_ARCHIVE_NAME"
+
+    tar -xzf "$archive_path" -C "$tmpdir"
+    [ -f "$tmpdir/zola" ] || die "zola release archive did not contain zola"
+
+    install_tmp=$(mktemp "$INSTALL_DIR/.zola.XXXXXX") || die "could not create temporary zola install file in $INSTALL_DIR"
+    INSTALL_TMP_TO_CLEAN=$install_tmp
+    cp "$tmpdir/zola" "$install_tmp"
+    chmod +x "$install_tmp"
+    mv "$install_tmp" "$INSTALL_DIR/zola"
+    INSTALL_TMP_TO_CLEAN=
+
+    ZOLA=$INSTALL_DIR/zola
+    cleanup_tmpdir
+    clear_cleanup_traps
+}
+
+ensure_zola() {
+    if command -v zola >/dev/null 2>&1; then
+        ZOLA=$(command -v zola)
+    elif [ -n "${HOME:-}" ] && [ -x "$HOME/.local/bin/zola" ]; then
+        INSTALL_DIR=$HOME/.local/bin
+        ZOLA=$INSTALL_DIR/zola
+        move_dir_to_front_of_script_path "$INSTALL_DIR"
+    else
+        install_zola
+        return 0
+    fi
+
+    if [ -n "${ZOLA:-}" ]; then
+        zola_output=$("$ZOLA" --version 2>/dev/null || true)
+        if parse_zola_version "$zola_output"; then
+            relation=$(zola_version_relation)
+            case "$relation" in
+                below)
+                    say "Found zola $ZOLA_FOUND_VERSION below supported 0.22.1. Installing zola 0.22.1."
+                    install_zola
+                    ;;
+                equal)
+                    say "Using existing zola $ZOLA_FOUND_VERSION at $ZOLA"
+                    ;;
+                newer)
+                    say "Found zola $ZOLA_FOUND_VERSION. build-eips is tested with zola 0.22.1 or newer. Continuing with the installed version."
+                    ;;
+            esac
+        else
+            say "Found zola with unparseable version output. Installing zola 0.22.1."
+            install_zola
+        fi
+    fi
+}
+
+INCLUDE_TEMPLATE=false
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --template)
+            INCLUDE_TEMPLATE=true
+            ;;
+        -h|--help)
+            say "usage: $0 [--template]"
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+    shift
+done
+
+INVOCATION_DIR=$(pwd)
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PREPROCESSOR_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+INSTALL_DIR=
+PATH_NOTES=
+TMPDIR_TO_CLEAN=
+INSTALL_TMP_TO_CLEAN=
+
+if [ -n "${WORKSPACE_ROOT:-}" ]; then
+    WORKSPACE_ROOT=$(absolute_path "$WORKSPACE_ROOT")
+else
+    WORKSPACE_ROOT=$(CDPATH= cd -- "$PREPROCESSOR_ROOT/.." && pwd)
+fi
+if [ -d "$WORKSPACE_ROOT" ]; then
+    WORKSPACE_ROOT=$(CDPATH= cd -- "$WORKSPACE_ROOT" && pwd)
+fi
+
+if [ -n "${ACTIVE_REPO_ROOT:-}" ]; then
+    ACTIVE_REPO_EXPLICIT=true
+    ACTIVE_REPO_ROOT=$(absolute_path "$ACTIVE_REPO_ROOT")
+else
+    ACTIVE_REPO_EXPLICIT=false
+    ACTIVE_REPO_ROOT=$WORKSPACE_ROOT/EIPs
+fi
+
+ensure_active_repo_root
+BUILD_EIPS=$PREPROCESSOR_ROOT/target/debug/build-eips
+
+say "Workspace root: $WORKSPACE_ROOT"
+say "Active proposal repo: $ACTIVE_REPO_ROOT"
+say "Local build-eips: $BUILD_EIPS"
+
+command -v cargo >/dev/null 2>&1 || die "need cargo to build local build-eips. Install Rust from https://rustup.rs/ and re-run this script."
+
+say "Building local build-eips"
+if ! (CDPATH= cd -- "$PREPROCESSOR_ROOT" && cargo build); then
+    die "cargo build failed"
+fi
+
+[ -x "$BUILD_EIPS" ] || die "local build-eips was not built at $BUILD_EIPS"
+
+ensure_zola
+
+say "Bootstrapping local contributor workspace"
+if [ "$INCLUDE_TEMPLATE" = true ]; then
+    if ! "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" init "$WORKSPACE_ROOT" --platform-dev --template; then
+        die "build-eips init failed"
+    fi
+else
+    if ! "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" init "$WORKSPACE_ROOT" --platform-dev; then
+        die "build-eips init failed"
+    fi
+fi
+
+say "Running build-eips doctor"
+if ! "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" doctor; then
+    say "Warning: build-eips doctor reported issues above. Fix them before relying on local build-eips commands."
+fi
+
+WORKSPACE_DOC=$WORKSPACE_ROOT/WORKSPACE.md
+say ""
+if [ -f "$WORKSPACE_DOC" ]; then
+    say "Workspace docs: $WORKSPACE_DOC"
+else
+    say "Warning: workspace docs were not found at $WORKSPACE_DOC after build-eips init"
+fi
+
+if [ -n "$PATH_NOTES" ]; then
+    say ""
+    say "Updated PATH for this script process only:"
+    old_ifs=$IFS
+    IFS='
+'
+    for path_note in $PATH_NOTES; do
+        say "  $path_note"
+    done
+    say "To make this permanent in your shell, add:"
+    for path_note in $PATH_NOTES; do
+        say "  export PATH=$(shell_quote "$path_note"):\$PATH"
+    done
+    IFS=$old_ifs
+fi
+
+TARGET_DEBUG_DIR=$PREPROCESSOR_ROOT/target/debug
+
+say ""
+say "Next commands:"
+say "  cd $(shell_quote "$PREPROCESSOR_ROOT")"
+say "  cargo test"
+say "  $(shell_quote "$BUILD_EIPS") -C $(shell_quote "$ACTIVE_REPO_ROOT") check"
+say "  $(shell_quote "$BUILD_EIPS") -C $(shell_quote "$ACTIVE_REPO_ROOT") build"
+say "  $(shell_quote "$BUILD_EIPS") -C $(shell_quote "$ACTIVE_REPO_ROOT") serve"
+say ""
+say "For shorter one-off local commands in this shell, run:"
+say "  export PATH=$(shell_quote "$TARGET_DEBUG_DIR"):\$PATH"
+if [ "$INCLUDE_TEMPLATE" = true ]; then
+    say ""
+    say "Template check:"
+    say "  $(shell_quote "$BUILD_EIPS") -C $(shell_quote "$WORKSPACE_ROOT/template") check"
+fi
