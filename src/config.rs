@@ -8,7 +8,7 @@ use std::{borrow::Borrow, collections::HashMap, path::PathBuf, str::FromStr};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use snafu::{ensure, Backtrace, IntoError, ResultExt, Snafu};
+use snafu::{Backtrace, IntoError, OptionExt, ResultExt, Snafu};
 use url::Url;
 
 pub const MANIFEST_FILE: &str = "Build.toml";
@@ -35,13 +35,15 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "repo manifest `{}` is invalid: {reason}",
-        manifest_path.to_string_lossy()
+        "repo manifest `{}` is invalid: {}",
+        manifest_path.to_string_lossy(),
+        source,
     ))]
     Invalid {
         manifest_path: PathBuf,
-        reason: String,
         backtrace: Backtrace,
+        #[snafu(source(from(NoIdentityError, Box::new)))]
+        source: Box<dyn 'static + std::error::Error + Send>,
     },
 }
 
@@ -170,16 +172,12 @@ impl Manifest {
     }
 
     fn from_inner(manifest_path: PathBuf, inner: InnerManifest) -> Result<Self, Error> {
-        ensure!(
-            inner.locations.contains_key(&inner.name),
-            InvalidSnafu {
-                manifest_path: &manifest_path,
-                reason: format!(
-                    "this locations's name (`{}`) must appear in `locations`",
-                    inner.name
-                ),
-            }
-        );
+        if !inner.locations.contains_key(&inner.name) {
+            return NoIdentitySnafu { name: inner.name }
+                .fail()
+                .context(InvalidSnafu { manifest_path });
+        }
+
         Ok(Self {
             manifest_path,
             name: inner.name,
@@ -194,6 +192,43 @@ impl Manifest {
         })?;
 
         Self::from_inner(manifest_path, new)
+    }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(display("this locations's name (`{name}`) must appear in `locations`"))]
+pub struct NoIdentityError {
+    name: LocName,
+    backtrace: Backtrace,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepositoryUse {
+    pub title: String,
+    pub location: Location,
+    pub other_repos: HashMap<String, Url>,
+}
+
+impl TryFrom<Manifest> for RepositoryUse {
+    type Error = NoIdentityError;
+
+    fn try_from(mut value: Manifest) -> Result<Self, Self::Error> {
+        let location = value
+            .locations
+            .remove(&value.name)
+            .with_context(|| NoIdentitySnafu {
+                name: value.name.clone(),
+            })?;
+
+        Ok(Self {
+            title: value.name.into(),
+            location,
+            other_repos: value
+                .locations
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.repository))
+                .collect(),
+        })
     }
 }
 
@@ -286,6 +321,20 @@ commit = "aaa"
     }
 
     #[test]
+    fn repo_manifest_rejects_empty_names() {
+        let repo = TestRepo::new();
+        let manifest_path = repo.write_file(MANIFEST_FILE, r#"name = """#);
+
+        let Err(Error::Parse { source, .. }) = Manifest::load(&manifest_path) else {
+            panic!("expected parse error");
+        };
+
+        let reason = source.to_string();
+
+        assert!(reason.contains("invalid location name"));
+    }
+
+    #[test]
     fn repo_manifest_requires_self() {
         let repo = TestRepo::new();
         let manifest_path = repo.write_file(
@@ -299,9 +348,11 @@ commit = "aaa"
 "#,
         );
 
-        let Err(Error::Invalid { reason, .. }) = Manifest::load(&manifest_path) else {
+        let Err(Error::Invalid { source, .. }) = Manifest::load(&manifest_path) else {
             panic!("expected invalid error");
         };
+
+        let reason = source.to_string();
 
         assert!(reason.contains("this locations's name (`banana`) must appear in `locations`"));
     }

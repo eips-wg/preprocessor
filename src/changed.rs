@@ -13,7 +13,7 @@ use std::{
 
 use snafu::{ResultExt, Whatever};
 
-use crate::{cli::ChangedFormat, config::Manifest, git, layout::REPO_DIR};
+use crate::{cli::ChangedFormat, config::RepositoryUse, git, layout::REPO_DIR};
 
 pub(crate) fn is_proposal_path(mut p: PathBuf) -> bool {
     // Only lint `content/00001.md` and `content/00001/index.md` files.
@@ -55,13 +55,13 @@ pub(crate) fn is_proposal_path(mut p: PathBuf) -> bool {
 pub(crate) fn run(
     root_path: &Path,
     build_path: &Path,
-    manifest: Manifest,
+    repo_use: RepositoryUse,
     all: bool,
     format: &ChangedFormat,
 ) -> Result<(), Whatever> {
     let repo_path = build_path.join(REPO_DIR);
 
-    let both = git::Fresh::new(root_path, &repo_path, manifest)
+    let both = git::Fresh::new(root_path, &repo_path, repo_use)
         .whatever_context("initializing build repo")?
         .clone_src()
         .whatever_context("cloning source repo")?
