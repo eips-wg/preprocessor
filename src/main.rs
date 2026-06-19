@@ -28,8 +28,7 @@ use snafu::{Report, ResultExt, Whatever};
 
 use crate::{
     cli::{Args, Operation},
-    config::Manifest,
-    git::RepositoryUse,
+    config::{Manifest, RepositoryUse},
     layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
 };
 
@@ -81,7 +80,10 @@ impl Prepared {
         let content_path = repo_path.join(CONTENT_DIR);
         let output_path = build_path.join(OUTPUT_DIR);
 
-        let both = git::Fresh::new(&root_path, &repo_path, manifest.clone())
+        let repository_use = RepositoryUse::try_from(manifest.clone())
+            .whatever_context("cannot identify repository use")?;
+
+        let both = git::Fresh::new(&root_path, &repo_path, repository_use)
             .whatever_context("initializing build repo")?
             .clone_src()
             .whatever_context("cloning source repo")?
@@ -199,7 +201,9 @@ fn run() -> Result<(), Whatever> {
             Prepared::prepare(eipw, manifest, root_path, build_path)?.serve()?;
         }
         Operation::Changed { all, format } => {
-            changed::run(&root_path, &build_path, manifest, all, &format)?;
+            let repository_use = RepositoryUse::try_from(manifest)
+                .whatever_context("cannot identify repository use")?;
+            changed::run(&root_path, &build_path, repository_use, all, &format)?;
         }
     }
 

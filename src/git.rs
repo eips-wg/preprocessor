@@ -5,14 +5,13 @@
  */
 
 use std::{
-    collections::HashMap,
     ffi::OsStr,
     path::{absolute, Path, PathBuf},
 };
 
 use crate::{
     cache::Cache,
-    config::{LocName, Location, Manifest},
+    config::{NoIdentityError, RepositoryUse},
     progress::{Git, ProgressIteratorExt},
 };
 use git2::{
@@ -40,8 +39,11 @@ pub enum Error {
         source: git2::Error,
         backtrace: Backtrace,
     },
-    #[snafu(display("unable to determine which repository is being built (none match)"))]
-    NoIdentify { name: LocName, backtrace: Backtrace },
+    #[snafu(context(false))]
+    NoIdentity {
+        #[snafu(backtrace)]
+        source: NoIdentityError,
+    },
     #[snafu(display("working tree or index has uncommitted modifications"))]
     Dirty { backtrace: Backtrace },
     #[snafu(display("unable to update tree ({msg})"))]
@@ -51,33 +53,6 @@ pub enum Error {
         #[snafu(backtrace)]
         source: crate::cache::Error,
     },
-}
-
-#[derive(Debug, Clone)]
-pub struct RepositoryUse {
-    pub title: String,
-    pub location: Location,
-    pub other_repos: HashMap<String, Url>,
-}
-
-impl TryFrom<Manifest> for RepositoryUse {
-    type Error = Error;
-
-    fn try_from(mut value: Manifest) -> Result<Self, Self::Error> {
-        let Some(location) = value.locations.remove(&value.name) else {
-            return NoIdentifySnafu { name: value.name }.fail();
-        };
-
-        Ok(Self {
-            title: value.name.into(),
-            location,
-            other_repos: value
-                .locations
-                .into_iter()
-                .map(|(k, v)| (k.into(), v.repository))
-                .collect(),
-        })
-    }
 }
 
 pub fn check_dirty(root_path: &Path) -> Result<(), Error> {
@@ -139,10 +114,13 @@ pub struct Fresh {
 }
 
 impl Fresh {
-    pub fn new(root_path: &Path, build_path: &Path, manifest: Manifest) -> Result<Self, Error> {
+    pub fn new(
+        root_path: &Path,
+        build_path: &Path,
+        src_repo_use: RepositoryUse,
+    ) -> Result<Self, Error> {
         let root_path = absolute(root_path).context(IoSnafu { path: root_path })?;
         check_dirty(&root_path)?;
-        let src_repo_use = RepositoryUse::try_from(manifest)?;
         let src_repo_url = Url::from_directory_path(&root_path)
             .ok()
             .context(PathUrlSnafu { path: root_path })?;
