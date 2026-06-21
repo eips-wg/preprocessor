@@ -90,7 +90,10 @@ fn cli_only_requested(args: &Args) -> bool {
 }
 
 fn only_cli_is_applicable(args: &Args) -> bool {
-    matches!(args.operation, Operation::Build { .. }) && !args.operation.clean_cli_args().clean
+    matches!(
+        args.operation,
+        Operation::Build { .. } | Operation::Serve { .. }
+    ) && !args.operation.clean_cli_args().clean
         && !args.remote_siblings
 }
 
@@ -157,7 +160,10 @@ fn resolve_only_selection(
     settings: &ExecutionSettings,
     workspace_config: Option<&LoadedWorkspaceConfig>,
 ) -> Result<Option<BTreeSet<ProposalNumber>>, Whatever> {
-    let applicable = matches!(args.operation, Operation::Build { .. }) && settings.allow_dirty
+    let applicable = matches!(
+        args.operation,
+        Operation::Build { .. } | Operation::Serve { .. }
+    ) && settings.allow_dirty
         && settings.sibling == SelectedSource::WorkspaceLocal;
 
     if let Some(only) = args.operation.only_cli_args() {
@@ -386,3 +392,351 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use tempfile::TempDir;
+
+    use crate::{
+        cli::{Args, ServerCliArgs},
+        config::{self, LoadedWorkspaceConfig, ServerBinding},
+    };
+
+    use super::{
+        resolve_execution_settings, resolve_only_selection, resolve_server_binding,
+        resolve_theme_path, SelectedSource,
+    };
+
+    fn parse_args(arguments: &[&str]) -> Args {
+        Args::try_parse_from(arguments).unwrap()
+    }
+
+    fn load_workspace_config(contents: &str) -> LoadedWorkspaceConfig {
+        let workspace = TempDir::new().unwrap();
+        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
+        std::fs::write(&config_path, contents).unwrap();
+        LoadedWorkspaceConfig::from_path(&config_path).unwrap()
+    }
+
+    fn assert_theme_only_missing_workspace_error(arguments: &[&str]) {
+        let args = parse_args(arguments);
+        let error = resolve_theme_path(None, &args.operation).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains(
+            "the selected command requires a workspace config with a local theme, but no `.build-eips.toml` was found"
+        ));
+        assert!(message.contains("build-eips init <workspace-root>"));
+        assert!(!message.contains("theme and sibling"));
+        assert!(!message.contains(concat!("--remote", "-theme")));
+    }
+
+    fn assert_combined_missing_workspace_error(arguments: &[&str]) {
+        let args = parse_args(arguments);
+        let sibling_ids = vec!["ERCs".to_owned()];
+        let error = resolve_execution_settings(&args, &sibling_ids, None).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains(
+            "the selected command requires a workspace config with local theme and sibling sources"
+        ));
+        assert!(message.contains("no `.build-eips.toml` was found"));
+        assert!(message.contains("build-eips init <workspace-root>"));
+        assert!(message.contains(
+            "pass `--remote-siblings` if you intentionally want remote sibling proposal sources"
+        ));
+        assert!(!message.contains(concat!("--remote", "-theme")));
+        assert!(!message.contains("--profile"));
+        assert!(!message.contains("--allow-dirty"));
+        assert!(!message.contains("--theme <path>"));
+        assert!(!message.contains("--sibling-repo <path>"));
+    }
+
+    fn only_selection_for(
+        arguments: &[&str],
+        workspace_config: Option<&LoadedWorkspaceConfig>,
+    ) -> Option<Vec<u32>> {
+        let args = parse_args(arguments);
+        let settings = resolve_execution_settings(&args, &[], workspace_config).unwrap();
+        resolve_only_selection(&args, &settings, workspace_config)
+            .unwrap()
+            .map(|numbers| numbers.into_iter().map(|number| number.get()).collect())
+    }
+
+    #[test]
+    fn server_binding_resolution_uses_cli_config_then_defaults() {
+        assert_eq!(
+            resolve_server_binding(None, &ServerCliArgs::default()),
+            ServerBinding {
+                host: "127.0.0.1".to_owned(),
+                port: 1111,
+            }
+        );
+
+        let workspace_config = load_workspace_config(
+            r#"
+[server]
+host = "0.0.0.0"
+port = 8080
+"#,
+        );
+
+        assert_eq!(
+            resolve_server_binding(Some(&workspace_config), &ServerCliArgs::default()),
+            ServerBinding {
+                host: "0.0.0.0".to_owned(),
+                port: 8080,
+            }
+        );
+        assert_eq!(
+            resolve_server_binding(
+                Some(&workspace_config),
+                &ServerCliArgs {
+                    host: Some("127.0.0.1".to_owned()),
+                    port: Some(4000),
+                },
+            ),
+            ServerBinding {
+                host: "127.0.0.1".to_owned(),
+                port: 4000,
+            }
+        );
+        assert_eq!(
+            resolve_server_binding(
+                Some(&workspace_config),
+                &ServerCliArgs {
+                    host: None,
+                    port: Some(4000),
+                },
+            ),
+            ServerBinding {
+                host: "0.0.0.0".to_owned(),
+                port: 4000,
+            }
+        );
+    }
+
+    #[test]
+    fn non_theme_commands_do_not_require_workspace_local_theme() {
+        for arguments in [
+            &["build-eips", "changed"][..],
+            &["build-eips", "clean"][..],
+            &["build-eips", "preview"][..],
+            &["build-eips", "doctor"][..],
+            &["build-eips", "print", "schema-version"][..],
+        ] {
+            let args = parse_args(arguments);
+
+            assert!(resolve_theme_path(None, &args.operation).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn only_selection_dedupes_and_cli_replaces_config() {
+        let workspace_config = load_workspace_config(
+            r#"
+[render]
+only = [678, 555, 678]
+"#,
+        );
+
+        assert_eq!(
+            only_selection_for(&["build-eips", "build"], Some(&workspace_config)).unwrap(),
+            vec![555, 678]
+        );
+        assert_eq!(
+            only_selection_for(
+                &["build-eips", "build", "--only", "00555", "555", "897"],
+                Some(&workspace_config)
+            )
+            .unwrap(),
+            vec![555, 897]
+        );
+        assert_eq!(
+            only_selection_for(&["build-eips", "serve"], Some(&workspace_config)).unwrap(),
+            vec![555, 678]
+        );
+        assert_eq!(
+            only_selection_for(
+                &["build-eips", "serve", "--only", "00555", "555", "897"],
+                Some(&workspace_config)
+            )
+            .unwrap(),
+            vec![555, 897]
+        );
+    }
+
+    #[test]
+    fn missing_render_config_and_empty_only_disable_filtering() {
+        let missing_render = load_workspace_config("");
+        let missing_only = load_workspace_config("[render]\n");
+        let empty_only = load_workspace_config(
+            r#"
+[render]
+only = []
+"#,
+        );
+
+        assert!(only_selection_for(&["build-eips", "build"], Some(&missing_render)).is_none());
+        assert!(only_selection_for(&["build-eips", "build"], Some(&missing_only)).is_none());
+        assert!(only_selection_for(&["build-eips", "build"], Some(&empty_only)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&missing_render)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&missing_only)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&empty_only)).is_none());
+    }
+
+    #[test]
+    fn local_first_theme_commands_without_workspace_config_report_combined_setup_error() {
+        for arguments in [
+            &["build-eips", "build"][..],
+            &["build-eips", "serve"][..],
+            &["build-eips", "check"][..],
+            &["build-eips", "editorial", "lint", "content/0001.md"][..],
+            &["build-eips", "editorial", "check", "content/0001.md"][..],
+        ] {
+            assert_combined_missing_workspace_error(arguments);
+        }
+    }
+
+    #[test]
+    fn zero_sibling_local_first_without_workspace_config_only_requires_theme_resolution() {
+        let args = parse_args(&["build-eips", "build"]);
+        let settings = resolve_execution_settings(&args, &[], None).unwrap();
+
+        assert_eq!(settings.sibling, SelectedSource::WorkspaceLocal);
+        assert_theme_only_missing_workspace_error(&["build-eips", "build"]);
+    }
+
+    #[test]
+    fn remote_sibling_override_without_workspace_config_only_requires_theme_resolution() {
+        let args = parse_args(&["build-eips", "--remote-siblings", "build"]);
+        let sibling_ids = vec!["ERCs".to_owned()];
+        let settings = resolve_execution_settings(&args, &sibling_ids, None).unwrap();
+
+        assert_eq!(settings.sibling, SelectedSource::Remote);
+        assert_theme_only_missing_workspace_error(&["build-eips", "--remote-siblings", "build"]);
+    }
+
+    #[test]
+    fn missing_workspace_theme_path_reports_clear_error() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
+        std::fs::write(&config_path, "").unwrap();
+        let workspace_config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+        let args = parse_args(&["build-eips", "build"]);
+
+        let error = resolve_theme_path(Some(&workspace_config), &args.operation).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains(&format!(
+            "workspace-local theme path `{}` does not exist",
+            workspace
+                .path()
+                .join(config::DEFAULT_THEME_DIR)
+                .to_string_lossy()
+        )));
+        assert!(message.contains("build-eips init <workspace-root>"));
+    }
+}
+
+#[cfg(test)]
+mod active_manifest_clean_tests {
+    use std::path::Path;
+
+    use clap::Parser;
+    use git2::{IndexAddOption, Repository, Signature};
+    use tempfile::TempDir;
+
+    use crate::cli::Args;
+
+    use super::resolve_execution;
+
+    fn write_file(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn commit_all(repo: &Repository, message: &str) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("build-eips test", "build-eips@example.test").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &[])
+            .unwrap();
+    }
+
+    fn dirty_active_repo() -> TempDir {
+        let tempdir = TempDir::new().unwrap();
+        let repo = Repository::init(tempdir.path()).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+        write_file(
+            tempdir.path(),
+            "Build.toml",
+            r#"
+name = "EIPs"
+
+[locations.EIPs]
+repository = "https://example.test/EIPs.git"
+base-url = "https://example.test/EIPs/"
+
+[theme]
+repository = "https://example.test/theme.git"
+commit = "test-theme-commit"
+"#,
+        );
+        write_file(tempdir.path(), "content/00001.md", "# Proposal\n");
+        commit_all(&repo, "initial manifest");
+        write_file(
+            tempdir.path(),
+            "Build.toml",
+            r#"
+name = "EIPs"
+
+[locations.EIPs]
+repository = "https://example.test/EIPs.git"
+base-url = "https://dirty.example.test/EIPs/"
+
+[theme]
+repository = "https://example.test/theme.git"
+commit = "test-theme-commit"
+"#,
+        );
+        tempdir
+    }
+
+    fn assert_dirty_manifest_is_rejected(command: &[&str]) {
+        let tempdir = dirty_active_repo();
+        let root = tempdir.path().to_string_lossy().to_string();
+        let mut arguments = vec!["build-eips", "-C", root.as_str()];
+        arguments.extend_from_slice(command);
+        let args = Args::try_parse_from(arguments).unwrap();
+        let error = resolve_execution(&args).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("clean active-source mode requires a clean active checkout"));
+        assert!(format!("{error:?}").contains("Build.toml"));
+    }
+
+    #[test]
+    fn dirty_build_toml_is_rejected_for_clean_mode() {
+        assert_dirty_manifest_is_rejected(&["build", "--clean"]);
+    }
+
+    #[test]
+    fn dirty_build_toml_is_rejected_for_changed() {
+        assert_dirty_manifest_is_rejected(&["changed"]);
+    }
+
+    #[test]
+    fn dirty_build_toml_is_rejected_for_clean_remote_siblings() {
+        assert_dirty_manifest_is_rejected(&["--remote-siblings", "build", "--clean"]);
+    }
+}

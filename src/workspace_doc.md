@@ -12,3 +12,8 @@ build-eips init .. --template
 ```
 
 `init` preserves existing usable repositories and writes `.build-eips.toml` only when it is missing.
+
+
+## Render Specific Proposals Only
+
+Use `--only` with local dirty builds and serves to render selected proposal numbers. A workspace `[render]` section can provide the same defaults.

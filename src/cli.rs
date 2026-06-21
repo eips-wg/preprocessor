@@ -101,6 +101,9 @@ pub(crate) enum Operation {
 
         #[command(flatten)]
         clean: CleanCliArgs,
+
+        #[command(flatten)]
+        only: OnlyCliArgs,
     },
 
     /// Remove temporary and output files
@@ -195,7 +198,7 @@ impl Operation {
 
     pub(crate) fn only_cli_args(&self) -> Option<&OnlyCliArgs> {
         match self {
-            Self::Build { only, .. } => Some(only),
+            Self::Build { only, .. } | Self::Serve { only, .. } => Some(only),
             _ => None,
         }
     }
