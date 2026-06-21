@@ -15,6 +15,7 @@ mod github;
 mod layout;
 mod lint;
 mod markdown;
+mod pipeline;
 mod print;
 mod progress;
 mod workspace;
