@@ -1369,7 +1369,7 @@ mod tests {
         assert!(plan.should_sync_dirty_path(Path::new("content/00555.md")));
         assert!(plan.should_sync_dirty_path(Path::new("content/00555/assets/diagram.png")));
         assert!(plan.should_sync_dirty_path(Path::new("content/_index.md")));
-        assert!(plan.should_sync_dirty_path(Path::new(".build-eips.repo.toml")));
+        assert!(plan.should_sync_dirty_path(Path::new("Build.toml")));
         assert!(!plan.should_sync_dirty_path(Path::new("content/00678.md")));
         assert!(!plan.should_sync_dirty_path(Path::new("content/00678/assets/diagram.png")));
         assert!(!plan.should_sync_dirty_path(Path::new("content/00999.md")));

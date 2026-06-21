@@ -8,7 +8,7 @@ use eipw_lint::config::DefaultOptions;
 
 #[derive(Debug, clap::Args, Clone)]
 pub struct CmdArgs {
-    /// Thing to print
+    /// Linter metadata or configuration output to print
     what: What,
 }
 
