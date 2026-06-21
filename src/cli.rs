@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use url::Url;
 
-use crate::{lint, print};
+use crate::{lint, print, proposal::ProposalNumber};
 
 /// Build script for Ethereum EIPs and ERCs.
 #[derive(Parser, Debug)]
@@ -58,6 +58,13 @@ pub(crate) struct CleanCliArgs {
     pub(crate) clean: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+pub(crate) struct OnlyCliArgs {
+    /// Render only the selected proposal number(s)
+    #[arg(long, value_name = "NUMBER", value_parser = ProposalNumber::parse_cli_selector, num_args = 1..)]
+    pub(crate) only: Vec<ProposalNumber>,
+}
+
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum Operation {
     /// Print various useful things, like available lints
@@ -73,6 +80,9 @@ pub(crate) enum Operation {
 
         #[command(flatten)]
         clean: CleanCliArgs,
+
+        #[command(flatten)]
+        only: OnlyCliArgs,
     },
 
     /// Serve the existing built output without rebuilding it
@@ -180,6 +190,13 @@ impl Operation {
         match self {
             Self::Build { clean, .. } | Self::Serve { clean, .. } | Self::Check { clean } => clean.clone(),
             _ => CleanCliArgs::default(),
+        }
+    }
+
+    pub(crate) fn only_cli_args(&self) -> Option<&OnlyCliArgs> {
+        match self {
+            Self::Build { only, .. } => Some(only),
+            _ => None,
         }
     }
 

@@ -7,6 +7,7 @@
 //! Execution source and path resolution.
 
 use std::{
+    collections::BTreeSet,
     io::ErrorKind,
     path::{Path, PathBuf},
 };
@@ -21,6 +22,7 @@ use crate::{
     context::{resolve_input_path, root},
     git,
     layout::BUILD_DIR,
+    proposal::ProposalNumber,
 };
 
 #[derive(Debug, Clone)]
@@ -29,6 +31,7 @@ pub(crate) struct ResolvedExecution {
     pub(crate) build_path: PathBuf,
     pub(crate) repository_use: RepositoryUse,
     pub(crate) theme_path: Option<PathBuf>,
+    pub(crate) only: Option<BTreeSet<ProposalNumber>>,
     pub(crate) source_materialization: git::SourceMaterialization,
     pub(crate) server_binding: ServerBinding,
     pub(crate) base_url_override: Option<Url>,
@@ -77,6 +80,103 @@ fn remote_source_override(force_remote: bool) -> Option<SelectedSource> {
 
 fn format_sibling_ids(sibling_ids: &[String]) -> String {
     sibling_ids.join(", ")
+}
+
+fn cli_only_requested(args: &Args) -> bool {
+    args.operation
+        .only_cli_args()
+        .map(|only| !only.only.is_empty())
+        .unwrap_or(false)
+}
+
+fn only_cli_is_applicable(args: &Args) -> bool {
+    matches!(args.operation, Operation::Build { .. }) && !args.operation.clean_cli_args().clean
+        && !args.remote_siblings
+}
+
+pub(crate) fn resolve_execution_settings(
+    args: &Args,
+    sibling_ids: &[String],
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+) -> Result<ExecutionSettings, Whatever> {
+    let build_root = args
+        .build_root
+        .as_deref()
+        .map(resolve_input_path)
+        .transpose()?;
+    let sibling_override = remote_source_override(args.remote_siblings);
+    let clean = args.operation.clean_cli_args().clean;
+
+    if cli_only_requested(args) && !only_cli_is_applicable(args) {
+        snafu::whatever!("--only is supported only for local dirty build and serve commands");
+    }
+
+    let (allow_dirty, default_sibling) =
+        if args.operation.is_plain_site_command() || args.operation.is_editorial_command() {
+            (!clean, SelectedSource::WorkspaceLocal)
+        } else {
+            (false, SelectedSource::Remote)
+        };
+
+    let missing_theme = operation_requires_theme(&args.operation) && workspace_config.is_none();
+    let missing_sibling = sibling_override.is_none()
+        && default_sibling == SelectedSource::WorkspaceLocal
+        && !sibling_ids.is_empty()
+        && workspace_config.is_none();
+
+    match (missing_theme, missing_sibling) {
+        (true, true) => {
+            snafu::whatever!(
+                "the selected command requires a workspace config with local theme and sibling sources, but no `{}` was found.\n\nRun:\n  build-eips init <workspace-root>\n\nThen retry from that workspace, or pass `--remote-siblings` if you intentionally want remote sibling proposal sources.",
+                config::LOCAL_CONFIG_FILE
+            );
+        }
+        (false, true) => {
+            snafu::whatever!(
+                "the selected command requires workspace-local sibling sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--remote-siblings` for remote sibling source overrides",
+                config::LOCAL_CONFIG_FILE
+            );
+        }
+        _ => {}
+    }
+
+    Ok(ExecutionSettings {
+        build_root,
+        allow_dirty,
+        sibling: sibling_override.unwrap_or(default_sibling),
+    })
+}
+
+fn dedupe_only_numbers(numbers: &[ProposalNumber]) -> Option<BTreeSet<ProposalNumber>> {
+    let numbers = numbers.iter().copied().collect::<BTreeSet<_>>();
+    (!numbers.is_empty()).then_some(numbers)
+}
+
+fn resolve_only_selection(
+    args: &Args,
+    settings: &ExecutionSettings,
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+) -> Result<Option<BTreeSet<ProposalNumber>>, Whatever> {
+    let applicable = matches!(args.operation, Operation::Build { .. }) && settings.allow_dirty
+        && settings.sibling == SelectedSource::WorkspaceLocal;
+
+    if let Some(only) = args.operation.only_cli_args() {
+        if let Some(numbers) = dedupe_only_numbers(&only.only) {
+            if !applicable {
+                snafu::whatever!(
+                    "--only is supported only for local dirty build and serve commands"
+                );
+            }
+            return Ok(Some(numbers));
+        }
+    }
+
+    if !applicable {
+        return Ok(None);
+    }
+
+    Ok(workspace_config
+        .and_then(|workspace_config| dedupe_only_numbers(&workspace_config.render_settings().only)))
 }
 
 fn local_repo_url(path: &Path) -> Result<Url, Whatever> {
@@ -244,6 +344,7 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
     }
 
     let settings = resolve_execution_settings(args, &sibling_ids, workspace_config.as_ref())?;
+    let only = resolve_only_selection(args, &settings, workspace_config.as_ref())?;
     let theme_path = resolve_theme_path(workspace_config.as_ref(), &args.operation)?;
 
     let mut repository_use = active_repo.repository_use;
@@ -275,6 +376,7 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
         build_path,
         repository_use,
         theme_path,
+        only,
         source_materialization,
         server_binding: resolve_server_binding(
             workspace_config.as_ref(),

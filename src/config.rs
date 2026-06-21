@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use snafu::{Backtrace, IntoError, OptionExt, ResultExt, Snafu};
 use url::Url;
 
+use crate::proposal::ProposalNumber;
+
 pub const MANIFEST_FILE: &str = "Build.toml";
 pub const LOCAL_CONFIG_FILE: &str = ".build-eips.toml";
 pub const DEFAULT_BUILD_ROOT_BASE: &str = ".local-build";
@@ -320,6 +322,10 @@ pub struct WorkspaceConfig {
     /// Local rendered-site URL defaults for build and serve commands.
     #[serde(default)]
     pub site: SiteSettings,
+
+    /// Local render filtering defaults.
+    #[serde(default)]
+    pub render: RenderSettings,
 }
 
 impl WorkspaceConfig {
@@ -327,8 +333,18 @@ impl WorkspaceConfig {
         Self {
             server: ServerSettings::default(),
             site: SiteSettings::starter(),
+            render: RenderSettings::default(),
         }
     }
+}
+
+/// Local render filtering settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RenderSettings {
+    /// Proposal numbers to render for applicable local build and serve commands.
+    #[serde(default)]
+    pub only: Vec<ProposalNumber>,
 }
 
 /// Workspace-local bind address defaults for local server commands.
@@ -464,6 +480,10 @@ impl LoadedWorkspaceConfig {
 
     pub fn site_settings(&self) -> &SiteSettings {
         &self.config.site
+    }
+
+    pub fn render_settings(&self) -> &RenderSettings {
+        &self.config.render
     }
 
     pub fn local_theme_path(&self) -> PathBuf {
@@ -639,6 +659,8 @@ mod workspace_tests {
         ServerSettings, WorkspaceError, DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT,
         LOCAL_CONFIG_FILE,
     };
+    use crate::proposal::ProposalNumber;
+
     struct TestWorkspace {
         tempdir: TempDir,
     }
@@ -702,6 +724,8 @@ mod workspace_tests {
         assert!(original.contains("port = 1111"));
         assert!(original.contains("[site]"));
         assert!(original.contains("base_url = \"http://127.0.0.1:1111/\""));
+        assert!(original.contains("[render]"));
+        assert!(original.contains("only = []"));
         assert!(!original.contains("default_profile"));
         assert!(!original.contains("[profiles"));
     }
@@ -834,6 +858,72 @@ base_url = "http://127.0.0.1:1111"
 
         assert_eq!(config.server_settings(), &ServerSettings::default());
         assert!(config.site_settings().base_url.is_none());
+        assert!(config.render_settings().only.is_empty());
+    }
+
+    #[test]
+    fn parses_workspace_config_render_only_settings() {
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[render]
+only = [555, 678, 555]
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(
+            config.render_settings().only,
+            vec![
+                ProposalNumber::from_u32(555).unwrap(),
+                ProposalNumber::from_u32(678).unwrap(),
+                ProposalNumber::from_u32(555).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_render_missing_only_and_empty_only_disable_filtering() {
+        let cases = [
+            ("missing render", ""),
+            ("missing only", "[render]\n"),
+            ("empty only", "[render]\nonly = []\n"),
+        ];
+
+        for (name, contents) in cases {
+            let workspace = TestWorkspace::new();
+            let config_path = workspace.write_file(LOCAL_CONFIG_FILE, contents);
+            let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+            assert!(
+                config.render_settings().only.is_empty(),
+                "expected `{name}` to disable render filtering"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_config_render_only_rejects_non_positive_and_non_integer_values() {
+        let cases = [
+            ("zero", "only = [0]"),
+            ("negative", "only = [-555]"),
+            ("quoted", "only = [\"555\"]"),
+            ("overflow", "only = [4294967296]"),
+        ];
+
+        for (name, contents) in cases {
+            let workspace = TestWorkspace::new();
+            let config_path =
+                workspace.write_file(LOCAL_CONFIG_FILE, &format!("[render]\n{contents}\n"));
+            let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+
+            assert!(
+                matches!(error, WorkspaceError::Parse { .. }),
+                "expected `{name}` render only config to fail, got {error:?}"
+            );
+        }
     }
 
     #[test]
