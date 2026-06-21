@@ -34,6 +34,17 @@ pub(crate) struct Args {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+pub(crate) struct ServerCliArgs {
+    /// Host/interface for the local server to bind
+    #[arg(long)]
+    pub(crate) host: Option<String>,
+
+    /// Port for the local server to bind
+    #[arg(long)]
+    pub(crate) port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
 pub(crate) struct BaseUrlCliArgs {
     /// Override the rendered-site base URL for this command
     #[arg(long, value_parser = clap::value_parser!(Url))]
@@ -66,6 +77,9 @@ pub(crate) enum Operation {
 
     /// Build the project and launch a web server to preview it
     Serve {
+        #[command(flatten)]
+        server: ServerCliArgs,
+
         #[command(flatten)]
         base_url: BaseUrlCliArgs,
 
@@ -115,6 +129,13 @@ pub(crate) enum RuntimeOperation {
 }
 
 impl Operation {
+    pub(crate) fn server_cli_args(&self) -> ServerCliArgs {
+        match self {
+            Self::Serve { server, .. } => server.clone(),
+            _ => ServerCliArgs::default(),
+        }
+    }
+
     pub(crate) fn base_url_cli_args(&self) -> BaseUrlCliArgs {
         match self {
             Self::Build { base_url, .. } | Self::Serve { base_url, .. } => base_url.clone(),

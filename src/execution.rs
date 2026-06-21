@@ -16,8 +16,8 @@ use snafu::{OptionExt, ResultExt, Whatever};
 use url::Url;
 
 use crate::{
-    cli::{Args, Operation},
-    config::{self, ActiveRepo, LoadedWorkspaceConfig, RepositoryUse},
+    cli::{Args, Operation, ServerCliArgs},
+    config::{self, ActiveRepo, LoadedWorkspaceConfig, RepositoryUse, ServerBinding},
     context::{resolve_input_path, root},
     git,
     layout::BUILD_DIR,
@@ -30,6 +30,7 @@ pub(crate) struct ResolvedExecution {
     pub(crate) repository_use: RepositoryUse,
     pub(crate) theme_path: Option<PathBuf>,
     pub(crate) source_materialization: git::SourceMaterialization,
+    pub(crate) server_binding: ServerBinding,
     pub(crate) base_url_override: Option<Url>,
 }
 
@@ -187,6 +188,25 @@ fn resolve_theme_path(
     }
 }
 
+fn resolve_server_binding(
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+    server_cli: &ServerCliArgs,
+) -> ServerBinding {
+    let mut binding = workspace_config
+        .map(|workspace_config| ServerBinding::from(workspace_config.server_settings()))
+        .unwrap_or_default();
+
+    if let Some(host) = &server_cli.host {
+        binding.host = host.clone();
+    }
+
+    if let Some(port) = server_cli.port {
+        binding.port = port;
+    }
+
+    binding
+}
+
 fn resolve_base_url_override(
     args: &Args,
     workspace_config: Option<&LoadedWorkspaceConfig>,
@@ -256,6 +276,10 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
         repository_use,
         theme_path,
         source_materialization,
+        server_binding: resolve_server_binding(
+            workspace_config.as_ref(),
+            &args.operation.server_cli_args(),
+        ),
         base_url_override,
     })
 }

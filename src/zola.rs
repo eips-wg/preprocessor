@@ -241,3 +241,187 @@ where
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::OsString,
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, ExitStatus},
+    };
+
+    use crate::{
+        config::ServerBinding,
+        layout::{mounted_theme_path, theme_config_path},
+    };
+    use tempfile::TempDir;
+
+    use super::{find_zola, mount_theme, serve_args};
+
+    fn write_file(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+
+    fn zola_build_status(project_root: &Path) -> ExitStatus {
+        Command::new("zola")
+            .arg("build")
+            .arg("--drafts")
+            .current_dir(project_root)
+            .status()
+            .unwrap()
+    }
+
+    #[test]
+    fn zola_rejects_missing_internal_links_but_accepts_external_links() {
+        if find_zola().is_err() {
+            eprintln!("skipping zola link behavior fixture because zola is not installed");
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let internal = temp.path().join("internal");
+        write_file(
+            &internal,
+            "config.toml",
+            "base_url = \"https://example.test\"\n",
+        );
+        write_file(
+            &internal,
+            "content/_index.md",
+            "+++\ntitle = \"Internal\"\n+++\n[Missing](@/missing.md)\n",
+        );
+        let external = temp.path().join("external");
+        write_file(
+            &external,
+            "config.toml",
+            "base_url = \"https://example.test\"\n",
+        );
+        write_file(
+            &external,
+            "content/_index.md",
+            "+++\ntitle = \"External\"\n+++\n[External](https://eips.ethereum.org/EIPS/eip-1)\n",
+        );
+
+        assert!(!zola_build_status(&internal).success());
+        assert!(zola_build_status(&external).success());
+    }
+
+    #[test]
+    fn serve_args_include_configured_interface_and_port() {
+        let server_binding = ServerBinding {
+            host: "0.0.0.0".to_owned(),
+            port: 8080,
+        };
+
+        assert_eq!(
+            serve_args(&server_binding, Path::new("/tmp/build-output"), None),
+            vec![
+                OsString::from("serve"),
+                OsString::from("--drafts"),
+                OsString::from("--fast"),
+                OsString::from("--force"),
+                OsString::from("--interface"),
+                OsString::from("0.0.0.0"),
+                OsString::from("--port"),
+                OsString::from("8080"),
+                OsString::from("-o"),
+                OsString::from("/tmp/build-output"),
+            ]
+        );
+    }
+
+    #[test]
+    fn serve_args_include_base_url_override_when_present() {
+        let server_binding = ServerBinding {
+            host: "127.0.0.1".to_owned(),
+            port: 1111,
+        };
+        let base_url = "http://127.0.0.1:1111".parse().unwrap();
+
+        assert_eq!(
+            serve_args(
+                &server_binding,
+                Path::new("/tmp/build-output"),
+                Some(&base_url)
+            ),
+            vec![
+                OsString::from("serve"),
+                OsString::from("--drafts"),
+                OsString::from("--fast"),
+                OsString::from("--force"),
+                OsString::from("--interface"),
+                OsString::from("127.0.0.1"),
+                OsString::from("--port"),
+                OsString::from("1111"),
+                OsString::from("-u"),
+                OsString::from("http://127.0.0.1:1111/"),
+                OsString::from("--no-port-append"),
+                OsString::from("-o"),
+                OsString::from("/tmp/build-output"),
+            ]
+        );
+    }
+
+    #[test]
+    fn mounted_theme_paths_are_under_project_themes_directory() {
+        let project_path = PathBuf::from("/tmp/project");
+        let mounted_theme = mounted_theme_path(&project_path);
+
+        assert_eq!(
+            mounted_theme,
+            PathBuf::from("/tmp/project/themes/eips-theme")
+        );
+        assert_eq!(
+            theme_config_path(&mounted_theme),
+            PathBuf::from("/tmp/project/themes/eips-theme/config/zola.toml")
+        );
+    }
+
+    #[test]
+    fn mount_theme_does_not_symlink_mounted_local_theme_onto_itself() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path().join("repo");
+        let mounted_theme = mounted_theme_path(&project_path);
+        fs::create_dir_all(mounted_theme.join("config")).unwrap();
+        fs::write(mounted_theme.join("config/zola.toml"), "title = 'local'\n").unwrap();
+
+        let result = mount_theme(&mounted_theme, &project_path).unwrap();
+
+        assert_eq!(result, mounted_theme);
+        assert!(mounted_theme.join("config/zola.toml").is_file());
+        assert!(!fs::symlink_metadata(&mounted_theme)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn theme_mount_replaces_prior_real_mounted_theme_directory() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path().join("repo");
+        let source_theme = temp.path().join("source-theme");
+        fs::create_dir_all(source_theme.join("config")).unwrap();
+        fs::write(source_theme.join("config/zola.toml"), "title = 'source'\n").unwrap();
+
+        let mounted_theme = mounted_theme_path(&project_path);
+        fs::create_dir_all(&mounted_theme).unwrap();
+        fs::write(mounted_theme.join("stale.txt"), "stale").unwrap();
+
+        let result = mount_theme(&source_theme, &project_path).unwrap();
+
+        assert_eq!(result, mounted_theme);
+        assert!(fs::symlink_metadata(&mounted_theme)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(theme_config_path(&mounted_theme)).unwrap(),
+            "title = 'source'\n"
+        );
+    }
+}
