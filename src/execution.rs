@@ -7,6 +7,7 @@
 //! Execution source and path resolution.
 
 use std::{
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
@@ -27,8 +28,17 @@ pub(crate) struct ResolvedExecution {
     pub(crate) root_path: PathBuf,
     pub(crate) build_path: PathBuf,
     pub(crate) repository_use: RepositoryUse,
+    pub(crate) theme_path: Option<PathBuf>,
     pub(crate) source_materialization: git::SourceMaterialization,
     pub(crate) base_url_override: Option<Url>,
+}
+
+impl ResolvedExecution {
+    pub(crate) fn theme_path(&self) -> Result<&Path, Whatever> {
+        self.theme_path
+            .as_deref()
+            .whatever_context("the selected command requires a resolved workspace-local theme")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +144,49 @@ fn build_path(
         .unwrap_or_else(|| root_path.join(BUILD_DIR))
 }
 
+fn operation_requires_theme(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Build { .. }
+            | Operation::Serve { .. }
+            | Operation::Check { .. }
+            | Operation::Editorial { .. }
+    )
+}
+
+fn resolve_theme_path(
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+    operation: &Operation,
+) -> Result<Option<PathBuf>, Whatever> {
+    if !operation_requires_theme(operation) {
+        return Ok(None);
+    }
+
+    let workspace_config = workspace_config.with_whatever_context(|| {
+        format!(
+            "the selected command requires a workspace config with a local theme, but no `{}` was found.\n\nRun:\n  build-eips init <workspace-root>\n\nThen retry from that workspace.",
+            config::LOCAL_CONFIG_FILE
+        )
+    })?;
+    let theme_path = workspace_config.local_theme_path();
+
+    match std::fs::metadata(&theme_path) {
+        Ok(_) => Ok(Some(theme_path)),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            snafu::whatever!(
+                "workspace-local theme path `{}` does not exist.\n\nRun `build-eips init <workspace-root>` to bootstrap the workspace, or\nclone/update the theme repository at the configured path.",
+                theme_path.to_string_lossy()
+            );
+        }
+        Err(error) => {
+            snafu::whatever!(
+                "unable to access workspace-local theme path `{}`: {error}",
+                theme_path.to_string_lossy()
+            );
+        }
+    }
+}
+
 fn resolve_base_url_override(
     args: &Args,
     workspace_config: Option<&LoadedWorkspaceConfig>,
@@ -171,6 +224,8 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
     }
 
     let settings = resolve_execution_settings(args, &sibling_ids, workspace_config.as_ref())?;
+    let theme_path = resolve_theme_path(workspace_config.as_ref(), &args.operation)?;
+
     let mut repository_use = active_repo.repository_use;
     apply_sibling_sources(
         &mut repository_use,
@@ -199,6 +254,7 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
         root_path,
         build_path,
         repository_use,
+        theme_path,
         source_materialization,
         base_url_override,
     })

@@ -15,7 +15,10 @@ use semver::Version;
 use snafu::{ensure, Backtrace, IntoError, Report, ResultExt, Snafu};
 use url::Url;
 
-use crate::{cache::Cache, git};
+use crate::{
+    config::ServerBinding,
+    layout::{mounted_theme_path, theme_config_path},
+};
 
 const MINIMUM_VERSION: Version = Version::new(0, 22, 1);
 
@@ -38,13 +41,29 @@ fn symlink_dir(original: &Path, link: &Path) -> Result<(), std::io::Error> {
 }
 
 fn force_symlink_dir(original: &Path, link: &Path) -> Result<(), std::io::Error> {
-    match std::fs::remove_file(link) {
-        Ok(()) => (),
+    match std::fs::symlink_metadata(link) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(link)?;
+        }
+        Ok(_) => std::fs::remove_file(link)?,
         Err(e) if e.kind() == ErrorKind::NotFound => (),
         Err(e) => return Err(e),
     }
 
     symlink_dir(original, link)
+}
+
+fn mount_theme(theme_dir: &Path, project_path: &Path) -> Result<PathBuf, std::io::Error> {
+    let mounted_theme_path = mounted_theme_path(project_path);
+    if theme_dir == mounted_theme_path {
+        return Ok(mounted_theme_path);
+    }
+
+    if let Some(parent) = mounted_theme_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    force_symlink_dir(theme_dir, &mounted_theme_path)?;
+    Ok(mounted_theme_path)
 }
 
 #[derive(Debug, Snafu)]
@@ -71,11 +90,6 @@ pub enum Error {
         backtrace: Backtrace,
         source: std::io::Error,
     },
-    #[snafu(context(false))]
-    Git {
-        #[snafu(backtrace)]
-        source: git::Error,
-    },
 }
 
 pub fn find_zola() -> Result<(), Error> {
@@ -96,21 +110,14 @@ pub fn find_zola() -> Result<(), Error> {
     Ok(())
 }
 
-pub fn check(
-    theme_repo: &str,
-    theme_rev: &str,
-    cache: &Cache,
-    project_path: &Path,
-) -> Result<(), Error> {
+pub fn check(theme_dir: &Path, project_path: &Path) -> Result<(), Error> {
     let args = ["check", "--drafts", "--skip-external-links"];
-    spawn_log(theme_repo, theme_rev, cache, project_path, args)?;
+    spawn_log(theme_dir, project_path, args)?;
     Ok(())
 }
 
 pub fn build(
-    theme_repo: &str,
-    theme_rev: &str,
-    cache: &Cache,
+    theme_dir: &Path,
     project_path: &Path,
     output_path: &Path,
     base_url: &str,
@@ -120,7 +127,7 @@ pub fn build(
         .map(OsString::from)
         .into_iter()
         .chain(std::iter::once(output_path.into()));
-    spawn_log(theme_repo, theme_rev, cache, project_path, args)?;
+    spawn_log(theme_dir, project_path, args)?;
     if let Ok(url) = Url::from_file_path(output_path) {
         info!("HTML output to: {}", url);
     }
@@ -128,21 +135,48 @@ pub fn build(
 }
 
 pub fn serve(
-    theme_repo: &str,
-    theme_rev: &str,
-    cache: &Cache,
+    theme_dir: &Path,
     project_path: &Path,
     output_path: &Path,
+    server_binding: &ServerBinding,
+    base_url_override: Option<&Url>,
 ) -> Result<(), Error> {
     // TODO: Properly kill the child process when we receive ctrl-c.
-    warn!("live reloading is not implemented");
     remove_output(output_path);
-    let args = ["serve", "--drafts", "-o"]
-        .map(OsString::from)
-        .into_iter()
-        .chain(std::iter::once(output_path.into()));
-    spawn_log(theme_repo, theme_rev, cache, project_path, args)?;
+    let args = serve_args(server_binding, output_path, base_url_override);
+    spawn_log(theme_dir, project_path, args)?;
     Ok(())
+}
+
+fn serve_args(
+    server_binding: &ServerBinding,
+    output_path: &Path,
+    base_url_override: Option<&Url>,
+) -> Vec<OsString> {
+    let mut args = [
+        "serve",
+        "--drafts",
+        "--fast",
+        "--force",
+        "--interface",
+        server_binding.host.as_str(),
+        "--port",
+    ]
+    .map(OsString::from)
+    .to_vec();
+
+    args.push(OsString::from(server_binding.port.to_string()));
+
+    if let Some(base_url) = base_url_override {
+        args.extend([
+            OsString::from("-u"),
+            OsString::from(base_url.as_str()),
+            OsString::from("--no-port-append"),
+        ]);
+    }
+
+    args.extend([OsString::from("-o"), output_path.as_os_str().to_os_string()]);
+    args
 }
 
 fn remove_output(output_path: &Path) {
@@ -154,13 +188,7 @@ fn remove_output(output_path: &Path) {
     }
 }
 
-fn spawn_log<U, I>(
-    theme_repo: &str,
-    theme_rev: &str,
-    cache: &Cache,
-    project_path: &Path,
-    args: U,
-) -> Result<(), Error>
+fn spawn_log<U, I>(theme_dir: &Path, project_path: &Path, args: U) -> Result<(), Error>
 where
     U: IntoIterator<Item = I>,
     I: Into<OsString>,
@@ -173,18 +201,9 @@ where
 
     find_zola()?;
 
-    let theme_dir = cache.repo(theme_repo, theme_rev)?;
-
-    let mut themes_dir = project_path.join("themes");
-    if let Err(e) = std::fs::create_dir(&themes_dir) {
-        debug!("got while creating themes dir: {}", Report::from_error(e));
-    }
-    themes_dir.push("eips-theme");
-    force_symlink_dir(&theme_dir, &themes_dir).context(FsSnafu { path: &themes_dir })?;
-
-    let config_path: PathBuf = [&theme_dir, Path::new("config"), Path::new("zola.toml")]
-        .iter()
-        .collect();
+    let mounted_theme_path =
+        mount_theme(theme_dir, project_path).context(FsSnafu { path: theme_dir })?;
+    let config_path = theme_config_path(&mounted_theme_path);
 
     let prefix = [OsString::from("-c"), config_path.into()].into_iter();
     let args = prefix.chain(args.into_iter().map(Into::into));
@@ -221,3 +240,4 @@ where
 
     Ok(())
 }
+
