@@ -56,3 +56,8 @@ cargo install --git https://github.com/ethereum/build-eips.git
 
 [`ethereum/EIPs`]: https://github.com/ethereum/EIPs/
 [`ethereum/ERCs`]: https://github.com/ethereum/ERCs/
+
+
+## Workspace Bootstrap
+
+Use `scripts/dev-setup` or `scripts/dev-setup.ps1` to build the local binary, prepare a contributor workspace, and run `doctor`.
