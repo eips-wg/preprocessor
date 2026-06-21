@@ -92,6 +92,58 @@ pub fn repository_available(path: &Path) -> bool {
     git2::Repository::open(path).is_ok()
 }
 
+/// Open a non-bare repository with a resolvable HEAD without modifying it.
+pub fn open_usable_repository(path: &Path) -> Result<git2::Repository, Error> {
+    let repository =
+        git2::Repository::open_ext(path, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr])
+            .context(GitSnafu {
+                what: "open workspace repository",
+            })?;
+    ensure_usable_workspace_repository(&repository, path)?;
+    Ok(repository)
+}
+
+/// Return the commit currently checked out by a repository.
+pub fn head_commit_id(repository: &git2::Repository) -> Result<Oid, Error> {
+    let head = repository.head().context(GitSnafu {
+        what: "read repository HEAD",
+    })?;
+    let commit = head.peel_to_commit().context(GitSnafu {
+        what: "resolve repository HEAD commit",
+    })?;
+    Ok(commit.id())
+}
+
+/// Resolve a local commit-ish to its commit object ID without fetching.
+pub fn resolve_commit_id(repository: &git2::Repository, commit: &str) -> Result<Oid, Error> {
+    let object = repository.revparse_single(commit).context(GitSnafu {
+        what: "resolve local commit-ish",
+    })?;
+    let commit = object.peel_to_commit().context(GitSnafu {
+        what: "resolve local commit object",
+    })?;
+    Ok(commit.id())
+}
+
+/// Return configured remote URLs without fetching or otherwise modifying a repository.
+pub fn remote_urls(repository: &git2::Repository) -> Result<Vec<String>, Error> {
+    let names = repository.remotes().context(GitSnafu {
+        what: "list repository remotes",
+    })?;
+
+    names
+        .iter()
+        .flatten()
+        .map(|name| {
+            let remote = repository.find_remote(name).context(GitSnafu {
+                what: "read repository remote",
+            })?;
+            Ok(remote.url().map(ToOwned::to_owned))
+        })
+        .collect::<Result<Vec<_>, Error>>()
+        .map(|urls| urls.into_iter().flatten().collect())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloneOutcome {
     Fresh,
@@ -1212,3 +1264,327 @@ fn open_or_init(dir: &Path) -> Result<git2::Repository, Error> {
     Ok(repo)
 }
 
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use git2::{IndexAddOption, Repository, Signature};
+    use tempfile::TempDir;
+
+    use super::{
+        checkout_fresh_clone_at_commit, materialize_working_tree, sync_working_tree_paths,
+        tracked_working_tree_paths, Fresh, SourceMaterialization,
+    };
+    use crate::config::{Location, RepositoryUse};
+
+    fn file_url(path: &Path) -> url::Url {
+        url::Url::from_directory_path(path).unwrap()
+    }
+
+    fn write_file(root: &Path, relative: impl AsRef<Path>, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn commit_all(repo: &Repository, message: &str) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("build-eips test", "build-eips@example.test").unwrap();
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).unwrap())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .unwrap();
+    }
+
+    fn init_repo(path: &Path, files: &[(&str, &str)]) -> Repository {
+        std::fs::create_dir_all(path).unwrap();
+        let repo = Repository::init(path).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+        for (relative, contents) in files {
+            write_file(path, relative, contents);
+        }
+        commit_all(&repo, "initial");
+        repo
+    }
+
+    fn stage_path(repo: &Repository, relative: &str) {
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(relative)).unwrap();
+        index.write().unwrap();
+    }
+
+    #[test]
+    fn checkout_fresh_clone_missing_destination_returns_error() {
+        let temp = TempDir::new().unwrap();
+        let destination = temp.path().join("missing");
+        let error =
+            checkout_fresh_clone_at_commit(&destination, "https://example.test/theme.git", "main")
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::Error::MissingFreshWorkspaceRepository { .. }
+        ));
+    }
+
+    #[test]
+    fn checkout_fresh_clone_fetches_missing_manifest_commit() {
+        let temp = TempDir::new().unwrap();
+        let source_path = temp.path().join("source");
+        let source = init_repo(
+            &source_path,
+            &[(
+                "README.md",
+                "source
+",
+            )],
+        );
+        write_file(
+            &source_path,
+            "PINNED.md",
+            "pinned
+",
+        );
+        commit_all(&source, "pinned commit");
+        let pinned_commit = source.head().unwrap().target().unwrap().to_string();
+        let destination = temp.path().join("destination");
+        init_repo(
+            &destination,
+            &[(
+                "README.md",
+                "destination
+",
+            )],
+        );
+
+        checkout_fresh_clone_at_commit(
+            &destination,
+            file_url(&source_path).as_str(),
+            &pinned_commit,
+        )
+        .unwrap();
+
+        let destination_repo = Repository::open(&destination).unwrap();
+        assert_eq!(
+            destination_repo
+                .head()
+                .unwrap()
+                .target()
+                .unwrap()
+                .to_string(),
+            pinned_commit
+        );
+        assert!(destination_repo
+            .find_reference("refs/build-eips/theme-pin")
+            .is_ok());
+        assert_eq!(
+            std::fs::read_to_string(destination.join("PINNED.md")).unwrap(),
+            "pinned
+"
+        );
+    }
+
+    #[test]
+    fn merge_skips_sibling_homepage_and_keeps_sibling_proposals() {
+        let temp = TempDir::new().unwrap();
+        let active = temp.path().join("active");
+        let sibling = temp.path().join("sibling");
+        let prepared = temp.path().join("prepared");
+
+        init_repo(
+            &active,
+            &[
+                ("content/_index.md", "active homepage\n"),
+                ("content/00555.md", "# Active proposal\n"),
+            ],
+        );
+        init_repo(
+            &sibling,
+            &[
+                ("content/_index.md", "sibling homepage\n"),
+                ("content/00678.md", "# Sibling proposal\n"),
+            ],
+        );
+
+        let mut other_repos = std::collections::HashMap::new();
+        other_repos.insert("ERCs".to_owned(), file_url(&sibling));
+        let active_url = file_url(&active);
+        let repository_use = RepositoryUse {
+            title: "EIPs".to_owned(),
+            location: Location {
+                repository: active_url,
+                base_url: "https://eips.example.test/".parse().unwrap(),
+            },
+            other_repos,
+        };
+
+        Fresh::new(
+            &active,
+            &prepared,
+            repository_use,
+            SourceMaterialization::Clean,
+        )
+        .unwrap()
+        .clone_src()
+        .unwrap()
+        .fetch_upstream()
+        .unwrap()
+        .merge()
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(prepared.join("content/_index.md")).unwrap(),
+            "active homepage\n"
+        );
+        assert!(prepared.join("content/00678.md").is_file());
+    }
+
+    #[test]
+    fn materialize_working_tree_uses_tracked_theme_scope() {
+        let temp = TempDir::new().unwrap();
+        let theme = temp.path().join("theme");
+        let mounted = temp.path().join("repo/themes/eips-theme");
+        let repo = init_repo(
+            &theme,
+            &[
+                ("config/zola.toml", "title = 'theme'\n"),
+                ("build/generated.txt", "tracked build path\n"),
+                ("delete.txt", "delete me\n"),
+                ("staged.txt", "old staged\n"),
+                ("tracked.txt", "old tracked\n"),
+            ],
+        );
+
+        write_file(&theme, "tracked.txt", "unstaged tracked edit\n");
+        write_file(&theme, "staged.txt", "staged tracked edit\n");
+        stage_path(&repo, "staged.txt");
+        write_file(&theme, "new-staged.txt", "new staged file\n");
+        stage_path(&repo, "new-staged.txt");
+        std::fs::remove_file(theme.join("delete.txt")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("delete.txt")).unwrap();
+        index.write().unwrap();
+        write_file(
+            &theme,
+            "untracked.txt",
+            "ignored by theme materialization\n",
+        );
+
+        materialize_working_tree(&theme, &mounted).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("config/zola.toml")).unwrap(),
+            "title = 'theme'\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("build/generated.txt")).unwrap(),
+            "tracked build path\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("tracked.txt")).unwrap(),
+            "unstaged tracked edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("staged.txt")).unwrap(),
+            "staged tracked edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("new-staged.txt")).unwrap(),
+            "new staged file\n"
+        );
+        assert!(!mounted.join("delete.txt").exists());
+        assert!(!mounted.join("untracked.txt").exists());
+    }
+
+    #[test]
+    fn newly_staged_theme_file_syncs_after_git_index_rescan() {
+        let temp = TempDir::new().unwrap();
+        let theme = temp.path().join("theme");
+        let mounted = temp.path().join("repo/themes/eips-theme");
+        let repo = init_repo(&theme, &[("config/zola.toml", "title = 'theme'\n")]);
+        materialize_working_tree(&theme, &mounted).unwrap();
+        let mut previous_dirty_paths = tracked_working_tree_paths(&theme)
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        write_file(&theme, "templates/new.html", "new staged template\n");
+        stage_path(&repo, "templates/new.html");
+        let current_dirty_paths = tracked_working_tree_paths(&theme)
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let affected_paths = previous_dirty_paths
+            .union(&current_dirty_paths)
+            .cloned()
+            .collect();
+
+        sync_working_tree_paths(&theme, &mounted, &affected_paths).unwrap();
+        previous_dirty_paths = current_dirty_paths;
+
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("templates/new.html")).unwrap(),
+            "new staged template\n"
+        );
+        assert!(previous_dirty_paths.contains(Path::new("templates/new.html")));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn tracked_theme_symlinks_are_materialized_as_symlinks() {
+        let temp = TempDir::new().unwrap();
+        let theme = temp.path().join("theme");
+        let mounted = temp.path().join("repo/themes/eips-theme");
+        std::fs::create_dir_all(&theme).unwrap();
+        let repo = Repository::init(&theme).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+        write_file(&theme, "target.txt", "target\n");
+        std::os::unix::fs::symlink("target.txt", theme.join("linked.txt")).unwrap();
+        commit_all(&repo, "initial");
+
+        materialize_working_tree(&theme, &mounted).unwrap();
+
+        assert!(std::fs::symlink_metadata(mounted.join("linked.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(mounted.join("linked.txt")).unwrap(),
+            PathBuf::from("target.txt")
+        );
+    }
+
+    #[test]
+    fn materialize_working_tree_requires_git_repository() {
+        let temp = TempDir::new().unwrap();
+        let theme = temp.path().join("theme");
+        let mounted = temp.path().join("repo/themes/eips-theme");
+        std::fs::create_dir_all(&theme).unwrap();
+
+        let error = materialize_working_tree(&theme, &mounted).unwrap_err();
+
+        assert!(error.to_string().contains("unable to open root repository"));
+    }
+}

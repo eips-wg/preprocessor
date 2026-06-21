@@ -71,6 +71,9 @@ pub(crate) enum Operation {
         #[arg(long)]
         template: bool,
     },
+
+    /// Check workspace layout, local repos, and required tools
+    Doctor,
 }
 
 #[derive(Debug, clap::ValueEnum, Clone, Default)]

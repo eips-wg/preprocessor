@@ -31,7 +31,7 @@ use crate::{
     cli::{Args, Operation},
     config::{Manifest, RepositoryUse},
     layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
-    workspace::init_workspace,
+    workspace::{doctor_workspace, init_workspace},
 };
 
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
@@ -174,6 +174,11 @@ fn run() -> Result<(), Whatever> {
 
     if let Operation::Init { path, template } = &args.operation {
         init_workspace(&args, path.clone(), *template)?;
+        return Ok(());
+    }
+
+    if let Operation::Doctor = &args.operation {
+        doctor_workspace(&args)?;
         return Ok(());
     }
 
