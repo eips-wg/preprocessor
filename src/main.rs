@@ -16,6 +16,7 @@ mod layout;
 mod lint;
 mod markdown;
 mod pipeline;
+mod preview;
 mod print;
 mod progress;
 mod workspace;

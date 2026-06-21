@@ -75,6 +75,12 @@ pub(crate) enum Operation {
         clean: CleanCliArgs,
     },
 
+    /// Serve the existing built output without rebuilding it
+    Preview {
+        #[command(flatten)]
+        server: ServerCliArgs,
+    },
+
     /// Build the project and launch a web server to preview it
     Serve {
         #[command(flatten)]
@@ -126,12 +132,13 @@ pub(crate) enum RuntimeOperation {
     Clean,
     Check,
     Changed { all: bool, format: ChangedFormat },
+    Preview,
 }
 
 impl Operation {
     pub(crate) fn server_cli_args(&self) -> ServerCliArgs {
         match self {
-            Self::Serve { server, .. } => server.clone(),
+            Self::Serve { server, .. } | Self::Preview { server } => server.clone(),
             _ => ServerCliArgs::default(),
         }
     }
@@ -159,6 +166,7 @@ impl Operation {
             Self::Print { .. } | Self::Init { .. } | Self::Doctor => None,
             Self::Build { .. } => Some(RuntimeOperation::Build),
             Self::Serve { .. } => Some(RuntimeOperation::Serve),
+            Self::Preview { .. } => Some(RuntimeOperation::Preview),
             Self::Clean => Some(RuntimeOperation::Clean),
             Self::Check { .. } => Some(RuntimeOperation::Check),
             Self::Changed { all, format } => Some(RuntimeOperation::Changed { all: *all, format: format.clone() }),
