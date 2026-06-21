@@ -7,6 +7,7 @@
 use std::{
     collections::BTreeSet,
     ffi::OsStr,
+    io::ErrorKind,
     path::{absolute, Path, PathBuf},
 };
 
@@ -16,8 +17,8 @@ use crate::{
     progress::{Git, ProgressIteratorExt},
 };
 use git2::{
-    build::TreeUpdateBuilder,
-    Commit, FetchOptions, FileMode, ObjectType, Oid, Signature, Status,
+    build::{CheckoutBuilder, TreeUpdateBuilder},
+    Commit, FetchOptions, FileMode, ObjectType, Oid, RepositoryOpenFlags, Signature, Status,
     StatusOptions, Tree, TreeEntry, TreeWalkResult,
 };
 use log::{debug, info};
@@ -60,6 +61,25 @@ pub enum Error {
     DirtyUnsupportedPath { path: PathBuf, backtrace: Backtrace },
     #[snafu(display("unable to update tree ({msg})"))]
     UpdateTree { msg: String, backtrace: Backtrace },
+    #[snafu(display(
+        "workspace path `{}` already exists but is not a usable git repository",
+        path.to_string_lossy()
+    ))]
+    ExistingWorkspacePath { path: PathBuf, backtrace: Backtrace },
+    #[snafu(display(
+        "workspace repository `{}` is unusable: {reason}",
+        path.to_string_lossy()
+    ))]
+    UnusableWorkspaceRepository {
+        path: PathBuf,
+        reason: &'static str,
+        backtrace: Backtrace,
+    },
+    #[snafu(display(
+        "fresh workspace repository `{}` was missing before checkout",
+        path.to_string_lossy()
+    ))]
+    MissingFreshWorkspaceRepository { path: PathBuf, backtrace: Backtrace },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +90,141 @@ pub enum SourceMaterialization {
 
 pub fn repository_available(path: &Path) -> bool {
     git2::Repository::open(path).is_ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneOutcome {
+    Fresh,
+    Existing,
+}
+
+fn ensure_usable_workspace_repository(
+    repository: &git2::Repository,
+    path: &Path,
+) -> Result<(), Error> {
+    if repository.workdir().is_none() {
+        return UnusableWorkspaceRepositorySnafu {
+            path: path.to_path_buf(),
+            reason: "it is bare",
+        }
+        .fail();
+    }
+
+    if repository.head().is_err() {
+        return UnusableWorkspaceRepositorySnafu {
+            path: path.to_path_buf(),
+            reason: "it has no HEAD commit",
+        }
+        .fail();
+    }
+
+    Ok(())
+}
+
+fn open_existing_workspace_repository(
+    destination: &Path,
+) -> Result<Option<git2::Repository>, Error> {
+    match git2::Repository::open_ext(
+        destination,
+        RepositoryOpenFlags::NO_SEARCH,
+        &[] as &[&OsStr],
+    ) {
+        Ok(repository) => {
+            ensure_usable_workspace_repository(&repository, destination)?;
+            Ok(Some(repository))
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {
+            match std::fs::symlink_metadata(destination) {
+                Ok(_) => ExistingWorkspacePathSnafu {
+                    path: destination.to_path_buf(),
+                }
+                .fail(),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(IoSnafu {
+                    path: destination.to_path_buf(),
+                }
+                .into_error(error)),
+            }
+        }
+        Err(error) => match std::fs::symlink_metadata(destination) {
+            Ok(_) => ExistingWorkspacePathSnafu {
+                path: destination.to_path_buf(),
+            }
+            .fail(),
+            Err(metadata_error) if metadata_error.kind() == ErrorKind::NotFound => Err(GitSnafu {
+                what: "open existing workspace repository",
+            }
+            .into_error(error)),
+            Err(metadata_error) => Err(IoSnafu {
+                path: destination.to_path_buf(),
+            }
+            .into_error(metadata_error)),
+        },
+    }
+}
+
+pub fn clone_missing_repo(url: &str, destination: &Path) -> Result<CloneOutcome, Error> {
+    if open_existing_workspace_repository(destination)?.is_some() {
+        info!(
+            "using existing workspace repo `{}`",
+            destination.to_string_lossy()
+        );
+        return Ok(CloneOutcome::Existing);
+    }
+
+    info!("cloning `{url}` into `{}`", destination.to_string_lossy());
+    let repository = git2::Repository::clone(url, destination).context(GitSnafu {
+        what: "clone workspace repository",
+    })?;
+    ensure_usable_workspace_repository(&repository, destination)?;
+    Ok(CloneOutcome::Fresh)
+}
+
+pub fn checkout_fresh_clone_at_commit(
+    destination: &Path,
+    repository_url: &str,
+    commit: &str,
+) -> Result<(), Error> {
+    let Some(repository) = open_existing_workspace_repository(destination)? else {
+        return MissingFreshWorkspaceRepositorySnafu {
+            path: destination.to_path_buf(),
+        }
+        .fail();
+    };
+    let commit = match repository
+        .revparse_single(commit)
+        .and_then(|object| object.peel_to_commit())
+    {
+        Ok(commit) => commit,
+        Err(error)
+            if matches!(
+                error.code(),
+                git2::ErrorCode::NotFound | git2::ErrorCode::InvalidSpec
+            ) =>
+        {
+            let refspec = format!("+{commit}:refs/build-eips/theme-pin");
+            fetch(&repository, repository_url, &refspec)?
+        }
+        Err(error) => {
+            return Err(GitSnafu {
+                what: "resolve manifest theme commit",
+            }
+            .into_error(error));
+        }
+    };
+
+    repository
+        .set_head_detached(commit.id())
+        .context(GitSnafu {
+            what: "detach manifest theme commit",
+        })?;
+    repository
+        .checkout_head(Some(CheckoutBuilder::default().force()))
+        .context(GitSnafu {
+            what: "checkout manifest theme commit",
+        })?;
+
+    Ok(())
 }
 
 fn is_generated_path(path: &Path) -> bool {

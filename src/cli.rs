@@ -61,6 +61,16 @@ pub(crate) enum Operation {
         #[clap(long, value_enum, default_value_t)]
         format: ChangedFormat,
     },
+
+    /// Create workspace config, docs, build root, and missing local repos
+    Init {
+        /// Workspace root directory
+        path: PathBuf,
+
+        /// Also clone template for proposal-family scaffold work
+        #[arg(long)]
+        template: bool,
+    },
 }
 
 #[derive(Debug, clap::ValueEnum, Clone, Default)]
