@@ -8,6 +8,7 @@ mod changed;
 mod cli;
 mod config;
 mod context;
+mod editorial;
 mod execution;
 mod find_root;
 mod git;
@@ -31,6 +32,7 @@ use log::{debug, info};
 use snafu::{Report, ResultExt, Whatever};
 
 use crate::{
+    editorial::{editorial_runtime_execution, run_editorial_lint},
     cli::{Args, Operation},
     config::{Manifest, RepositoryUse},
     layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
@@ -182,6 +184,18 @@ fn run() -> Result<(), Whatever> {
 
     if let Operation::Doctor = &args.operation {
         doctor_workspace(&args)?;
+        return Ok(());
+    }
+
+    if let Operation::Editorial { command } = &args.operation {
+        let resolved = execution::resolve_execution(&args)?;
+        match command {
+            crate::cli::EditorialCommand::Lint { selectors, eipw } => run_editorial_lint(&resolved, selectors, eipw.clone())?,
+            crate::cli::EditorialCommand::Check { selectors, eipw } => {
+                run_editorial_lint(&resolved, selectors, eipw.clone())?;
+                pipeline::Prepared::prepare(editorial_runtime_execution(resolved, selectors))?.check()?;
+            }
+        }
         return Ok(());
     }
 

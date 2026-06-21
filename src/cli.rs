@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use url::Url;
 
-use crate::print;
+use crate::{lint, print};
 
 /// Build script for Ethereum EIPs and ERCs.
 #[derive(Parser, Debug)]
@@ -111,6 +111,12 @@ pub(crate) enum Operation {
         format: ChangedFormat,
     },
 
+    /// Run targeted editorial lint or check workflows
+    Editorial {
+        #[command(subcommand)]
+        command: EditorialCommand,
+    },
+
     /// Create workspace config, docs, build root, and missing local repos
     Init {
         /// Workspace root directory
@@ -125,6 +131,25 @@ pub(crate) enum Operation {
     Doctor,
 }
 
+
+#[derive(Debug, Subcommand, Clone)]
+pub(crate) enum EditorialCommand {
+    Lint { #[command(flatten)] selectors: EditorialSelectorArgs, #[command(flatten)] eipw: lint::CmdArgs },
+    Check { #[command(flatten)] selectors: EditorialSelectorArgs, #[command(flatten)] eipw: lint::CmdArgs },
+}
+
+#[derive(Debug, clap::Args, Clone)]
+pub(crate) struct EditorialSelectorArgs {
+    #[arg(value_name = "TARGET")]
+    pub(crate) paths: Vec<PathBuf>,
+    #[arg(long)]
+    pub(crate) batch: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) working_tree: bool,
+    #[arg(long)]
+    pub(crate) against_upstream: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeOperation {
     Build,
@@ -133,6 +158,7 @@ pub(crate) enum RuntimeOperation {
     Check,
     Changed { all: bool, format: ChangedFormat },
     Preview,
+    Editorial { command: EditorialCommand },
 }
 
 impl Operation {
@@ -170,7 +196,12 @@ impl Operation {
             Self::Clean => Some(RuntimeOperation::Clean),
             Self::Check { .. } => Some(RuntimeOperation::Check),
             Self::Changed { all, format } => Some(RuntimeOperation::Changed { all: *all, format: format.clone() }),
+            Self::Editorial { command } => Some(RuntimeOperation::Editorial { command: command.clone() }),
         }
+    }
+
+    pub(crate) fn is_editorial_command(&self) -> bool {
+        matches!(self, Self::Editorial { .. })
     }
 
     pub(crate) fn is_workspace_lifecycle_command(&self) -> bool {
