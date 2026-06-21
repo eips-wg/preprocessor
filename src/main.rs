@@ -9,6 +9,7 @@ mod changed;
 mod cli;
 mod config;
 mod context;
+mod execution;
 mod find_root;
 mod git;
 mod github;
@@ -17,6 +18,7 @@ mod lint;
 mod markdown;
 mod print;
 mod progress;
+mod workspace;
 mod zola;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +32,7 @@ use crate::{
     cli::{Args, Operation},
     config::{Manifest, RepositoryUse},
     layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
+    workspace::{doctor_workspace, init_workspace},
 };
 
 fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
@@ -167,6 +170,16 @@ fn run() -> Result<(), Whatever> {
     let args = Args::parse();
     if let Operation::Print { print } = args.operation {
         print::print(print);
+        return Ok(());
+    }
+
+    if let Operation::Init { path, template } = &args.operation {
+        init_workspace(&args, path.clone(), *template)?;
+        return Ok(());
+    }
+
+    if let Operation::Doctor = &args.operation {
+        doctor_workspace(&args)?;
         return Ok(());
     }
 

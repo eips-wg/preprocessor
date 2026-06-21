@@ -255,6 +255,25 @@ fn version_cmp(
     Ok(())
 }
 
+fn eipw_config_path(theme_path: &Path) -> PathBuf {
+    theme_path.join("config").join("eipw.toml")
+}
+
+/// Check whether a theme's eipw configuration uses a compatible schema.
+pub fn eipw_schema_status(theme_path: &Path) -> Result<(), Error> {
+    let config_path = eipw_config_path(theme_path);
+    let toml_file = Toml::file_exact(&config_path);
+    let file_version = Figment::new()
+        .merge(toml_file)
+        .extract::<ConfigVersion>()
+        .context(ConfigSnafu)?
+        .schema_version;
+    let application_version = DefaultOptions::<String>::schema_version();
+
+    version_cmp(file_version, application_version)?;
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 pub async fn eipw(
     theme_repo: &str,
