@@ -9,6 +9,7 @@ mod changed;
 mod cli;
 mod config;
 mod context;
+mod execution;
 mod find_root;
 mod git;
 mod github;
