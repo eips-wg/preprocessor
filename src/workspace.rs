@@ -25,6 +25,8 @@ use crate::{
 };
 
 const PROPOSAL_TEMPLATE_URL: &str = "https://github.com/eips-wg/template.git";
+const PLATFORM_PREPROCESSOR_URL: &str = "https://github.com/eips-wg/preprocessor.git";
+const PLATFORM_EIPW_URL: &str = "https://github.com/ethereum/eipw.git";
 const WORKSPACE_DOC_FILE: &str = "WORKSPACE.md";
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +44,8 @@ struct DoctorReport {
 
 struct WorkspaceInitToolingRepositories<'a> {
     template: &'a Url,
+    preprocessor: &'a Url,
+    eipw: &'a Url,
 }
 
 impl fmt::Display for DoctorStatus {
@@ -667,17 +671,25 @@ pub(crate) fn init_workspace(
     args: &Args,
     workspace_root: PathBuf,
     include_template: bool,
+    platform_dev: bool,
 ) -> Result<(), Whatever> {
     let template_repository = Url::parse(PROPOSAL_TEMPLATE_URL)
         .whatever_context("invalid proposal template repository URL")?;
+    let preprocessor_repository = Url::parse(PLATFORM_PREPROCESSOR_URL)
+        .whatever_context("invalid platform preprocessor repository URL")?;
+    let eipw_repository =
+        Url::parse(PLATFORM_EIPW_URL).whatever_context("invalid platform eipw repository URL")?;
     let repositories = WorkspaceInitToolingRepositories {
         template: &template_repository,
+        preprocessor: &preprocessor_repository,
+        eipw: &eipw_repository,
     };
 
     init_workspace_with_repositories(
         args,
         workspace_root,
         include_template,
+        platform_dev,
         &repositories,
     )
 }
@@ -686,6 +698,7 @@ fn init_workspace_with_repositories(
     args: &Args,
     workspace_root: PathBuf,
     include_template: bool,
+    platform_dev: bool,
     repositories: &WorkspaceInitToolingRepositories<'_>,
 ) -> Result<(), Whatever> {
     let root_path = root(args)
@@ -742,6 +755,24 @@ fn init_workspace_with_repositories(
             })?;
     }
 
+    if platform_dev {
+        let preprocessor_path = workspace_root.join("preprocessor");
+        git::clone_missing_repo(repositories.preprocessor.as_str(), &preprocessor_path)
+            .with_whatever_context(|_| {
+                format!(
+                    "unable to prepare workspace preprocessor repo at `{}`; destination must be missing or a usable git repository",
+                    preprocessor_path.to_string_lossy()
+                )
+            })?;
+        let eipw_path = workspace_root.join("eipw");
+        git::clone_missing_repo(repositories.eipw.as_str(), &eipw_path).with_whatever_context(|_| {
+            format!(
+                "unable to prepare workspace eipw repo at `{}`; destination must be missing or a usable git repository",
+                eipw_path.to_string_lossy()
+            )
+        })?;
+    }
+
     std::fs::create_dir_all(workspace_root.join(config::DEFAULT_BUILD_ROOT_BASE))
         .whatever_context("unable to create local build root")?;
 
@@ -788,3 +819,1413 @@ fn write_workspace_doc(workspace_root: &Path) -> Result<(), Whatever> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use clap::Parser;
+    use eipw_lint::config::DefaultOptions;
+    use git2::{IndexAddOption, Repository, Signature};
+    use tempfile::TempDir;
+    use url::Url;
+
+    use crate::{
+        cli::{Args, Operation},
+        config::{self, LoadedWorkspaceConfig},
+    };
+
+    use super::{
+        collect_doctor_report, doctor_root, init_workspace_with_repositories, workspace_doc_text,
+        WorkspaceInitToolingRepositories, PLATFORM_EIPW_URL, PLATFORM_PREPROCESSOR_URL,
+        PROPOSAL_TEMPLATE_URL, WORKSPACE_DOC_FILE,
+    };
+
+    fn parse_args(arguments: &[&str]) -> Args {
+        Args::try_parse_from(arguments).unwrap()
+    }
+
+    fn file_url(path: &Path) -> Url {
+        Url::from_directory_path(path).unwrap()
+    }
+
+    fn write_file(root: &Path, relative: impl AsRef<Path>, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn commit_all(repo: &Repository, message: &str) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("build-eips test", "build-eips@example.test").unwrap();
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).unwrap())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .unwrap();
+    }
+
+    fn init_repo(path: &Path, files: &[(&str, &str)]) -> Repository {
+        std::fs::create_dir_all(path).unwrap();
+        let repo = Repository::init(path).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+        for (relative, contents) in files {
+            write_file(path, relative, contents);
+        }
+        commit_all(&repo, "initial");
+        repo
+    }
+
+    fn build_manifest_text_with_theme(
+        repo_name: &str,
+        repository: &Url,
+        siblings: &[(&str, Url)],
+        theme_repository: &Url,
+        theme_commit: &str,
+    ) -> String {
+        let mut manifest = format!(
+            r#"
+name = "{repo_name}"
+
+[locations.{repo_name}]
+repository = "{repository}"
+base-url = "https://example.test/{repo_name}/"
+
+[theme]
+repository = "{theme_repository}"
+commit = "{theme_commit}"
+"#
+        );
+
+        for (sibling_id, sibling_repository) in siblings {
+            manifest.push_str(&format!(
+                r#"
+[locations.{sibling_id}]
+repository = "{sibling_repository}"
+base-url = "https://example.test/{sibling_id}/"
+"#
+            ));
+        }
+
+        manifest
+    }
+
+    fn build_manifest_text(repo_name: &str, repository: &Url, siblings: &[(&str, Url)]) -> String {
+        let theme_repository = Url::parse("https://example.test/theme.git").unwrap();
+        build_manifest_text_with_theme(
+            repo_name,
+            repository,
+            siblings,
+            &theme_repository,
+            "test-theme-commit",
+        )
+    }
+
+    fn write_build_manifest_file_with_theme(
+        path: &Path,
+        repo_name: &str,
+        upstream: &Url,
+        siblings: &[(&str, Url)],
+        theme_repository: &Url,
+        theme_commit: &str,
+    ) {
+        write_file(
+            path,
+            config::MANIFEST_FILE,
+            &build_manifest_text_with_theme(
+                repo_name,
+                upstream,
+                siblings,
+                theme_repository,
+                theme_commit,
+            ),
+        );
+    }
+
+    fn write_build_manifest_file(
+        path: &Path,
+        repo_name: &str,
+        upstream: &Url,
+        siblings: &[(&str, Url)],
+    ) {
+        write_file(
+            path,
+            config::MANIFEST_FILE,
+            &build_manifest_text(repo_name, upstream, siblings),
+        );
+    }
+
+    fn write_manifest_repo_with_theme(
+        path: &Path,
+        repo_name: &str,
+        upstream: &Url,
+        siblings: &[(&str, Url)],
+        theme_repository: &Url,
+        theme_commit: &str,
+    ) -> Repository {
+        let repo = init_repo(path, &[("content/0001.md", "# Proposal\n")]);
+        write_build_manifest_file_with_theme(
+            path,
+            repo_name,
+            upstream,
+            siblings,
+            theme_repository,
+            theme_commit,
+        );
+        commit_all(&repo, "add manifest");
+        repo
+    }
+
+    fn write_manifest_repo(
+        path: &Path,
+        repo_name: &str,
+        upstream: &Url,
+        siblings: &[(&str, Url)],
+    ) -> Repository {
+        let repo = init_repo(path, &[("content/0001.md", "# Proposal\n")]);
+        write_build_manifest_file(path, repo_name, upstream, siblings);
+        commit_all(&repo, "add manifest");
+        repo
+    }
+
+    fn repository_head(repo: &Repository) -> String {
+        repo.head().unwrap().target().unwrap().to_string()
+    }
+
+    fn init_workspace_source_repo(remotes_root: &Path, name: &str) -> Url {
+        let path = remotes_root.join(name);
+        init_repo(&path, &[("README.md", "init test repo\n")]);
+        file_url(&path)
+    }
+
+    fn compatible_eipw_config() -> String {
+        format!(
+            "schema-version = \"{}\"\n\n[fetch]\nproposal-format = \"{{:05}}\"\n",
+            DefaultOptions::<String>::schema_version()
+        )
+    }
+
+    fn init_workspace_theme_repo(remotes_root: &Path) -> (Url, String) {
+        let path = remotes_root.join("theme");
+        let eipw_config = compatible_eipw_config();
+        let repo = init_repo(
+            &path,
+            &[
+                ("README.md", "theme\n"),
+                ("config/zola.toml", "title = \"theme\"\n"),
+                ("config/eipw.toml", eipw_config.as_str()),
+            ],
+        );
+        (file_url(&path), repository_head(&repo))
+    }
+
+    fn workspace_init_test_repository_urls(remotes_root: &Path) -> (Url, String, Url, Url, Url) {
+        let (theme_url, theme_commit) = init_workspace_theme_repo(remotes_root);
+        (
+            theme_url,
+            theme_commit,
+            init_workspace_source_repo(remotes_root, "template"),
+            init_workspace_source_repo(remotes_root, "preprocessor"),
+            init_workspace_source_repo(remotes_root, "eipw"),
+        )
+    }
+
+    fn tooling_repositories<'a>(
+        template: &'a Url,
+        preprocessor: &'a Url,
+        eipw: &'a Url,
+    ) -> WorkspaceInitToolingRepositories<'a> {
+        WorkspaceInitToolingRepositories {
+            template,
+            preprocessor,
+            eipw,
+        }
+    }
+
+    fn run_workspace_init(
+        active_path: &Path,
+        workspace_root: &Path,
+        repositories: &WorkspaceInitToolingRepositories<'_>,
+    ) -> Result<(), snafu::Whatever> {
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "init",
+            workspace_root.to_str().unwrap(),
+        ]);
+
+        init_workspace_with_repositories(
+            &args,
+            workspace_root.to_path_buf(),
+            false,
+            false,
+            repositories,
+        )
+    }
+
+    fn create_hidden_theme_commit(repo: &Repository, root: &Path) -> String {
+        let default_head = repo.head().unwrap().target().unwrap();
+        write_file(root, "PINNED.md", "pinned theme commit\n");
+        commit_all(repo, "pinned theme commit");
+        let pinned_head = repo.head().unwrap().target().unwrap();
+        repo.reference(
+            "refs/build-eips/theme-pin-source",
+            pinned_head,
+            true,
+            "test-only pinned theme source",
+        )
+        .unwrap();
+        repo.find_reference("refs/heads/master")
+            .unwrap()
+            .set_target(default_head, "restore default theme branch")
+            .unwrap();
+        pinned_head.to_string()
+    }
+
+    fn run_workspace_init_for_docs(
+        existing_doc: Option<&str>,
+        existing_config: Option<&str>,
+    ) -> (TempDir, std::path::PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = WorkspaceInitToolingRepositories {
+            template: &template_url,
+            preprocessor: &preprocessor_url,
+            eipw: &eipw_url,
+        };
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &[],
+            &theme_url,
+            &theme_commit,
+        );
+
+        if let Some(contents) = existing_doc {
+            write_file(&workspace_root, WORKSPACE_DOC_FILE, contents);
+        }
+        if let Some(contents) = existing_config {
+            write_file(&workspace_root, config::LOCAL_CONFIG_FILE, contents);
+        }
+
+        let init_args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "init",
+            workspace_root.to_str().unwrap(),
+        ]);
+
+        init_workspace_with_repositories(
+            &init_args,
+            workspace_root.clone(),
+            false,
+            false,
+            &repositories,
+        )
+        .unwrap();
+
+        (temp, workspace_root)
+    }
+
+    #[test]
+    fn tooling_repository_urls_remain_bootstrap_metadata() {
+        for url in [
+            PROPOSAL_TEMPLATE_URL,
+            PLATFORM_PREPROCESSOR_URL,
+            PLATFORM_EIPW_URL,
+        ] {
+            assert!(
+                Url::parse(url).is_ok(),
+                "expected valid tooling URL `{url}`"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn front_door_setup_tool_records_posix_helper_warnings() {
+        let mut report = super::DoctorReport::default();
+
+        super::record_optional_download_tool(&mut report, None, None);
+        super::record_front_door_archive_tool(&mut report, None);
+
+        assert_eq!(report.warnings, 2);
+        assert_eq!(report.failures, 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn front_door_setup_tool_accepts_posix_helpers() {
+        let mut report = super::DoctorReport::default();
+        let tool_path = Path::new("/usr/bin/tool");
+
+        super::record_optional_download_tool(&mut report, Some(tool_path), None);
+        super::record_front_door_archive_tool(&mut report, Some(tool_path));
+
+        assert_eq!(report.warnings, 0);
+        assert_eq!(report.failures, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn front_door_setup_tools_skip_posix_helpers_on_windows() {
+        let mut report = super::DoctorReport::default();
+
+        super::check_front_door_setup_tools(&mut report);
+
+        assert_eq!(report.warnings, 0);
+        assert_eq!(report.failures, 0);
+    }
+
+    #[test]
+    fn workspace_doc_text_mentions_required_workspace_reference_content() {
+        let text = workspace_doc_text();
+
+        for expected in [
+            "Build.toml",
+            ".build-eips.toml",
+            ".local-build",
+            "workspace/theme",
+            "build-eips init",
+            "build-eips doctor",
+            "build-eips build",
+            "build-eips serve",
+            "build-eips preview",
+            "build-eips editorial check",
+            "[render]",
+            "only = [",
+            "--only",
+            "--clean",
+            "--remote-siblings",
+            "--base-url",
+        ] {
+            assert!(
+                text.contains(expected),
+                "workspace document text should contain `{expected}`"
+            );
+        }
+
+        for removed in [
+            ".build-eips.repo.toml",
+            "--staging",
+            "--production",
+            "parity",
+            "../WORKSPACE.md",
+            "repo_id",
+        ] {
+            assert!(
+                !text.contains(removed),
+                "workspace document text should not contain stale `{removed}`"
+            );
+        }
+
+        assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn workspace_init_writes_workspace_doc() {
+        let (_temp, workspace_root) = run_workspace_init_for_docs(None, None);
+
+        let doc = std::fs::read_to_string(workspace_root.join(WORKSPACE_DOC_FILE)).unwrap();
+        assert_eq!(doc, workspace_doc_text());
+    }
+
+    #[test]
+    fn workspace_init_overwrites_existing_workspace_doc() {
+        let existing_doc = "Old workspace docs\n";
+        let (_temp, workspace_root) = run_workspace_init_for_docs(Some(existing_doc), None);
+
+        let doc = std::fs::read_to_string(workspace_root.join(WORKSPACE_DOC_FILE)).unwrap();
+        assert_ne!(doc, existing_doc);
+        assert_eq!(doc, workspace_doc_text());
+    }
+
+    #[test]
+    fn workspace_init_leaves_existing_config_without_render_unchanged() {
+        let existing_config = "[server]\nhost = \"127.0.0.1\"\nport = 1111\n";
+        let (_temp, workspace_root) = run_workspace_init_for_docs(None, Some(existing_config));
+
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join(config::LOCAL_CONFIG_FILE)).unwrap(),
+            existing_config
+        );
+    }
+
+    #[test]
+    fn fresh_workspace_init_clones_manifest_theme_at_pinned_commit() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = tooling_repositories(&template_url, &preprocessor_url, &eipw_url);
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &[],
+            &theme_url,
+            &theme_commit,
+        );
+
+        run_workspace_init(&active_path, &workspace_root, &repositories).unwrap();
+
+        let theme = Repository::open(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+        assert_eq!(repository_head(&theme), theme_commit);
+        assert_eq!(
+            theme.find_remote("origin").unwrap().url(),
+            Some(theme_url.as_str())
+        );
+    }
+
+    #[test]
+    fn fresh_theme_clone_fetches_missing_manifest_pin_before_checkout() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let theme_source_path = remotes_root.join("theme");
+        let theme_source = init_repo(&theme_source_path, &[("README.md", "theme\n")]);
+        let pinned_commit = create_hidden_theme_commit(&theme_source, &theme_source_path);
+        let theme_url = file_url(&theme_source_path);
+        let template_url = init_workspace_source_repo(&remotes_root, "template");
+        let preprocessor_url = init_workspace_source_repo(&remotes_root, "preprocessor");
+        let eipw_url = init_workspace_source_repo(&remotes_root, "eipw");
+        let repositories = tooling_repositories(&template_url, &preprocessor_url, &eipw_url);
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &[],
+            &theme_url,
+            &pinned_commit,
+        );
+
+        run_workspace_init(&active_path, &workspace_root, &repositories).unwrap();
+
+        let theme = Repository::open(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+        assert_eq!(repository_head(&theme), pinned_commit);
+        assert_eq!(
+            std::fs::read_to_string(
+                workspace_root
+                    .join(config::DEFAULT_THEME_DIR)
+                    .join("PINNED.md")
+            )
+            .unwrap(),
+            "pinned theme commit\n"
+        );
+    }
+
+    #[test]
+    fn fresh_theme_clone_reports_manifest_pin_fetch_or_checkout_failure() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, _theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = tooling_repositories(&template_url, &preprocessor_url, &eipw_url);
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        let missing_commit = "0000000000000000000000000000000000000000";
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &[],
+            &theme_url,
+            missing_commit,
+        );
+
+        let error = run_workspace_init(&active_path, &workspace_root, &repositories)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unable to fetch or check out active Build.toml theme commit"));
+        assert!(error.contains(missing_commit));
+    }
+
+    #[test]
+    fn existing_workspace_theme_repo_is_left_untouched_when_manifest_pin_differs() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = tooling_repositories(&template_url, &preprocessor_url, &eipw_url);
+        let existing_theme_path = workspace_root.join(config::DEFAULT_THEME_DIR);
+        let existing_theme = init_repo(&existing_theme_path, &[("README.md", "local theme\n")]);
+        let existing_head = repository_head(&existing_theme);
+        assert_ne!(existing_head, theme_commit);
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &[],
+            &theme_url,
+            &theme_commit,
+        );
+
+        run_workspace_init(&active_path, &workspace_root, &repositories).unwrap();
+
+        let theme = Repository::open(&existing_theme_path).unwrap();
+        assert_eq!(repository_head(&theme), existing_head);
+        assert_eq!(
+            std::fs::read_to_string(existing_theme_path.join("README.md")).unwrap(),
+            "local theme\n"
+        );
+    }
+
+    #[test]
+    fn existing_non_git_workspace_theme_path_fails_without_overwriting_files() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = tooling_repositories(&template_url, &preprocessor_url, &eipw_url);
+        let theme_path = workspace_root.join(config::DEFAULT_THEME_DIR);
+        write_file(&theme_path, "keep.txt", "do not overwrite\n");
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &[],
+            &theme_url,
+            &theme_commit,
+        );
+
+        let error = run_workspace_init(&active_path, &workspace_root, &repositories).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unable to prepare workspace theme repo"));
+        assert!(error
+            .to_string()
+            .contains("destination must be missing or a usable git repository"));
+        assert_eq!(
+            std::fs::read_to_string(theme_path.join("keep.txt")).unwrap(),
+            "do not overwrite\n"
+        );
+    }
+
+    #[test]
+    fn existing_partial_workspace_theme_repo_fails_without_reporting_success() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = tooling_repositories(&template_url, &preprocessor_url, &eipw_url);
+        let theme_path = workspace_root.join(config::DEFAULT_THEME_DIR);
+        std::fs::create_dir_all(&theme_path).unwrap();
+        Repository::init(&theme_path).unwrap();
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &[],
+            &theme_url,
+            &theme_commit,
+        );
+
+        let error = run_workspace_init(&active_path, &workspace_root, &repositories).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unable to prepare workspace theme repo"));
+        assert!(error
+            .to_string()
+            .contains("destination must be missing or a usable git repository"));
+        assert!(theme_path.join(".git").exists());
+    }
+
+    #[test]
+    fn workspace_init_clones_missing_siblings_from_manifest_locations() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = tooling_repositories(&template_url, &preprocessor_url, &eipw_url);
+        let sibling_source_path = remotes_root.join("ERCs");
+        init_repo(
+            &sibling_source_path,
+            &[("content/00002.md", "remote sibling\n")],
+        );
+        let sibling_url = file_url(&sibling_source_path);
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &[("ERCs", sibling_url)],
+            &theme_url,
+            &theme_commit,
+        );
+
+        run_workspace_init(&active_path, &workspace_root, &repositories).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("ERCs/content/00002.md")).unwrap(),
+            "remote sibling\n"
+        );
+    }
+
+    #[test]
+    fn existing_workspace_sibling_repo_is_left_untouched() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = tooling_repositories(&template_url, &preprocessor_url, &eipw_url);
+        let sibling_source_path = remotes_root.join("ERCs");
+        init_repo(
+            &sibling_source_path,
+            &[("content/00002.md", "remote sibling\n")],
+        );
+        let sibling_url = file_url(&sibling_source_path);
+        let sibling_path = workspace_root.join("ERCs");
+        let sibling = init_repo(&sibling_path, &[("content/00002.md", "local sibling\n")]);
+        let sibling_head = repository_head(&sibling);
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &[("ERCs", sibling_url)],
+            &theme_url,
+            &theme_commit,
+        );
+
+        run_workspace_init(&active_path, &workspace_root, &repositories).unwrap();
+
+        let sibling = Repository::open(&sibling_path).unwrap();
+        assert_eq!(repository_head(&sibling), sibling_head);
+        assert_eq!(
+            std::fs::read_to_string(sibling_path.join("content/00002.md")).unwrap(),
+            "local sibling\n"
+        );
+    }
+
+    #[test]
+    fn existing_non_git_workspace_sibling_path_fails_without_overwriting_files() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = tooling_repositories(&template_url, &preprocessor_url, &eipw_url);
+        let sibling_source_path = remotes_root.join("ERCs");
+        init_repo(
+            &sibling_source_path,
+            &[("content/00002.md", "remote sibling\n")],
+        );
+        let sibling_url = file_url(&sibling_source_path);
+        let sibling_path = workspace_root.join("ERCs");
+        write_file(&sibling_path, "keep.txt", "do not overwrite\n");
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &[("ERCs", sibling_url)],
+            &theme_url,
+            &theme_commit,
+        );
+
+        let error = run_workspace_init(&active_path, &workspace_root, &repositories).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unable to prepare workspace sibling repo `ERCs`"));
+        assert!(error
+            .to_string()
+            .contains("destination must be missing or a usable git repository"));
+        assert_eq!(
+            std::fs::read_to_string(sibling_path.join("keep.txt")).unwrap(),
+            "do not overwrite\n"
+        );
+    }
+
+    #[test]
+    fn workspace_init_accepts_active_checkout_basename_different_from_manifest_title() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = tooling_repositories(&template_url, &preprocessor_url, &eipw_url);
+        let active_path = temp.path().join("source/checkout-copy");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Managed",
+            &active_url,
+            &[],
+            &theme_url,
+            &theme_commit,
+        );
+
+        run_workspace_init(&active_path, &workspace_root, &repositories).unwrap();
+
+        let workspace_config =
+            LoadedWorkspaceConfig::from_path(&workspace_root.join(config::LOCAL_CONFIG_FILE))
+                .unwrap();
+        assert_eq!(
+            workspace_config.workspace_build_root("Managed"),
+            workspace_root
+                .join(config::DEFAULT_BUILD_ROOT_BASE)
+                .join("Managed")
+        );
+        assert!(Repository::open(workspace_root.join(config::DEFAULT_THEME_DIR)).is_ok());
+    }
+
+    #[test]
+    fn workspace_init_requires_active_build_toml() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (_theme_url, _theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = tooling_repositories(&template_url, &preprocessor_url, &eipw_url);
+        let active_path = temp.path().join("source/no-manifest");
+        init_repo(&active_path, &[("content/00001.md", "active\n")]);
+
+        let error = run_workspace_init(&active_path, &workspace_root, &repositories)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("workspace init requires an active Build.toml repository root"));
+    }
+
+    fn assert_workspace_init_optional_repos(
+        workspace_root: &Path,
+        expect_template: bool,
+        expect_platform_dev: bool,
+    ) {
+        assert!(Repository::open(workspace_root.join(config::DEFAULT_THEME_DIR)).is_ok());
+        assert_eq!(
+            Repository::open(workspace_root.join("template")).is_ok(),
+            expect_template
+        );
+        assert_eq!(
+            Repository::open(workspace_root.join("preprocessor")).is_ok(),
+            expect_platform_dev
+        );
+        assert_eq!(
+            Repository::open(workspace_root.join("eipw")).is_ok(),
+            expect_platform_dev
+        );
+    }
+
+    struct DoctorWorkspace {
+        _temp: TempDir,
+        workspace_root: PathBuf,
+        active_path: PathBuf,
+        theme_source_path: PathBuf,
+        theme_url: Url,
+        theme_commit: String,
+    }
+
+    fn initialized_doctor_workspace(sibling_ids: &[&str]) -> DoctorWorkspace {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = WorkspaceInitToolingRepositories {
+            template: &template_url,
+            preprocessor: &preprocessor_url,
+            eipw: &eipw_url,
+        };
+        let sibling_repositories = sibling_ids
+            .iter()
+            .map(|sibling_id| {
+                let sibling_path = remotes_root.join(sibling_id);
+                let sibling_url = file_url(&sibling_path);
+                write_manifest_repo(&sibling_path, sibling_id, &sibling_url, &[]);
+                ((*sibling_id).to_owned(), sibling_url)
+            })
+            .collect::<Vec<_>>();
+        let sibling_manifest_entries = sibling_repositories
+            .iter()
+            .map(|(sibling_id, sibling_url)| (sibling_id.as_str(), sibling_url.clone()))
+            .collect::<Vec<_>>();
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &sibling_manifest_entries,
+            &theme_url,
+            &theme_commit,
+        );
+        run_workspace_init(&active_path, &workspace_root, &repositories).unwrap();
+
+        DoctorWorkspace {
+            _temp: temp,
+            workspace_root,
+            active_path,
+            theme_source_path: theme_url.to_file_path().unwrap(),
+            theme_url,
+            theme_commit,
+        }
+    }
+
+    fn doctor_report(workspace: &DoctorWorkspace) -> super::DoctorReport {
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            workspace.active_path.to_str().unwrap(),
+            "doctor",
+        ]);
+        collect_doctor_report(&args, false).unwrap()
+    }
+
+    fn rewrite_active_theme_pin(workspace: &DoctorWorkspace, theme_pin: &str) {
+        let active_url = file_url(&workspace.active_path);
+        write_build_manifest_file_with_theme(
+            &workspace.active_path,
+            "Core",
+            &active_url,
+            &[],
+            &workspace.theme_url,
+            theme_pin,
+        );
+    }
+
+    fn assert_workspace_init_and_doctor_for_siblings(sibling_ids: &[&str]) {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = WorkspaceInitToolingRepositories {
+            template: &template_url,
+            preprocessor: &preprocessor_url,
+            eipw: &eipw_url,
+        };
+
+        let sibling_repositories = sibling_ids
+            .iter()
+            .map(|sibling_id| {
+                let sibling_id = *sibling_id;
+                let sibling_path = remotes_root.join(sibling_id);
+                let sibling_url = file_url(&sibling_path);
+                write_manifest_repo(&sibling_path, sibling_id, &sibling_url, &[]);
+                (sibling_id.to_owned(), sibling_url)
+            })
+            .collect::<Vec<_>>();
+        let sibling_manifest_entries = sibling_repositories
+            .iter()
+            .map(|(repo_name, url)| (repo_name.as_str(), url.clone()))
+            .collect::<Vec<_>>();
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &sibling_manifest_entries,
+            &theme_url,
+            &theme_commit,
+        );
+        let init_args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "init",
+            workspace_root.to_str().unwrap(),
+        ]);
+
+        init_workspace_with_repositories(
+            &init_args,
+            workspace_root.clone(),
+            false,
+            false,
+            &repositories,
+        )
+        .unwrap();
+
+        assert!(workspace_root.join(config::LOCAL_CONFIG_FILE).is_file());
+        assert_workspace_init_optional_repos(&workspace_root, false, false);
+        for sibling_id in sibling_ids {
+            assert!(Repository::open(workspace_root.join(sibling_id)).is_ok());
+        }
+
+        let doctor_args =
+            parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
+        let report = collect_doctor_report(&doctor_args, false).unwrap();
+
+        assert_eq!(report.failures, 0);
+    }
+
+    fn assert_workspace_init_optional_clone_behavior(
+        flags: &[&str],
+        expect_template: bool,
+        expect_platform_dev: bool,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, theme_commit, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = WorkspaceInitToolingRepositories {
+            template: &template_url,
+            preprocessor: &preprocessor_url,
+            eipw: &eipw_url,
+        };
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo_with_theme(
+            &active_path,
+            "Core",
+            &active_url,
+            &[],
+            &theme_url,
+            &theme_commit,
+        );
+        let active_path = active_path.to_string_lossy();
+        let workspace_root_arg = workspace_root.to_string_lossy();
+        let mut arguments = vec![
+            "build-eips",
+            "-C",
+            active_path.as_ref(),
+            "init",
+            workspace_root_arg.as_ref(),
+        ];
+        arguments.extend_from_slice(flags);
+        let init_args = parse_args(&arguments);
+        let Operation::Init {
+            path: workspace_root_path,
+            template,
+            platform_dev,
+        } = init_args.operation.clone()
+        else {
+            panic!("expected init command");
+        };
+
+        assert_eq!(template, expect_template);
+        assert_eq!(platform_dev, expect_platform_dev);
+
+        init_workspace_with_repositories(
+            &init_args,
+            workspace_root_path,
+            template,
+            platform_dev,
+            &repositories,
+        )
+        .unwrap();
+
+        assert_workspace_init_optional_repos(&workspace_root, expect_template, expect_platform_dev);
+    }
+
+    #[test]
+    fn workspace_init_and_doctor_cover_zero_one_and_many_siblings() {
+        assert_workspace_init_and_doctor_for_siblings(&[]);
+        assert_workspace_init_and_doctor_for_siblings(&["ERCs"]);
+        assert_workspace_init_and_doctor_for_siblings(&["EIPs", "ERCs"]);
+    }
+
+    #[test]
+    fn workspace_doctor_missing_active_build_toml_reports_failure() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let active_path = workspace_root.join("Core");
+        std::fs::create_dir_all(&active_path).unwrap();
+        write_file(&workspace_root, config::LOCAL_CONFIG_FILE, "");
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+    }
+
+    #[test]
+    fn workspace_doctor_invalid_active_build_toml_reports_failure() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let active_path = workspace_root.join("Core");
+        init_repo(&active_path, &[("content/0001.md", "# Proposal\n")]);
+        write_file(&active_path, config::MANIFEST_FILE, "[");
+        write_file(&workspace_root, config::LOCAL_CONFIG_FILE, "");
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+    }
+
+    #[test]
+    fn workspace_doctor_accepts_matching_sibling_manifest() {
+        let workspace = initialized_doctor_workspace(&["ERCs"]);
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_warns_for_missing_sibling_build_toml() {
+        let workspace = initialized_doctor_workspace(&["ERCs"]);
+        std::fs::remove_file(workspace.workspace_root.join("ERCs/Build.toml")).unwrap();
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.warnings, 1);
+    }
+
+    #[test]
+    fn workspace_doctor_fails_for_malformed_sibling_build_toml() {
+        let workspace = initialized_doctor_workspace(&["ERCs"]);
+        write_file(
+            &workspace.workspace_root.join("ERCs"),
+            config::MANIFEST_FILE,
+            "[",
+        );
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_fails_for_sibling_manifest_name_mismatch() {
+        let workspace = initialized_doctor_workspace(&["ERCs"]);
+        let sibling_path = workspace.workspace_root.join("ERCs");
+        let sibling_url = file_url(&sibling_path);
+        write_build_manifest_file(&sibling_path, "Wrong", &sibling_url, &[]);
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_fails_for_missing_theme() {
+        let workspace = initialized_doctor_workspace(&[]);
+        std::fs::remove_dir_all(workspace.workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_fails_for_non_git_theme() {
+        let workspace = initialized_doctor_workspace(&[]);
+        let theme_path = workspace.workspace_root.join(config::DEFAULT_THEME_DIR);
+        std::fs::remove_dir_all(&theme_path).unwrap();
+        write_file(&theme_path, "config/zola.toml", "title = \"theme\"\n");
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_fails_for_missing_theme_zola_config() {
+        let workspace = initialized_doctor_workspace(&[]);
+        std::fs::remove_file(workspace.workspace_root.join("theme/config/zola.toml")).unwrap();
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_fails_for_invalid_theme_zola_config() {
+        let workspace = initialized_doctor_workspace(&[]);
+        write_file(
+            &workspace.workspace_root.join(config::DEFAULT_THEME_DIR),
+            "config/zola.toml",
+            "[",
+        );
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_fails_for_missing_theme_eipw_config() {
+        let workspace = initialized_doctor_workspace(&[]);
+        std::fs::remove_file(workspace.workspace_root.join("theme/config/eipw.toml")).unwrap();
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_fails_for_incompatible_theme_eipw_schema() {
+        let workspace = initialized_doctor_workspace(&[]);
+        write_file(
+            &workspace.workspace_root.join(config::DEFAULT_THEME_DIR),
+            "config/eipw.toml",
+            "schema-version = \"999.0.0\"\n",
+        );
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_does_not_warn_when_theme_pin_matches() {
+        let workspace = initialized_doctor_workspace(&[]);
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_accepts_short_sha_theme_pin() {
+        let workspace = initialized_doctor_workspace(&[]);
+        let short_pin = &workspace.theme_commit[..8];
+        rewrite_active_theme_pin(&workspace, short_pin);
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_accepts_tag_theme_pin() {
+        let workspace = initialized_doctor_workspace(&[]);
+        let theme =
+            Repository::open(workspace.workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+        let head = theme.revparse_single("HEAD").unwrap();
+        theme.tag_lightweight("manifest-pin", &head, false).unwrap();
+        rewrite_active_theme_pin(&workspace, "manifest-pin");
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_warns_for_theme_pin_drift_without_failing_readiness() {
+        let workspace = initialized_doctor_workspace(&[]);
+        let theme_path = workspace.workspace_root.join(config::DEFAULT_THEME_DIR);
+        let theme = Repository::open(&theme_path).unwrap();
+        write_file(&theme_path, "LOCAL.md", "local theme edit\n");
+        commit_all(&theme, "local theme edit");
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.warnings, 1);
+    }
+
+    #[test]
+    fn workspace_doctor_warns_for_missing_local_theme_pin_without_fetching() {
+        let workspace = initialized_doctor_workspace(&[]);
+        let source_theme = Repository::open(&workspace.theme_source_path).unwrap();
+        write_file(
+            &workspace.theme_source_path,
+            "REMOTE-ONLY.md",
+            "remote-only theme commit\n",
+        );
+        commit_all(&source_theme, "remote-only theme commit");
+        let remote_only_pin = repository_head(&source_theme);
+        rewrite_active_theme_pin(&workspace, &remote_only_pin);
+
+        let theme_path = workspace.workspace_root.join(config::DEFAULT_THEME_DIR);
+        let local_theme = Repository::open(&theme_path).unwrap();
+        assert!(local_theme.revparse_single(&remote_only_pin).is_err());
+        drop(local_theme);
+
+        let report = doctor_report(&workspace);
+
+        let local_theme = Repository::open(&theme_path).unwrap();
+        assert!(local_theme.revparse_single(&remote_only_pin).is_err());
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.warnings, 1);
+    }
+
+    #[test]
+    fn workspace_doctor_accepts_theme_remote_with_non_origin_name() {
+        let workspace = initialized_doctor_workspace(&[]);
+        let theme =
+            Repository::open(workspace.workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+        theme.remote_rename("origin", "theme-source").unwrap();
+
+        let report = doctor_report(&workspace);
+
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn default_workspace_init_clones_required_repos_only() {
+        assert_workspace_init_optional_clone_behavior(&[], false, false);
+    }
+
+    #[test]
+    fn workspace_init_template_clones_template_only_as_optional_repo() {
+        assert_workspace_init_optional_clone_behavior(&["--template"], true, false);
+    }
+
+    #[test]
+    fn workspace_init_platform_dev_clones_platform_repos_only_as_optional_repos() {
+        assert_workspace_init_optional_clone_behavior(&["--platform-dev"], false, true);
+    }
+
+    #[test]
+    fn workspace_init_template_and_platform_dev_clone_all_optional_repos() {
+        assert_workspace_init_optional_clone_behavior(
+            &["--template", "--platform-dev"],
+            true,
+            true,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_tool_candidates_must_be_executable_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let candidate = temp.path().join("tool");
+        std::fs::write(&candidate, "#!/bin/sh\n").unwrap();
+
+        let mut permissions = std::fs::metadata(&candidate).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&candidate, permissions).unwrap();
+        assert!(!super::is_command_candidate(&candidate));
+
+        let mut permissions = std::fs::metadata(&candidate).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&candidate, permissions).unwrap();
+        assert!(super::is_command_candidate(&candidate));
+    }
+
+    #[test]
+    fn workspace_doctor_explicit_plain_directory_reports_invalid_root() {
+        let workspace = TempDir::new().unwrap();
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            workspace.path().to_str().unwrap(),
+            "doctor",
+        ]);
+
+        let error = doctor_root(&args).unwrap_err().to_string();
+
+        assert_eq!(error, "invalid root directory");
+    }
+
+    #[test]
+    fn workspace_doctor_missing_config_reports_one_failure_without_skip_warning() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_parse_failed_config_reports_one_failure_without_skip_warning() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        std::fs::write(workspace.path().join(config::LOCAL_CONFIG_FILE), "[").unwrap();
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_removed_config_fields_report_parse_failure_check() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
+        std::fs::write(
+            &config_path,
+            r#"
+build_root_base = ".local-build"
+default_profile = "local"
+
+[profiles.local]
+staging = true
+"#,
+        )
+        .unwrap();
+        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+        assert!(matches!(error, config::WorkspaceError::Parse { .. }));
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+}

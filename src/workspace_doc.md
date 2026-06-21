@@ -17,3 +17,8 @@ build-eips init .. --template
 ## Render Specific Proposals Only
 
 Use `--only` with local dirty builds and serves to render selected proposal numbers. A workspace `[render]` section can provide the same defaults.
+
+
+## Platform Development
+
+Use `build-eips init --platform-dev` to add local `preprocessor/` and `eipw/` checkouts.

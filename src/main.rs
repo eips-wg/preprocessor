@@ -18,11 +18,15 @@ mod lint;
 mod markdown;
 mod pipeline;
 mod preview;
-mod proposal;
 mod print;
 mod progress;
+mod proposal;
+mod serve;
 mod workspace;
 mod zola;
+
+#[cfg(test)]
+mod tests;
 
 use std::path::{Path, PathBuf};
 
@@ -32,10 +36,11 @@ use log::{debug, info};
 use snafu::{Report, ResultExt, Whatever};
 
 use crate::{
+    cli::{Args, EditorialCommand, Operation, RuntimeOperation},
     editorial::{editorial_runtime_execution, run_editorial_lint},
-    cli::{Args, Operation},
-    config::{Manifest, RepositoryUse},
-    layout::{BUILD_DIR, CONTENT_DIR, OUTPUT_DIR, REPO_DIR},
+    execution::{resolve_execution, validate_non_execution_command_flags},
+    layout::output_path,
+    pipeline::Prepared,
     workspace::{doctor_workspace, init_workspace},
 };
 
@@ -55,130 +60,32 @@ fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
     Ok(lock_file)
 }
 
-fn make_build_dir(root: &Path) -> Result<PathBuf, Whatever> {
-    let build_path = root.join(BUILD_DIR);
-    if let Err(e) = std::fs::create_dir_all(&build_path) {
+fn make_build_dir(build_path: &Path) -> Result<PathBuf, Whatever> {
+    if let Err(e) = std::fs::create_dir_all(build_path) {
         debug!(
             "got while creating build directory: {}",
             Report::from_error(e)
         );
     }
-    Ok(build_path)
-}
-
-#[derive(Debug)]
-struct Prepared {
-    cache: cache::Cache,
-    repo_path: PathBuf,
-    output_path: PathBuf,
-    manifest: Manifest,
-}
-
-impl Prepared {
-    fn prepare(
-        eipw: lint::CmdArgs,
-        manifest: Manifest,
-        root_path: PathBuf,
-        build_path: PathBuf,
-    ) -> Result<Self, Whatever> {
-        zola::find_zola().whatever_context("unable to find suitable zola binary")?;
-
-        let repo_path = build_path.join(REPO_DIR);
-        let content_path = repo_path.join(CONTENT_DIR);
-        let output_path = build_path.join(OUTPUT_DIR);
-
-        let repository_use = RepositoryUse::try_from(manifest.clone())
-            .whatever_context("cannot identify repository use")?;
-
-        let both = git::Fresh::new(&root_path, &repo_path, repository_use)
-            .whatever_context("initializing build repo")?
-            .clone_src()
-            .whatever_context("cloning source repo")?
-            .fetch_upstream()
-            .whatever_context("fetching upstream repo")?;
-
-        let changed_files: Vec<_> = both
-            .changed_files()
-            .whatever_context("unable to list changed files")?
-            .into_iter()
-            .filter(|p| changed::is_proposal_path(p.into()))
-            .map(|p| repo_path.join(p))
-            .collect();
-
-        both.merge()
-            .whatever_context("unable to merge ERC/EIP repositories")?;
-
-        let cache = cache::Cache::open().whatever_context("unable to open cache")?;
-
-        lint::eipw(
-            manifest.theme.repository.as_str(),
-            &manifest.theme.commit,
-            &cache,
-            &root_path,
-            &repo_path,
-            changed_files,
-            eipw,
-        )
-        .whatever_context("linting failed")?;
-
-        markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
-
-        Ok(Prepared {
-            manifest,
-            cache,
-            repo_path,
-            output_path,
-        })
-    }
-
-    fn build(self) -> Result<(), Whatever> {
-        let repository_use = RepositoryUse::try_from(self.manifest.clone())
-            .whatever_context("cannot identify repository use")?;
-        zola::build(
-            self.manifest.theme.repository.as_str(),
-            &self.manifest.theme.commit,
-            &self.cache,
-            &self.repo_path,
-            &self.output_path,
-            repository_use.location.base_url.as_str(),
-        )
-        .whatever_context("zola build failed")?;
-        Ok(())
-    }
-
-    fn serve(self) -> Result<(), Whatever> {
-        zola::serve(
-            self.manifest.theme.repository.as_str(),
-            &self.manifest.theme.commit,
-            &self.cache,
-            &self.repo_path,
-            &self.output_path,
-        )
-        .whatever_context("zola serve failed")?;
-        Ok(())
-    }
-
-    fn check(self) -> Result<(), Whatever> {
-        zola::check(
-            self.manifest.theme.repository.as_str(),
-            &self.manifest.theme.commit,
-            &self.cache,
-            &self.repo_path,
-        )
-        .whatever_context("zola check failed")?;
-        Ok(())
-    }
+    Ok(build_path.to_path_buf())
 }
 
 fn run() -> Result<(), Whatever> {
     let args = Args::parse();
-    if let Operation::Print { print } = args.operation {
-        print::print(print);
+    validate_non_execution_command_flags(&args)?;
+
+    if let Operation::Print { print } = &args.operation {
+        print::print(print.clone());
         return Ok(());
     }
 
-    if let Operation::Init { path, template } = &args.operation {
-        init_workspace(&args, path.clone(), *template)?;
+    if let Operation::Init {
+        path,
+        template,
+        platform_dev,
+    } = &args.operation
+    {
+        init_workspace(&args, path.clone(), *template, *platform_dev)?;
         return Ok(());
     }
 
@@ -187,53 +94,54 @@ fn run() -> Result<(), Whatever> {
         return Ok(());
     }
 
-    if let Operation::Editorial { command } = &args.operation {
-        let resolved = execution::resolve_execution(&args)?;
-        match command {
-            crate::cli::EditorialCommand::Lint { selectors, eipw } => run_editorial_lint(&resolved, selectors, eipw.clone())?,
-            crate::cli::EditorialCommand::Check { selectors, eipw } => {
-                run_editorial_lint(&resolved, selectors, eipw.clone())?;
-                pipeline::Prepared::prepare(editorial_runtime_execution(resolved, selectors))?.check()?;
-            }
-        }
+    let runtime_operation = args
+        .operation
+        .runtime_operation()
+        .expect("non-execution commands should have returned earlier");
+    let resolved = resolve_execution(&args)?;
+
+    if matches!(runtime_operation, RuntimeOperation::Preview) {
+        preview::serve(&output_path(&resolved.build_path), &resolved.server_binding)
+            .whatever_context("preview server failed")?;
         return Ok(());
     }
 
-    let root_path = context::root(&args)?;
-
-    let manifest_path = root_path.join(config::MANIFEST_FILE);
-    let manifest = Manifest::load(&manifest_path).whatever_context("unable to read manifest")?;
-
-    let build_path = make_build_dir(&root_path)?;
-
+    let build_path = make_build_dir(&resolved.build_path)?;
     let mut lock_file = lock(&build_path)?;
 
-    match args.operation {
-        Operation::Print { .. } => unreachable!(),
-        Operation::Clean => {
+    match runtime_operation {
+        RuntimeOperation::Clean => {
             // TODO: There's a race condition here. Maybe we move the lockfile to the repository
             //       root?
             lock_file
                 .unlock()
                 .whatever_context("unable to unlock build directory")?;
-            std::fs::remove_dir_all(build_path)
+            std::fs::remove_dir_all(&build_path)
                 .whatever_context("unable to remove build directory")?;
             return Ok(());
         }
-        Operation::Check { eipw } => {
-            Prepared::prepare(eipw, manifest, root_path, build_path)?.check()?;
+        RuntimeOperation::Check => {
+            Prepared::prepare(resolved)?.check()?;
         }
-        Operation::Build { eipw } => {
-            Prepared::prepare(eipw, manifest, root_path, build_path)?.build()?;
+        RuntimeOperation::Build => {
+            Prepared::prepare(resolved)?.build()?;
         }
-        Operation::Serve { eipw } => {
-            Prepared::prepare(eipw, manifest, root_path, build_path)?.serve()?;
+        RuntimeOperation::Serve => {
+            Prepared::prepare(resolved)?.serve()?;
         }
-        Operation::Changed { all, format } => {
-            let repository_use = RepositoryUse::try_from(manifest)
-                .whatever_context("cannot identify repository use")?;
-            changed::run(&root_path, &build_path, repository_use, all, &format)?;
+        RuntimeOperation::Preview => unreachable!(),
+        RuntimeOperation::Changed { all, format } => {
+            changed::run(&resolved, &build_path, all, &format)?;
         }
+        RuntimeOperation::Editorial { command } => match command {
+            EditorialCommand::Lint { selectors, eipw } => {
+                run_editorial_lint(&resolved, &selectors, eipw)?;
+            }
+            EditorialCommand::Check { selectors, eipw } => {
+                run_editorial_lint(&resolved, &selectors, eipw)?;
+                Prepared::prepare(editorial_runtime_execution(resolved, &selectors))?.check()?;
+            }
+        },
     }
 
     lock_file
